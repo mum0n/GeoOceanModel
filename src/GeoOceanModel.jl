@@ -47,26 +47,25 @@ using Oceananigans
 using JSON3
 
 # ============================================================================
-# Source layout, in dependency order. Same order as the original `ParticleTracking.jl`, minus
-# the biology and analysis halves, which are now in GeoLarvalTracking.
-#
-# `output/visualization.jl` includes its own figure families, so the families are NOT included
-# again here: a double include redefines every method on the same line, which Julia refuses
-# during precompilation.
+# Source layout, in dependency order. The figure families are included by
+# `output/visualization.jl` itself, so they are NOT listed here: a double include
+# redefines every method on the same line, which Julia refuses during precompilation.
 # ============================================================================
 include("config/configuration.jl")
 include("data/open_data.jl")
 include("utils/architecture.jl")
+include("utils/tides.jl")
 include("data/grid_bathymetry.jl")
 include("data/vertical_grid.jl")
 include("model/hydrodynamic_model.jl")
-include("utils/tides.jl")
 include("model/tidal_forcing.jl")
 include("model/climate_scenarios.jl")
 include("model/simulation.jl")
 include("model/simulation_result.jl")
 include("output/geodata_output.jl")
-include("data/geodata/geodata_integration.jl")
 include("output/visualization.jl")
-
+include("data/geodata/geodata_integration.jl")
+# The ocean-half run segments, as library code. Included last so every name its
+# bodies reach for is already defined; it adds the run driver the CLI dispatches to.
+include("driver.jl")
 end # module

@@ -62,17 +62,29 @@ struct GeodataOutputCallback
 end
 
 """
-    GeodataOutputCallback(output_dir, model; fields = ("u","v","w","T"))
+    GeodataOutputCallback(output_dir, model; fields = ("u","v","w","T"), resume = false)
 
-Construct the output writer for one run. The store is created empty and cleared if it exists,
-because a re-run overwrites its own output rather than appending two simulations into one file.
+Construct the output writer for one run. A fresh run clears the store and starts at slice 0.
+`resume = true` keeps the store and continues from however many slices it already holds, so an
+extended/interrupted run appends to its own output instead of re-downloading nothing and
+overwriting the interval it already wrote.
 """
 function GeodataOutputCallback(output_dir::AbstractString, model;
-                               fields::Tuple = ("u", "v", "w", "T"))
+                               fields::Tuple = ("u", "v", "w", "T"), resume::Bool = false)
     isdir(output_dir) || mkpath(output_dir)
     store = output_zarr_path(output_dir)
-    ispath(store) && rm(store; recursive = true, force = true)
+    if !resume && ispath(store)
+        rm(store; recursive = true, force = true)   # a fresh run overwrites its own output
+    end
     mkpath(store)
+
+    # On resume, keep the interval this store already holds: the next slice continues at the
+    # existing count. On a fresh run there is no time.json, so the count is 0.
+    start = 0
+    if resume
+        tf = joinpath(store, "time.json")
+        start = isfile(tf) ? length(Vector{Float64}(JSON3.read(read(tf, String)))) : 0
+    end
 
     # The frame's metadata: which fields, and from when. Written as `.zattrs` so a reader can
     # tell what it is holding without opening every array.
@@ -87,23 +99,39 @@ function GeodataOutputCallback(output_dir::AbstractString, model;
         JSON3.write(io, frame)
     end
 
-    return GeodataOutputCallback(store, collect(String.(fields)), Ref(0))
+    return GeodataOutputCallback(store, collect(String.(fields)), Ref(start))
 end
 
 """
     _field_arrays(model) -> (; x, y, z)
 
-The grid's interior cell centres along each axis.
+The grid's **interior** cell centres as geographic `(lon, lat, depth)`.
 
-`z` is reached through `grid.z.cᵃᵃᶜ`, because `grid.z` is a `StaticVerticalDiscretization`, not
-a vector. Reaching for `grid.z` directly is a MethodError at the first write, and reaching for
-its face array instead writes N+1 values where a reader expects N centres.
+The halo must be stripped: writing the halo-inclusive coordinate array would put store index
+`i` at halo position `i` rather than interior position `i` — a silent displacement of the whole
+field with a shape that still looks fine. Rather than slice the halo range here, this delegates
+to `extract_grid_coordinates`, the project's tested halo-stripped extractor in degrees and
+metres, so the store's coordinates are the model's real interior centres by construction.
 """
 function _field_arrays(model)
     g = model.grid
-    return (x = [Float64(v) for v in g.xᶜᵃᵃ],
-            y = [Float64(v) for v in g.yᵃᶜᵃ],
-            z = [Float64(v) for v in g.z.cᵃᵃᶜ])
+    base = hasproperty(g, :underlying_grid) ? g.underlying_grid : g
+    # Geographic (spherical) grid -- the real model. Delegate to the project's tested
+    # degrees/metres extractor so the store's coordinates are the same interior centres the
+    # rest of the code reports; hand-slicing the halo here shifted them by the halo width.
+    if base isa Oceananigans.Grids.LatitudeLongitudeGrid
+        c = extract_grid_coordinates(base)
+        return (x = Float64.(c.lons), y = Float64.(c.lats), z = Float64.(c.depths))
+    end
+    # Metric/rectilinear grid (the unit tests): Cartesian horizontal centres in metres, halo
+    # stripped, with the vertical centre from `znode` as above.
+    ix = (base.Hx + 1):(base.Hx + base.Nx)
+    iy = (base.Hy + 1):(base.Hy + base.Ny)
+    x = Float64[v for v in base.xᶜᵃᵃ[ix]]
+    y = Float64[v for v in base.yᵃᶜᵃ[iy]]
+    z = [Float64(Oceananigans.Grids.znode(k, base, Oceananigans.Grids.Center()))
+         for k in 1:base.Nz]
+    return (x = x, y = y, z = z)
 end
 
 function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
@@ -163,8 +191,8 @@ simulation's own output interval, which is the run's actual cadence. Passing an 
 and would risk two different cadences in one run.
 """
 function attach_output_callback!(sim, output_dir::AbstractString;
-                                  fields::Tuple = ("u", "v", "w", "T"))
-    cb = GeodataOutputCallback(output_dir, sim.model; fields = fields)
+                                  fields::Tuple = ("u", "v", "w", "T"), resume::Bool = false)
+    cb = GeodataOutputCallback(output_dir, sim.model; fields = fields, resume = resume)
     Oceananigans.add_callback!(sim, Oceananigans.Callback(cb))
     store = output_zarr_path(output_dir)
     write_grid_metadata!(store, sim.model)

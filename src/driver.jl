@@ -1,39 +1,38 @@
 # ==============================================================================
-#  driver.jl -- the ocean half's run driver, as library code
+#  driver.jl -- the ocean half's run segments, as library code
 # ==============================================================================
 #
-#  These are the segment functions `ParticleTrackingRun.jl` held as a script. They are here,
-#  in `src/`, because a caller needs them: `GeoOceanModelRun.jl` dispatches to them, and a
-#  test needs to call `run_segment_grid` without going through a CLI. A script that defines
-#  the behaviour is a script nobody can test; what is left in `GeoOceanModelRun.jl` is
-#  argument parsing and dispatch only.
+#  The segment functions `ParticleTrackingRun.jl` held as a script, moved here so
+#  `GeoOceanModelRun.jl` can dispatch to them and `Pkg.test` can reach them: a
+#  script that defines the behaviour is a script nobody can test.
 #
-#  What is deliberately NOT here: the larval segments (`run_segment_tracking`,
-#  `run_segment_metrics`, `run_segment_visualize`, `render_all_figures`) and
-#  `run_production_pipeline`, which spans both halves. They belong to GeoLarvalTracking, and
-#  the pipeline becomes two entry points with the handover file between them.
+#  Included LAST in `GeoOceanModel.jl`, after the model builders and the store
+#  writer, so every name these bodies reach for (`build_shelf_grid`,
+#  `build_hydrodynamic_model`, `inspect_hydrodynamic_file`, the tidal helpers,
+#  `attach_output_callback!`, ...) is already defined when a call happens.
 #
-#  Extracted verbatim from `ParticleTrackingRun.jl`. Two kinds of reference are left in the
-#  text and are marked where they occur, because the file does not load until they are
-#  resolved and an unresolved reference found by the compiler is better than one found by a
-#  wrong velocity:
+#  What is NOT here: the larval segments and the Zarr storage/analytics API.
+#  `run_production_pipeline` reaches them on the path past the handover, and
+#  `run_segment_simulation` reaches the legacy storage writer inside the
+#  hand-over block. Under the split each is a stub that names where it really
+#  lives, so the coupling is at the call site rather than a `MethodError` later.
 #
-#    * `temperature_dependent_pld`, `larval_thermal_mortality_rate`  (larval half; the
-#      ocean run appends larval PLD and thermal mortality to its climate output, which is
-#      larval concern and moves to GeoLarvalTracking);
-#    * `open_storage`, `save_hydrodynamic_field!`, `close_storage`  (the Zarr/GeoParquet
-#      analytical store, currently in GeoLarvalTracking/src/analysis/larval_storage.jl;
-#      `save_hydrodynamic_field!` writes ocean fields, so that family belongs here).
+#  NO `using` statements. The module imports Oceananigans, `prettytime`, the
+#  manifest and `GeoDataSources`; a file included into a package relies on the
+#  module scope. `data_source`/`fetch_input` are written `GeoDataSources.`-qualified
+#  because they are not exported from `GeoDataSources`.
 # ==============================================================================
 
-using Oceananigans
-using Oceananigans.Units
-using Oceananigans.Utils: prettytime
-using Oceananigans.OutputWriters: JLD2Writer, Checkpointer
-using Oceananigans.Architectures
-using GeoDataSources: data_source, fetch_input
-using Dates
-using Random
+"""
+    resolve_hydro_model_path(opts::HydroDynamicOptions, default_filename::String) -> Tuple{String, String}
+
+Resolve the target hydrodynamic JLD2 output/input path and filename. If `opts.hydro_model_file`
+is specified, it is used directly (or resolved relative to `opts.output_dir` if a bare filename
+is provided). If empty, returns `(joinpath(opts.output_dir, default_filename), default_filename)`.
+
+# Inputs
+- `opts::HydrodynamicOptions`: Configuration parameters.
+- `default_filename::String`: Default fallback filename when none is specified.
 
 # Outputs
 - `Tuple{String, String}`: `(full_path, file_basename)`
@@ -47,7 +46,72 @@ function resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::S
         full_path = isabspath(raw) || dirname(raw) != "" ? raw : joinpath(opts.output_dir, raw)
         return (full_path, basename(raw))
     end
+end
 
+"""
+    _woa_store_locations(opts::HydrodynamicOptions) -> Vector{String}
+
+Where WOA23 already lives in the GeoData store. Each variable is ~900 MB, so a store copy is
+reused, never re-downloaded: this run's input dir first, then the package's own `inputs/`,
+then every `work/*/inputs` and `outputs/*/inputs` a prior run left, then the stores of the
+other halves. `woa23_in_store` picks the first copy that exists.
+"""
+function _woa_store_locations(opts::HydrodynamicOptions)
+    root = dirname(@__DIR__)   # the GeoOceanModel package directory
+    dirs = AbstractString[opts.input_dir, joinpath(root, "inputs")]
+    for scan in (joinpath(root, "work"), joinpath(root, "outputs"),
+                 joinpath(root, "..", "ParticleTracking", "outputs"))
+        isdir(scan) && for d in readdir(scan; join = true)
+            push!(dirs, joinpath(d, "inputs"))
+        end
+    end
+    push!(dirs, joinpath(root, "..", "ParticleTracking", "inputs"))
+    push!(dirs, joinpath(root, "..", "ParticleTracking", "work", "snowcrab", "inputs"))
+    return String[dirs...]
+end
+
+"""
+    _woa_in_store(opts, prefix, month_str) -> String
+
+Path to the store's WOA23 file for `prefix` and month, or "" if the store has none. `.nc` in
+preference to `.zarr`, at the first directory that has either.
+"""
+function _woa_in_store(opts::HydrodynamicOptions, prefix::AbstractString, month_str::AbstractString)
+    for d in _woa_store_locations(opts)
+        nc = joinpath(d, "woa23_$(prefix)_$(month_str)_0.25deg.nc")
+        isfile(nc) && return nc
+        zr = joinpath(d, "woa23_$(prefix)_$(month_str)_0.25deg.zarr")
+        isdir(zr) && return zr
+    end
+    return ""
+end
+
+"""
+    _store_sim_info(store_path; stop_time) -> (; exists, is_complete, last_time, n_timesteps)
+
+Resume/reuse state of a run's GeoData (Zarr) store, read from its own `time.json` -- the
+cumulative times the writer appended each interval. `last_time` is the newest, `n_timesteps`
+the count, `is_complete` whether it reached `stop_time`. A missing store, or one with no
+slices, is `exists = false`. This replaced inspecting a JLD2 archive, which the run no longer
+writes: the store is the deliverable, so it is also the record of progress.
+"""
+function _store_sim_info(store_path::AbstractString; stop_time::Real)
+    tf = joinpath(store_path, "time.json")
+    stored = (isfile(tf) && isdir(store_path)) ?
+        (try Vector{Float64}(JSON3.read(read(tf, String))) catch; Float64[] end) :
+        Float64[]
+    n = length(stored)
+    last = n > 0 ? maximum(stored) : 0.0
+    return (exists = n > 0,
+            is_complete = n > 0 && last >= stop_time - 1e-3,
+            last_time = last,
+            n_timesteps = n)
+end
+
+"""
+    _run_bathymetry_source(opts::HydrodynamicOptions) -> Symbol
+
+Which bathymetry product this run uses.
 
 `opts.bathy_source` is the name the operator wrote in the TOML; the domain is
 `opts.domain_lon`/`opts.domain_lat`. The choice itself is `GeoDataSources`'s: a named
@@ -64,6 +128,8 @@ function _run_bathymetry_source(opts::HydrodynamicOptions)
     )
 end
 
+"""
+    _run_bathymetry_path(opts::HydrodynamicOptions) -> String
 
 Where this run's bathymetry artefact lives: `inputs/bathymetry_active.nc` when there is no
 store yet, otherwise whichever of the `.nc` and `.zarr` spellings is already on disk.
@@ -74,6 +140,10 @@ function _run_bathymetry_path(opts::HydrodynamicOptions)
     return isfile(bathy_nc) ? bathy_nc : (isdir(bathy_zarr) ? bathy_zarr : bathy_nc)
 end
 
+"""
+    _run_bathymetry(; opts::HydrodynamicOptions, force::Bool = false) -> NamedTuple
+
+Resolve this run's bathymetry to its source, its durable artefact, and its arrays.
 
 One call site per segment rather than one per use, so the grid, the larval spawn filter, the
 tracking bathymetry function and the figure backgrounds are all one sea floor. Format and
@@ -93,7 +163,20 @@ function _run_bathymetry(; opts::HydrodynamicOptions, force::Bool = false)
     println("Bathymetry source: $(source) (", GeoDataSources.BATHYMETRY_SOURCES[source], ")")
     return (source = source, output_path = output_path, elevation = bathy.elevation,
             lon = bathy.lon, lat = bathy.lat)
+end
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Segment 1: Data Ingestion & Benchmark Generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    run_segment_data(; opts::HydrodynamicOptions) -> NamedTuple
+
+Fetch real-world bathymetry and surface winds from NOAA ERDDAP or generate synthetic
+analogs matching the model bounding box. Computes kinematic wind stress components.
+
+# Inputs
+- `opts::HydrodynamicOptions`: Workflow options container.
 
 # Outputs
 - `NamedTuple`: `(bathy_file, wind_file, tau_x, tau_y, bathy_info)`
@@ -157,10 +240,10 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
     if opts.enable_tides
         src_str = lowercase(strip(String(opts.tides_source)))
         if !(src_str in ("analytic", "synthetic", "none", "off", "false"))
-            tides_file = replace(data_source(:tides).cache, "<output_dir>" => opts.output_dir)
+            tides_file = replace(GeoDataSources.data_source(:tides).cache, "<output_dir>" => opts.output_dir)
             if !isfile(tides_file)
                 println("Retrieving tidal solution ($(opts.tides_source))...")
-                fetch_input(:tides, opts.output_dir)
+                GeoDataSources.fetch_input(:tides, opts.output_dir)
             else
                 println("Using existing real tidal solution file: $tides_file")
             end
@@ -187,7 +270,17 @@ end
 # Segment 2: Computational Grid & Immersed Seafloor Boundary
 # ─────────────────────────────────────────────────────────────────────────────
 
+"""
+    run_segment_grid(; opts::HydrodynamicOptions) -> NamedTuple
 
+Construct the base spherical `LatitudeLongitudeGrid` and wrap it with an
+`ImmersedBoundaryGrid` using 2D bilinear interpolation from bathymetry data.
+
+# Inputs
+- `opts::HydrodynamicOptions`: Workflow options.
+
+# Outputs
+- `NamedTuple`: `(base_grid, immersed_grid)`
 
 The bathymetry is requested through `_run_bathymetry_source`/`_run_bathymetry_path`, so this
 segment resolves the same source, over the same domain, to the same artefact as segment 1.
@@ -307,7 +400,13 @@ end
         tau_y::Real=0.0
     ) -> NamedTuple
 
+Instantiate the Oceananigans `HydrostaticFreeSurfaceModel` with Coriolis rotation,
+buoyancy, surface wind boundary conditions, and semi-diurnal tidal body forcing (M2).
 
+# Inputs
+- `opts::HydrodynamicOptions`: Workflow options.
+- `immersed_grid`: Pre-constructed `ImmersedBoundaryGrid`.
+- `tau_x, tau_y`: Surface kinematic momentum fluxes.
 
 # Outputs
 - `NamedTuple`: `(model, tidal_forcing, simpson_hunter_bank, simpson_hunter_shelf)`
@@ -343,10 +442,10 @@ function run_segment_model(;
     tidal_forcing = if opts.enable_tides
         src_str = lowercase(strip(String(opts.tides_source)))
         if !(src_str in ("analytic", "synthetic", "none", "off", "false"))
-            tides_file = replace(data_source(:tides).cache, "<output_dir>" => opts.output_dir)
+            tides_file = replace(GeoDataSources.data_source(:tides).cache, "<output_dir>" => opts.output_dir)
             if !isfile(tides_file)
                 println("Tidal solution missing at $(tides_file); retrieving via fetch_input(:tides)...")
-                fetch_input(:tides, opts.output_dir)
+                GeoDataSources.fetch_input(:tides, opts.output_dir)
             end
             if !isfile(tides_file)
                 error(
@@ -399,14 +498,15 @@ function run_segment_model(;
     coriolis_lat = 0.5 * (opts.domain_lat[1] + opts.domain_lat[2])
 
 """
-    fetch_boundary_tracers(source::Symbol, opts, cfg) -> NamedTuple
+    fetch_boundary_tracers(source::Symbol, opts) -> NamedTuple
 
 Thin wrapper binding a configured source to the bounding box and month from the TOML.
 
 Everything else -- acquisition, caching, which file holds which variable, what units the
 temperature is in, and whether the file is actually usable data -- lives in
 `fetch_boundary_hydrography`. The driver deliberately does not know how any source is
-
+packaged, because that knowledge is what made two WOA23 readers, a truncated boundary file
+and a units error possible in the first place.
 
 The bounding box is the `[boundaries] embedding_*` region rather than the study domain. It
 has to be larger: the model needs the water just *outside* its own edges, and a subset cut
@@ -419,7 +519,7 @@ function fetch_boundary_tracers(source::Symbol, opts)
         month = opts.hydrography_month)
 end
 
-# Configure open boundary conditions (lateral sponge) if requested.
+    # Configure open boundary conditions (lateral sponge) if requested.
     #
     # Two independent things are decided here and they were previously conflated into one
     # boolean:
@@ -487,8 +587,8 @@ end
         # over. `surface_heat_flux` is a VALUE in W m-2, so treating it as a switch conflates
         # "no flux" with "a small real flux"; and the resulting `want_flux` was then used only
         # to pick a printed message, while `heat_flux = hx` was returned unconditionally. So
-        # setting `surface_heat_flux = 0.0` did not disable the bulk flux -- it still drove the
-        # run -- and `bulk_heat_flux`, which is parsed and stored in `HydrodynamicOptions` and
+        # setting `surface_heat_flux = 0.0` did not disable the bulk flux -- it still drove
+        # the run -- and `bulk_heat_flux`, which is parsed and stored in `HydrodynamicOptions` and
         # documented in the TOML, was never read at all. Both keys now do what they say.
         want_bulk = opts.bulk_heat_flux
         if want_bulk && isnothing(hx)
@@ -544,8 +644,10 @@ end
         sponge_width = opts.sponge_layer_width,
         sponge_tau = opts.sponge_timescale,
     # The prescribed tide is a VELOCITY and is relaxed toward, not forced as an acceleration.
-    # See the note in `build_hydrodynamic_model`.
-    tidal_tau = opts.tidal_relaxation_timescale,
+    # See the note in `build_hydrodynamic_model`. The keyword is the model's
+    # `tidal_relaxation_timescale` (the umbrella driver's older `tidal_tau` spelling was
+    # renamed in `src/model/hydrodynamic_model.jl`).
+    tidal_relaxation_timescale = opts.tidal_relaxation_timescale,
         u_inflow = opts.u_inflow,
         v_inflow = opts.v_inflow,
         boundary_tracers = boundary_tracer_data,
@@ -566,19 +668,19 @@ end
     # provider and the initial state are separate choices, and conflating them is what left
     # every "real data" run silently initialising from the constants `T = 10.0, S = 35.0`.
     hydro_src = opts.hydrography_source
-
     if hydro_src === :woa23
-        month_str = lpad(string(opts.hydrography_month), 2, '0')
-        t_nc = joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.nc")
-        s_nc = joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.nc")
-        o_nc = joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.nc")
-        t_zarr = joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.zarr")
-        s_zarr = joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.zarr")
-        o_zarr = joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.zarr")
 
-        t_file = isfile(t_nc) ? t_nc : (isdir(t_zarr) ? t_zarr : "")
-        s_file = isfile(s_nc) ? s_nc : (isdir(s_zarr) ? s_zarr : "")
-        o_file = isfile(o_nc) ? o_nc : (isdir(o_zarr) ? o_zarr : "")
+        month_str = lpad(string(opts.hydrography_month), 2, '0')
+
+        # Resolve each variable from the store first (a store copy is reused, never
+        # re-downloaded), then this run's own input dir; a download is the last resort.
+        t_file = _woa_in_store(opts, "temperature", month_str)
+        s_file = _woa_in_store(opts, "salinity", month_str)
+        o_file = _woa_in_store(opts, "oxygen", month_str)
+        if !isempty(t_file) || !isempty(s_file)
+            println("WOA23 resolved $(isempty(t_file) ? "?" : basename(t_file)) / " *
+                    "$(isempty(s_file) ? "?" : basename(s_file)) from the GeoData store.")
+        end
 
         if isempty(t_file) || isempty(s_file)
             println("Fetching WOA23 climatology via GeoDataSources...")
@@ -588,10 +690,21 @@ end
                 month = opts.hydrography_month,
                 output_dir = opts.input_dir
             )
-            # Recheck paths after GeoDataSources acquisition
-            t_file = isfile(t_nc) ? t_nc : (isdir(t_zarr) ? t_zarr : "")
-            s_file = isfile(s_nc) ? s_nc : (isdir(s_zarr) ? s_zarr : "")
-            o_file = isfile(o_nc) ? o_nc : (isdir(o_zarr) ? o_zarr : "")
+            # Recheck paths after GeoDataSources acquisition (now in this run's input dir).
+            t_file = isfile(joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.nc")) ?
+                joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.nc") :
+                (isdir(joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.zarr")) ?
+                 joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.zarr") : t_file)
+            s_file = isfile(joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.nc")) ?
+                joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.nc") :
+                (isdir(joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.zarr")) ?
+                 joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.zarr") : s_file)
+            if isempty(o_file)
+                o_file = isfile(joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.nc")) ?
+                    joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.nc") :
+                    (isdir(joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.zarr")) ?
+                     joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.zarr") : o_file)
+            end
         end
 
         if !isempty(t_file) && !isempty(s_file)
@@ -671,10 +784,23 @@ end
     )
 end
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Segment 4: Climate Forcing Scenarios & Larval Thermal Ecology
+# ─────────────────────────────────────────────────────────────────────────────
 
+"""
+    run_segment_climate(; opts::HydrodynamicOptions, model=nothing) -> NamedTuple
+
+Inspect CMIP6 climate scenario deltas, apply warming and freshening anomalies to
+the model stratification, and evaluate temperature-dependent PLD and mortality.
+
+# Inputs
+- `opts::HydrodynamicOptions`: Workflow options.
+- `model`: Optional `HydrostaticFreeSurfaceModel` to update in-place.
 
 # Outputs
-- `NamedTuple`: `(deltas, pld_cold, pld_warm, mort_cold, mort_warm)`
+- `NamedTuple`: `(deltas,)` -- the scenario anomaly deltas. Pelagic larval duration and
+  thermal mortality are larval biology and are computed by `GeoLarvalTracking`, not here.
 """
 function run_segment_climate(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
@@ -698,23 +824,10 @@ function run_segment_climate(;
         apply_climate_scenario!(model, scenario = opts.scenario, year = opts.projection_year)
     end
 
-    # Larval developmental duration (PLD) and thermal stress mortality
-    t_cold = 2.5 # Deep baseline water temperature (°C)
-    t_warm = t_cold + deltas.ΔT_surface
-    pld_cold = temperature_dependent_pld(t_cold)
-    pld_warm = temperature_dependent_pld(t_warm)
-    mort_cold = larval_thermal_mortality_rate(t_cold)
-    mort_warm = larval_thermal_mortality_rate(t_warm)
-
-    # (Snow Crab Larval Thermal Ecology printout removed as it is not relevant to hydrodynamics phase)
-
-    return (
-        deltas = deltas,
-        pld_cold = pld_cold,
-        pld_warm = pld_warm,
-        mort_cold = mort_cold,
-        mort_warm = mort_warm
-    )
+    # Pelagic larval duration and thermal mortality are NOT computed here: they are larval
+    # biology, owned by the larval half (GeoLarvalTracking). This segment ends at the ocean
+    # effect of a scenario -- the warming/freshening anomaly applied to the stratification.
+    return (deltas = deltas,)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -724,10 +837,16 @@ end
 """
     run_segment_simulation(; opts::HydrodynamicOptions, model=nothing) -> NamedTuple
 
+Configure Oceananigans time stepping, adaptive CFL wizard, stability watchdogs,
+and execute the regional hydrodynamic integration.
 
+# Inputs
+- `opts::HydrodynamicOptions`: Workflow options.
+- `model`: Configured `HydrostaticFreeSurfaceModel`.
 
 # Outputs
-- `NamedTuple`: `(simulation, jld2_output_path)`
+- `NamedTuple`: `(simulation, output_path, checkpoint_path)` — `output_path` is the GeoData
+  output store, `checkpoint_path` the JLD2 restart checkpoint.
 """
 function run_segment_simulation(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
@@ -735,53 +854,34 @@ function run_segment_simulation(;
 )
     default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
     jld2_path, jld2_filename = resolve_hydro_model_path(opts, default_jld2)
+    # The store is where this run's output lives and is what resume/reuse act on; the JLD2 is
+    # only the Oceananigans restart checkpoint (state, not a deliverable).
+    store_path = output_zarr_path(dirname(jld2_path))
 
-    # Inspect existing target hydrodynamic file.
-    #
-    # A run extended into several `_partN` archives is inspected across ALL of them. Reading
-    # only the base path would report the span of the first increment, so a later extension
-    # would look like it is resuming from far earlier than it is -- and a run whose parts are
-    # complete would be judged incomplete, restarting work that was already done.
-    #
-    # The resolver requires the base archive to exist, which is right when it is actually
-    # reassembling parts but wrong here: a run that failed before writing any output leaves
-    # the grid file and possibly an empty `parts/` directory behind, and there is then no
-    # output to inspect. Asking the resolver in that state aborted the run with "Simulation
-    # output file not found" instead of starting fresh, so a failed run could not be re-run
-    # without manually deleting the directory. The base is therefore checked first, and a
-    # missing one is reported as the single non-existent path, which `inspect_hydrodynamic_file`
-    # records as `exists = false` and the fresh-start path below handles.
-    parts = isfile(jld2_path) ? resolve_hydro_model_paths(jld2_path) : [jld2_path]
-    infos = [inspect_hydrodynamic_file(p, expected_stop_time = opts.sim_duration) for p in parts]
-    file_info = if length(infos) == 1
-        infos[1]
-    else
-        (exists = any(i -> i.exists, infos),
-         is_complete = all(i -> i.is_complete, infos),
-         last_time = maximum(i -> i.last_time, infos),
-         n_timesteps = sum(i -> i.n_timesteps, infos))
-    end
-    if length(infos) > 1
-        println("Existing simulation spans $(length(infos)) part(s), " *
-                "reaching $(round(file_info.last_time / 3600.0, digits=2)) h " *
-                "over $(file_info.n_timesteps) snapshots.")
+    # Inspect the store's own record: how far it has run and how many slices it holds. This
+    # replaced inspecting a JLD2 timeseries archive, which is no longer written.
+    file_info = _store_sim_info(store_path; stop_time = opts.sim_duration)
+    if file_info.exists
+        println("Existing GeoData store at $(store_path): reaching " *
+                "$(round(file_info.last_time / 3600.0, digits = 2)) h over " *
+                "$(file_info.n_timesteps) snapshot(s).")
     end
 
-    # If track-only: require existing valid file with snapshots
+    # If track-only: require an existing store with snapshots to track through
     if opts.track_only
         println("\n=================================================================")
         println(" [Segment 5/8] Hydrodynamic Simulation Time Stepping")
         println("=================================================================")
         if file_info.exists && file_info.n_timesteps > 0
-            println("Using existing hydrodynamic flow solution from: $(jld2_path)")
-            return (simulation = nothing, jld2_output_path = jld2_path)
+            println("Using existing GeoData store from: $(store_path)")
+            return (simulation = nothing, output_path = store_path)
         else
-            error("Cannot run in --track-only mode: hydrodynamic model file does not exist or has no time snapshots: $(jld2_path)\n" *
-                  "Please run with --hydro-only first or specify an existing file with --hydro-model=<path>.")
+            error("Cannot run in --track-only mode: no GeoData store with snapshots at $(store_path)\n" *
+                  "Please run with --hydro-only first or specify an existing store with --hydro-model=<path>.")
         end
     end
 
-    # If reuse-hydro requested or animate-hydro on existing hydro-model file: reuse it
+    # If reuse-hydro requested or animate-hydro on existing hydrodynamic output: reuse the store
     can_reuse = (opts.reuse_hydro || (opts.animate_hydro && !isempty(opts.hydro_model_file))) &&
                 file_info.exists && file_info.n_timesteps > 0
     if can_reuse
@@ -789,12 +889,12 @@ function run_segment_simulation(;
         println(" [Segment 5/8] Hydrodynamic Simulation Time Stepping")
         println("=================================================================")
         if file_info.is_complete
-            println("Reusing completed hydrodynamic flow solution from: $(jld2_path)")
+            println("Reusing completed GeoData store from: $(store_path)")
         else
-            println("Reusing hydrodynamic flow solution from: $(jld2_path)")
+            println("Reusing GeoData store from: $(store_path)")
             println("  Notice: $(file_info.n_timesteps) snapshot(s) present (up to $(round(file_info.last_time / 3600.0, digits=2)) h).")
         end
-        return (simulation = nothing, jld2_output_path = jld2_path)
+        return (simulation = nothing, output_path = store_path)
     end
 
     target_model = if isnothing(model)
@@ -838,10 +938,8 @@ function run_segment_simulation(;
 
     discard_run!(reason) = begin
         println(reason)
-        println("  Discarding the archive and its checkpoints; starting from t = 0.")
-        for f in (jld2_path, replace(jld2_path, r"\.jld2$" => "_grid.jld2"))
-            isfile(f) && rm(f; force = true)
-        end
+        println("  Discarding the GeoData store and its checkpoints; starting from t = 0.")
+        ispath(store_path) && rm(store_path; recursive = true, force = true)
         cpdir = joinpath(out_dir_target, "checkpoints")
         isdir(cpdir) && for f in readdir(cpdir; join = true)
             endswith(f, ".jld2") && rm(f; force = true)
@@ -866,14 +964,14 @@ function run_segment_simulation(;
 
     resume = false
     if file_info.exists && !file_info.is_complete && file_info.last_time <= 0
-        discard_run!("Existing output $(basename(jld2_path)) is incomplete with no recorded progress.")
+        discard_run!("Existing store $(basename(store_path)) is incomplete with no recorded progress.")
     elseif file_info.exists && failed_before && opts.auto_restart
         discard_run!(
             "A previous attempt to continue this run from t = " *
             "$(round(file_info.last_time / 3600.0, digits=2)) h did not get any further " *
-            "(the archive's stored time is unchanged).")
+            "(the store's stored time is unchanged).")
     elseif file_info.exists && !file_info.is_complete && opts.auto_restart
-        println("Found interrupted hydrodynamic simulation at: $(jld2_path)")
+        println("Found interrupted simulation on the store at: $(store_path)")
         println("  (progress: $(round(file_info.last_time / 3600.0, digits=2)) of " *
                 "$(round(opts.sim_duration / 3600.0, digits=2)) hours)")
         file_info.last_time >= opts.sim_duration &&
@@ -882,7 +980,7 @@ function run_segment_simulation(;
         println("Resuming simulation gracefully from latest checkpoint...")
         resume = true
     elseif file_info.exists && !file_info.is_complete
-        println("Found incomplete simulation at $(jld2_path), but auto-restart is disabled.")
+        println("Found incomplete simulation on $(store_path), but auto-restart is disabled.")
         println("Starting fresh simulation from t = 0...")
     elseif file_info.exists && file_info.is_complete && opts.auto_restart
         if file_info.last_time >= opts.sim_duration
@@ -913,37 +1011,10 @@ function run_segment_simulation(;
     cp_dir_target = isempty(opts.checkpoint_dir) ?
         joinpath(out_dir_target, "checkpoints") : opts.checkpoint_dir
 
-    # Where this invocation writes its snapshots.
-    #
-    # Continuing an existing run gets a NEW `_partN` file rather than reopening the old one.
-    # `JLD2Writer` re-serialises `serialized/coriolis`, `buoyancy`, `closure` and the grid
-    # entries every time it opens a file, so reopening an archive it previously wrote raises
-    # `a group or dataset named rotation_rate is already present`; `overwrite_existing` only
-    # decides whether the file is deleted first, so there is no append mode to fall back on.
-    # Parts are therefore written once and never reopened, and `resolve_hydro_model_paths`
-    # stitches them on read.
-    #
-    # The boundary coincides with the resume point by construction: the run picks up from the
-    # checkpoint and writes the interval that follows it.
-    ext = splitext(jld2_filename)[2]
-    parts_dir = joinpath(out_dir_target, "parts")
-    write_dir = out_dir_target
-    write_filename = jld2_filename
-    if resume
-        # Parts go in a `parts/` subdirectory so a run that accumulates a dozen multi-GB
-        # files does not bury the inputs, checkpoints and figures beside them. The checkpoint
-        # directory deliberately stays at the top level: it is working state that gets cleaned
-        # up, not part of the record.
-        mkpath(parts_dir)
-        write_dir = parts_dir
-        stem = splitext(jld2_filename)[1]
-        n = 1
-        while isfile(joinpath(parts_dir, "$(stem)_part$(n)$(ext)"))
-            n += 1
-        end
-        println("Continuing into a new part: parts/$(stem)_part$(n)$(ext)")
-        write_filename = "$(stem)_part$(n)$(ext)"
-    end
+    # Where this invocation writes: the GeoData store beside this run's outputs. A resume
+    # appends to it (the writer keeps the interval already written); a fresh run replaces it.
+    # There are no `_partN` JLD2 archives any more -- the store is the deliverable, and its
+    # own `time.json` is the record of progress the resume/reuse logic reads back.
 
     # Initial time step: start at 10% of the configured sim_dt to allow the
     # CFL wizard to safely ramp up from rest without violating barotropic CFL.
@@ -959,7 +1030,10 @@ function run_segment_simulation(;
         target_cfl = opts.target_cfl,
         max_Δt = max_Δt,
         min_Δt = opts.min_dt_seconds,
-        output_path = joinpath(write_dir, write_filename),
+        # The simulated output is NOT a JLD2 timeseries: it is written straight into the
+        # GeoData layer (below). JLD2 keeps its one job it can do better than anything --
+        # the Oceananigans checkpoint for restart.
+        enable_output = false,
         output_schedule = (opts.output_schedule_seconds > 0.0) ?
             opts.output_schedule_seconds : 21600.0,
         progress_schedule = 100,
@@ -971,6 +1045,15 @@ function run_segment_simulation(;
         pickup = resume ? :auto : false
     )
 
+    # Write the simulated fields (u, v, w, T) into a GeoData Zarr store at the run's own
+    # output interval, with the grid's interior cell centres carried in the store itself.
+    # The larval half opens that through the data layer rather than through Oceananigans'
+    # storage layout, which is the coupling the whole split exists to remove. On a resume the
+    # store is appended to, not rebuilt.
+    output_store = attach_output_callback!(sim, out_dir_target; fields = ("u", "v", "w", "T"), resume = resume)
+    @assert output_store == store_path "output store drifted from the resume/reuse target"
+    println("Ocean output is a GeoData store: $(output_store)")
+
     println("Integrating hydrostatic primitive equations...")
     run_hydrodynamic_simulation!(
         sim,
@@ -980,45 +1063,18 @@ function run_segment_simulation(;
 
     completed_sim = sim.model.clock.time >= (sim.stop_time - 1e-3)
     if completed_sim
-        println("Simulation completed successfully; fields saved to: $(jld2_path)")
+        println("Simulation completed successfully; output written to the GeoData store: $(output_store)")
     else
         println("Simulation paused/interrupted at $(prettytime(sim.model.clock.time)); state saved to checkpoints.")
     end
 
-    # Archive hydrodynamic snapshot fields to analytical storage (Zarr)
-    if opts.enable_zarr
-        try
-            println("Archiving hydrodynamic flow fields to analytical storage -> $(opts.zarr_path)...")
-            coords = extract_grid_coordinates(target_model.grid)
-            glon, glat, gdepth = coords.lons, coords.lats, coords.depths
-            u_data = Array(interior(target_model.velocities.u))
-            v_data = Array(interior(target_model.velocities.v))
-            w_data = Array(interior(target_model.velocities.w))
-            t_data = Array(interior(target_model.tracers.T))
-            s_data = Array(interior(target_model.tracers.S))
-            eta_data = if hasproperty(target_model, :free_surface) &&
-                          hasproperty(target_model.free_surface, :η)
-                Array(interior(target_model.free_surface.η))
-            else
-                nothing
-            end
+    return (simulation = sim, output_path = output_store, checkpoint_path = jld2_path)
+end
 
-            db = open_storage(opts.zarr_path)
-            try
-                target_run_id = !isempty(opts.run_id) ? opts.run_id :
-                    "run_$(opts.scenario)_$(opts.projection_year)"
-                save_hydrodynamic_field!(
-                    db, target_run_id, opts;
-                    grid_lons = glon, grid_lats = glat, grid_depths = gdepth,
-                    u = u_data, v = v_data, w = w_data,
-                    temperature = t_data, salinity = s_data,
-                    elevation = eta_data,
-                    time_seconds = opts.sim_duration
+# ─────────────────────────────────────────────────────────────────────────────
+# Hydrodynamic Animation
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-# Outputs
-- `Union{Nothing, String}`: Path to generated animation file, or `nothing` if not requested.
-"""
 function render_hydrodynamic_animation_if_requested(
     opts::HydrodynamicOptions,
     hydro_source::AbstractString
@@ -1072,7 +1128,7 @@ function render_hydrodynamic_animation_if_requested(
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Full End-to-End Production Pipeline
+# Full End-to-End Production Pipeline (ocean path)
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
@@ -1081,3 +1137,159 @@ end
 Execute the complete end-to-end regional modeling, hydrodynamic simulation,
 snow crab larval tracking, metric extraction, and visualization workflow.
 
+The ocean half runs Steps 1-5 and, with `--hydro-only`, stops at the handover. Reaching
+Step 6 onwards is the larval half's job: `run_segment_tracking`, `run_segment_metrics` and
+`run_segment_visualize` are stubs that say so, so a call that continues past the handover
+fails with that message rather than silently running one entry point's two halves' work.
+The pipeline is two commands with the handover file between them
+(`GeoOceanModelRun.jl` then `GeoLarvalTrackingRun.jl`).
+
+# Inputs
+- `opts::HydrodynamicOptions`: Workflow options.
+
+# Outputs
+- `NamedTuple`: Summary of all workflow artifacts.
+"""
+function run_production_pipeline(; opts::HydrodynamicOptions = HydroDynamicOptions())
+    println("\n=================================================================")
+    println(" Executing Full Hydrodynamic & Particle Tracking Pipeline")
+    println("=================================================================")
+    t_start = time()
+
+    # Step 1: Data Ingestion
+    data_res = run_segment_data(opts = opts)
+
+    # Step 2: Grid Construction
+    grid_res = run_segment_grid(opts = opts)
+
+    # Decoupled hydrodynamics: skip model and simulation if --track-only is active
+    model_res = nothing
+    climate_res = nothing
+    sim_res = nothing
+
+    if !opts.track_only
+        # Step 3: Model Setup
+        model_res = run_segment_model(
+            opts = opts,
+            immersed_grid = grid_res.immersed_grid,
+            tau_x = data_res.tau_x,
+            tau_y = data_res.tau_y
+        )
+
+        # Step 4: Climate Scenarios
+        climate_res = run_segment_climate(opts = opts, model = model_res.model)
+
+        # Step 5: Hydrodynamic Simulation
+        sim_res = run_segment_simulation(opts = opts, model = model_res.model)
+    else
+        println("[Pipeline Notice] --track-only active: Skipping hydrodynamic simulation (Segments 3-5).")
+    end
+
+    # If --hydro-only is active, exit early after saving hydrodynamic solution
+    if opts.hydro_only
+        t_elapsed = round(time() - t_start, digits = 2)
+        println("\n=================================================================")
+        println(" Hydrodynamics-only execution complete in $(t_elapsed) s (--hydro-only specified).")
+        println(" Flow solution saved to: $(isnothing(sim_res) ? opts.hydro_model_file : sim_res.output_path)")
+        println(" Skipping larval particle tracking and metrics.")
+
+        viz_res = nothing
+        if opts.animate_hydro
+            println(" Generating requested hydrodynamic animations...")
+            hydro_source = isnothing(sim_res) ? opts.hydro_model_file : sim_res.output_path
+            anim_file = render_hydrodynamic_animation_if_requested(opts, hydro_source)
+            viz_res = (animation = anim_file,)
+        end
+
+        # No storage session to close: the ocean output is the GeoData Zarr store written
+        # incrementally by the attached callback (`sim_res.output_path`), which a reader
+        # opens by path whenever it needs it.
+        println("=================================================================")
+        return (
+            data = data_res,
+            grid = grid_res,
+            model = model_res,
+            climate = climate_res,
+            simulation = sim_res,
+            tracking = nothing,
+            metrics = nothing,
+            visualizations = viz_res,
+            elapsed_seconds = t_elapsed
+        )
+    end
+
+    # Step 6: Lagrangian Particle Tracking
+    track_res = run_segment_tracking(opts = opts)
+
+    # Step 7: Metrics & Connectivity
+    metrics_res = run_segment_metrics(opts = opts, trajectories = track_res.trajectories)
+
+    # Step 8: Visualizations
+    viz_res = run_segment_visualize(opts = opts, trajectories = track_res.trajectories)
+
+    t_elapsed = round(time() - t_start, digits = 2)
+    println("\n=================================================================")
+    println(" Complete Workflow Pipeline Successfully Finished in $(t_elapsed) s")
+    println(" Outputs written to: $(opts.output_dir)/")
+    if !isnothing(sim_res)
+        println(" Ocean output (GeoData store): $(sim_res.output_path)")
+    end
+    println("=================================================================")
+
+    return (
+        data = data_res,
+        grid = grid_res,
+        model = model_res,
+        climate = climate_res,
+        simulation = sim_res,
+        tracking = track_res,
+        metrics = metrics_res,
+        visualizations = viz_res,
+        elapsed_seconds = t_elapsed
+    )
+end
+
+
+# ==============================================================================
+#  Boundary stubs
+#
+#  Names the larval half and the old storage/analytics API own. Two ocean functions
+#  reach them: `run_production_pipeline` past the handover, and `run_segment_climate`'s
+#  thermal-ecology lines and `run_segment_simulation`'s legacy archive block. Each is a
+#  stub that errors naming where it lives, so the coupling is at the call site and a run
+#  that crosses the split fails with that message rather than a `MethodError` later, or
+#  worse, a silent substitution.
+#
+#  Each stub is a docstring immediately followed by one definition; an unterminated
+#  docstring here is what made the earlier generated file fail `include` while passing
+#  `Meta.parseall`, so the streaming parser in `scratch_parse_probe/joiner.jl` checks it.
+# ==============================================================================
+
+"""
+    run_segment_tracking(args...; kwargs...)
+
+Owned by the LARVAL half (`GeoLarvalTracking`). Run it from `GeoLarvalTrackingRun.jl`
+against the store this package writes. `GeoOceanModel` ends at the handover; calling this
+here would be one entry point doing two halves' work.
+"""
+run_segment_tracking(args...; kwargs...) = error(
+    "`run_segment_tracking` is owned by GeoLarvalTracking, not by this package: run it " *
+    "from `GeoLarvalTrackingRun.jl` against the store this one wrote.")
+
+"""
+    run_segment_metrics(args...; kwargs...)
+
+Owned by the LARVAL half (`GeoLarvalTracking`). See `run_segment_tracking`.
+"""
+run_segment_metrics(args...; kwargs...) = error(
+    "`run_segment_metrics` is owned by GeoLarvalTracking, not by this package: run it " *
+    "from `GeoLarvalTrackingRun.jl` against the store this one wrote.")
+
+"""
+    run_segment_visualize(args...; kwargs...)
+
+Owned by the LARVAL half (`GeoLarvalTracking`). See `run_segment_tracking`.
+"""
+run_segment_visualize(args...; kwargs...) = error(
+    "`run_segment_visualize` is owned by GeoLarvalTracking, not by this package: run it " *
+    "from `GeoLarvalTrackingRun.jl` against the store this one wrote.")

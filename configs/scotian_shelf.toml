@@ -1,0 +1,173 @@
+# ==============================================================================
+#  scotian_shelf.toml — the ocean half, Scotian Shelf (production)
+# ==============================================================================
+#
+#  The production/realistic Scotian Shelf configuration: the snow-crab study
+#  domain and grid (SPLIT_PLAN.md), forced with the best available real data
+#  through the GeoData abstraction layer. This is the config to run for real
+#  analysis; `default.toml` is its small keyless demonstration twin.
+#
+#  Every physical input is piped in through GeoData (`GeoDataSources`), named
+#  once in [data]/[boundaries]; nothing is embedded:
+#    bathymetry  nwa_bathymetry   measured Northwest Atlantic shelf soundings
+#                                 (bundled tier-1 raw data; the right product for
+#                                 the Scotian Shelf, not a global model).
+#    coastline   natural_earth_10m
+#    wind        open_meteo       (GeoDataSources wind fetcher)
+#    boundary    glorys12v1       Copernicus Marine reanalysis for the open-edge
+#                                 hydrography and velocity (needs a Copernicus
+#                                 Marine account — see README/AGENTS).
+#    hydrography glorys12v1       the same reanalysis seeds the initial T/S
+#
+#  Sections are the ocean schema's; the larval half's settings live in
+#  ../GeoLarvalTracking/configs/biology.toml and are read from this run's
+#  output, not from a TOML.
+#
+#  Knobs for a longer/fully tidal production run: raise sim_duration_hours, and
+#  set [tides] tides_source = "tpxo9_atlas" with enable_tides = true and
+#  constituents = ["M2", "S2"] (TPXO9 is keyless via GeoDataSources). They are
+#  left off here so a short spin-up matches default.toml's other settings.
+# ==============================================================================
+
+[atmosphere]
+forcing = "era5_climatology"
+climatology = true
+variables = ["u10", "v10", "t2m", "ssrd", "strd"]
+drag_formulation = "garratt_1977"
+bulk_heat_flux = false
+
+
+[bathymetry]
+ingest_library = "geodata"
+resolution_arcsec = 60
+inshore_depth = -20.0
+shelf_slope = 500.0
+mask_bay_of_fundy = true
+
+
+[bottom_boundary_layer]
+cd_drag = 0.0025
+bottom_drag = 0.0001
+bbl_mixing_closure = "tke"
+
+
+[boundaries]
+# Open edges constrained by GLORYS12V1 (Copernicus Marine). This needs a
+# configured Copernicus Marine account; use default.toml (synthetic edges,
+# keyless) when one is not available.
+method = "flather_chapman"
+parent_ocean = "glorys12v1"
+ocean_boundary_source = "glorys12v1"
+climatology = true
+obc_type = "flather_chapman"
+active_boundaries = ["east", "south", "west"]
+sponge_layer_width = 0.25
+sponge_timescale_seconds = 3600.0
+u_inflow = -0.15
+v_inflow = 0.05
+
+embedding_lon_min = -71.0
+embedding_lon_max = -53.0
+embedding_lat_min = 40.0
+embedding_lat_max = 48.5
+
+
+[climate]
+scenario = "climatology"
+projection_year = 2022
+baseline_year = 2020
+horizon_year = 2050
+
+
+[data]
+coastline_source = "natural_earth_10m"
+bathy_source = "nwa_bathymetry"
+wind_source = "open_meteo"
+hydrography_source = "glorys12v1"
+wind_time_iso = "2020-06-01T00:00:00Z"
+
+
+[domain]
+lon_min = -68.0
+lon_max = -57.0
+lat_min = 42.0
+lat_max = 47.5
+z_min = -5000.0
+z_max = 0.0
+buffer_km = 50.0
+
+
+[grid]
+# Production study box (120 x 90 x 13). Raise nx/ny toward the shelf's full
+# extent (~345 x 245) for a higher-resolution production run.
+nx = 120
+ny = 90
+nz = 13
+depths = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 150.0, 200.0, 300.0, 400.0, 800.0, 2000.0, 5000.0]
+resolution_scale = 1.0
+vertical_stretching_mode = "tanh"
+
+
+[hardware]
+use_gpu = false
+fallback_to_cpu = false
+
+
+[hydrodynamics]
+sim_duration_hours = 6.0
+sim_dt_seconds = 60.0
+adaptive_cfl = true
+target_cfl = 0.2
+target_wave_cfl = 0.2
+max_dt_seconds = 360.0
+min_dt_seconds = 1.0
+coriolis_latitude = 44.5
+divergence_velocity_limit = 10.0
+surface_heat_flux = 50.0
+turbulence_closure = "nemotke"
+enable_sea_ice = false
+enable_oxygen = false
+output_schedule_seconds = 1800.0
+hydro_model_file = "hydrodynamics_scotian_shelf.jld2"
+enable_checkpoint = true
+
+
+[metadata]
+name = "Scotian Shelf Ocean (production)"
+description = "Scotian Shelf snow-crab domain forced with real data through the GeoData layer: nwa_bathymetry, GLORYS12V1 boundary and hydrography, open_meteo winds"
+author = "GeoOceanModel"
+version = "1.0.0"
+
+
+[paths]
+seed = 42
+
+
+[storage]
+output_path = "outputs/scotian_shelf/scotian_shelf.jld2"
+storage_backend = "zarr"
+output_schedule_seconds = 1800.0
+checkpoint_fields = ["u", "v", "w", "T", "S"]
+enable_checkpoint = true
+checkpoint_prefix = "scotian_shelf_checkpoint"
+checkpoint_schedule_seconds = 3600.0
+checkpoint_dir = "outputs/scotian_shelf/checkpoints"
+cleanup_checkpoints = true
+auto_restart = true
+
+
+[tides]
+tides_source = "analytic"
+constituents = []
+enable_tides = false
+tidal_u_amp = 0.25
+tidal_v_amp = 0.12
+s2_u_amp = 0.11
+s2_v_amp = 0.05
+tidal_period = 44712.0
+tidal_phase = 0.0
+
+
+[visualization]
+interactive_map = false
+title = "Scotian Shelf Ocean (production)"

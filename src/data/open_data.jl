@@ -289,7 +289,10 @@ function fetch_natural_earth_coastline(;
     margin_deg::Real = 1.0,
     verbose::Bool = true
 )
-    return fetch_natural_earth_coastline(;
+    # Delegate to the GeoData abstraction layer, qualified. Unqualified, this call
+    # resolves to THIS wrapper rather than to `GeoDataSources.fetch_natural_earth_coastline`
+    # (both share the name), which is self-recursion and blows the stack.
+    return GeoDataSources.fetch_natural_earth_coastline(;
         lon_range = lon_range,
         lat_range = lat_range,
         resolution = resolution,

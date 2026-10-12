@@ -1,0 +1,167 @@
+# ==============================================================================
+#  default.toml — the ocean half, Cape Breton (NENE) demonstration
+# ==============================================================================
+#
+#  The default GeoOceanModel config: a SMALL area centred on Cape Breton, the
+#  Northeast Nova Scotia (NENE) corner of the Scotian Shelf, at LOW resolution
+#  and for a 3-DAY run. It exists for demonstrations and error testing of a
+#  realistic-ish run on an ordinary machine -- small enough to finish quickly,
+#  coarse enough to be cheap, keyless enough to need no accounts.
+#
+#  Everything is piped in through the GeoData abstraction layer (GeoDataSources)
+#  with KEYLESS products -- no Copernicus Marine account, no tidal-atlas
+#  download:
+#    bathymetry  etopo2022        global modelled topo (keyless; downloaded).
+#    coastline   natural_earth_10m
+#    wind        open_meteo       (GeoDataSources wind fetcher)
+#    hydrography woa23            keyless NOAA World Ocean Atlas climatology
+#    boundaries  synthetic        open edges unconstrained (offline)
+#    tides       analytic/off     keyless
+#
+#  `scotian_shelf.toml` is the production twin of this file: the full snow-crab
+#  domain with nwa_bathymetry and GLORYS12V1 (Copernicus, account required).
+#  `julia --project=. GeoOceanModelRun.jl --hydro-only` runs THIS config by default.
+# ==============================================================================
+
+[atmosphere]
+forcing = "era5_climatology"
+climatology = true
+variables = ["u10", "v10"]
+drag_formulation = "garratt_1977"
+bulk_heat_flux = false
+
+
+[bathymetry]
+ingest_library = "geodata"
+resolution_arcsec = 60
+inshore_depth = -20.0
+shelf_slope = 500.0
+mask_bay_of_fundy = false
+
+
+[bottom_boundary_layer]
+cd_drag = 0.0025
+bottom_drag = 0.0001
+bbl_mixing_closure = "tke"
+
+
+[boundaries]
+# Synthetic (unconstrained) open edges: keyless, no account, offline-convergent
+# for a demo. No Copernicus download.
+method = "none"
+parent_ocean = "synthetic"
+ocean_boundary_source = "synthetic"
+climatology = true
+obc_type = "flather_chapman"
+active_boundaries = ["east", "south", "west"]
+sponge_layer_width = 0.25
+sponge_timescale_seconds = 3600.0
+u_inflow = -0.15
+v_inflow = 0.05
+
+embedding_lon_min = -61.2
+embedding_lon_max = -59.6
+embedding_lat_min = 45.0
+embedding_lat_max = 46.9
+
+
+[climate]
+scenario = "climatology"
+projection_year = 2022
+baseline_year = 2020
+horizon_year = 2050
+
+
+[data]
+coastline_source = "natural_earth_10m"
+bathy_source = "etopo2022"
+wind_source = "open_meteo"
+hydrography_source = "woa23"
+wind_time_iso = "2020-06-01T00:00:00Z"
+
+
+[domain]
+# Cape Breton / Northeast Nova Scotia corner of the Scotian Shelf.
+lon_min = -61.2
+lon_max = -59.6
+lat_min = 45.0
+lat_max = 46.9
+z_min = -1500.0
+z_max = 0.0
+buffer_km = 20.0
+
+
+[grid]
+# Low resolution for a cheap 3-day demonstration.
+nx = 32
+ny = 38
+nz = 8
+depths = [0.0, 20.0, 50.0, 100.0, 150.0, 300.0, 600.0, 1000.0, 1500.0]
+resolution_scale = 1.0
+vertical_stretching_mode = "tanh"
+
+
+[hardware]
+use_gpu = false
+fallback_to_cpu = false
+
+
+[hydrodynamics]
+sim_duration_hours = 72.0
+sim_dt_seconds = 120.0
+adaptive_cfl = true
+target_cfl = 0.2
+target_wave_cfl = 0.2
+max_dt_seconds = 600.0
+min_dt_seconds = 5.0
+coriolis_latitude = 45.95
+divergence_velocity_limit = 10.0
+surface_heat_flux = 50.0
+turbulence_closure = "nemotke"
+enable_sea_ice = false
+enable_oxygen = false
+output_schedule_seconds = 10800.0
+hydro_model_file = "hydrodynamics_default.jld2"
+enable_checkpoint = true
+
+
+[metadata]
+name = "Cape Breton (NENE) Ocean Demonstration"
+description = "3-day low-resolution demonstration over Cape Breton of the Scotian Shelf, keyless data only (etopo2022 bathymetry, woa23 hydrography, open_meteo winds)"
+author = "GeoOceanModel"
+version = "1.0.0"
+
+
+[paths]
+seed = 42
+
+
+[storage]
+output_path = "outputs/default/default.jld2"
+storage_backend = "zarr"
+output_schedule_seconds = 10800.0
+checkpoint_fields = ["u", "v", "w", "T", "S"]
+enable_checkpoint = true
+checkpoint_prefix = "default_checkpoint"
+checkpoint_schedule_seconds = 21600.0
+checkpoint_dir = "outputs/default/checkpoints"
+cleanup_checkpoints = true
+auto_restart = true
+
+
+[tides]
+# Analytic/off: keyless, no tidal-atlas download. Enough for a demonstration.
+tides_source = "analytic"
+constituents = []
+enable_tides = false
+tidal_u_amp = 0.25
+tidal_v_amp = 0.12
+s2_u_amp = 0.11
+s2_v_amp = 0.05
+tidal_period = 44712.0
+tidal_phase = 0.0
+
+
+[visualization]
+interactive_map = false
+title = "Cape Breton (NENE) Ocean Demonstration"

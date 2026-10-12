@@ -23,7 +23,7 @@ complete and answers a question nobody asked. Callers must fail loudly instead, 
 
 To run, pass one explicitly:
 
-    julia --project=. ParticleTrackingRun.jl --config=configs/snowcrab.toml
+    julia --project=. GeoOceanModelRun.jl --config=configs/scotian_shelf.toml
 
 or place `ParticleTracking.toml` at the project root.
 """
@@ -44,13 +44,14 @@ no statement of what it actually simulated -- it would be indistinguishable from
 was configured deliberately.
 
 Available configurations in this project:
-  configs/default.toml     small, fast baseline
-  configs/opendata.toml   keyless observed products, moderate grid
-  configs/snowcrab.toml    Scotian Shelf, high resolution, with tidal forcing
+  configs/default.toml       Cape Breton (NENE): small box, low resolution, 3 days,
+                             keyless data (etopo2022, WOA23, open_meteo). For demos.
+  configs/scotian_shelf.toml  The full snow-crab Scotian Shelf domain, nwa_bathymetry
+                             and GLORYS12V1 (Copernicus Marine account required).
 
 Run with one of:
 
-    julia --project=. ParticleTrackingRun.jl --config=configs/snowcrab.toml
+    julia --project=. GeoOceanModelRun.jl --config=configs/scotian_shelf.toml
 
 or copy one to ParticleTracking.toml at the project root, which the loader picks up
 automatically. For a study of your own, copy the closest config and edit the sections the
