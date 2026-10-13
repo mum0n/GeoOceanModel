@@ -280,7 +280,7 @@ function main(args::Vector{String})
     # perturbation (see `run_segments`: `climate` is named or it does not run). The segment
     # functions are the package's own `src/driver.jl`, imported above; this script only
     # decides how far down the chain to go and then dispatches.
-    requested = flags["all"] ? SEG_CHAIN : flags["segments"]
+    requested = flags["all"] ? filter(!=("climate"), SEG_CHAIN) : flags["segments"]
     isempty(requested) && return display_help()
 
     results = run_segments(opts, requested)
