@@ -15,6 +15,9 @@ lived in a script and could not be tested.
 
 using Test
 using GeoOceanModel
+using GeoData
+using GeoDataSources
+using DataFrames
 using Oceananigans
 using JSON3
 using Zarr
@@ -134,6 +137,54 @@ mkpath(OCEAN_TMP)
         @test first(tlons) != g.λᶠᵃᵃ[1]
         @test abs(first(tlons) - g.λᶠᵃᵃ[1]) > 0
     end
-end
+    @testset "land mask: the run's own coastline outranks the bundled one" begin
+        # A closed ring written as GeoParquet exactly the way the fetcher writes one, so
+        # the reader path is exercised rather than mocked.
+        local dir = joinpath(OCEAN_TMP, "coast")
+        mkpath(dir)
+        local ring_lons = Float64[-60.0, -60.0, -59.0, -59.0, -60.0]
+        local ring_lats = Float64[44.0, 45.0, 45.0, 44.0, 44.0]
+        local line = GeoData.GeoInterface.LineString(
+            [(ring_lons[i], ring_lats[i]) for i in eachindex(ring_lons)])
+        GeoData.GeoParquet.write(
+            joinpath(dir, "coastline.parquet"),
+            DataFrame(id = [1], name = ["test ring"], code = ["test_ring"], geometry = [line]),
+            (:geometry,))
 
-rm(OCEAN_TMP; recursive = true, force = true)
+        # The rings the run fetched are the ones the mask is drawn against, and naming
+        # the file instead of its directory resolves the same rings.
+        local from_dir = GeoOceanModel.resolve_land_mask_coastline(nothing; coastline_path = dir)
+        @test length(from_dir) == 1
+        @test from_dir[1].lons == ring_lons
+        @test from_dir[1].lats == ring_lats
+        @test GeoOceanModel.resolve_land_mask_coastline(
+            nothing; coastline_path = joinpath(dir, "coastline.parquet")) == from_dir
+
+        # A directory with no coastline in it, and no path at all, are the two cases
+        # where the region's bundled rings are used.
+        local bare = joinpath(OCEAN_TMP, "no_coast")
+        mkpath(bare)
+        local bundled = GeoDataSources.SCOTIAN_SHELF_COASTLINE
+        @test GeoOceanModel.resolve_land_mask_coastline(nothing; coastline_path = bare) == bundled
+        @test GeoOceanModel.resolve_land_mask_coastline(nothing) == bundled
+
+        # Explicit rings outrank every path.
+        local explicit = NamedTuple[
+            (name = "x", code = :x, lons = Float64[0.0, 1.0, 1.0, 0.0], lats = Float64[0.0, 0.0, 1.0, 1.0])
+        ]
+        @test GeoOceanModel.resolve_land_mask_coastline(explicit; coastline_path = dir) === explicit
+
+        # The synthetic branch honours the same order: the run's ring masks its own
+        # interior, and a caller holding an empty ring set is masked nowhere.
+        local masked = GeoOceanModel.extract_hydrodynamic_dataset(
+            nothing;
+            domain_lon = (-61.0, -58.0), domain_lat = (43.0, 46.0),
+            grid_size = (11, 11), coastline_path = dir)
+        @test any(isnan, masked.speed)
+        local unmasked = GeoOceanModel.extract_hydrodynamic_dataset(
+            nothing;
+            domain_lon = (-61.0, -58.0), domain_lat = (43.0, 46.0),
+            grid_size = (11, 11), coastline = NamedTuple[])
+        @test !any(isnan, unmasked.u)
+    end
+end

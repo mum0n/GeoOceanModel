@@ -8,6 +8,8 @@
 #  realistic-ish run on an ordinary machine -- small enough to finish quickly,
 #  coarse enough to be cheap, keyless enough to need no accounts.
 #
+#  Requires: GeoData and GeoDataSources
+#
 #  Everything is piped in through the GeoData abstraction layer (GeoDataSources)
 #  with KEYLESS products -- no Copernicus Marine account, no tidal-atlas
 #  download:
@@ -18,8 +20,6 @@
 #    boundaries  synthetic        open edges unconstrained (offline)
 #    tides       analytic/off     keyless
 #
-#  `scotian_shelf.toml` is the production twin of this file: the full snow-crab
-#  domain with nwa_bathymetry and GLORYS12V1 (Copernicus, account required).
 #  `julia --project=. GeoOceanModelRun.jl --hydro-only` runs THIS config by default.
 # ==============================================================================
 
@@ -47,7 +47,7 @@ bbl_mixing_closure = "tke"
 
 [boundaries]
 # Synthetic (unconstrained) open edges: keyless, no account, offline-convergent
-# for a demo. No Copernicus download.
+# for a demo 
 method = "none"
 parent_ocean = "synthetic"
 ocean_boundary_source = "synthetic"
@@ -103,7 +103,7 @@ vertical_stretching_mode = "tanh"
 
 [runtype]
 # Run hardware and RNG seed: the former [hardware] and [paths] merged here.
-use_gpu = false
+use_gpu = true
 fallback_to_cpu = false
 seed = 42
 
@@ -114,17 +114,14 @@ sim_dt_seconds = 120.0
 adaptive_cfl = true
 target_cfl = 0.2
 target_wave_cfl = 0.2
-max_dt_seconds = 600.0
+max_dt_seconds = 900.0
 min_dt_seconds = 5.0
 coriolis_latitude = 45.95
 divergence_velocity_limit = 10.0
 surface_heat_flux = 50.0
 turbulence_closure = "nemotke"
 enable_sea_ice = false
-enable_oxygen = false
-output_schedule_seconds = 10800.0
-hydro_model_file = "hydrodynamics_default.jld2"
-enable_checkpoint = true
+enable_oxygen = false 
 
 
 [metadata]
@@ -137,7 +134,7 @@ version = "1.0.0"
 [storage]
 output_path = "../lakehouse/GeoOceanModel/default"
 storage_backend = "zarr"
-output_schedule_seconds = 10800.0
+output_schedule_seconds = 21600.0
 checkpoint_fields = ["u", "v", "w", "T", "S"]
 enable_checkpoint = true
 checkpoint_prefix = "default_checkpoint"
@@ -161,5 +158,5 @@ tidal_phase = 0.0
 
 
 [visualization]
-interactive_map = false
-title = "Cape Breton  Ocean Demonstration"
+interactive_map = true
+title = "Cape Breton Ocean Demonstration"

@@ -74,7 +74,7 @@ end
         v::AbstractArray{<:Real, 3},
         w::AbstractArray{<:Real, 3},
         temp::AbstractArray{<:Real, 3},
-        sal::AbstractArray{<:Real, 3};
+        sal::Union{Nothing, AbstractArray{<:Real, 3}};
         ν_closure::Real = 1e-2,
         κ_closure::Real = 1e-2
     ) -> NamedTuple
@@ -85,6 +85,11 @@ Compute derived physical oceanographic diagnostics:
 - Vertical salinity stratification gradient \$\\\\\\\\\\\\\\partial S / \\\\\\\\\\\\\\partial z\$.
 - Turbulent vertical eddy diffusivity \$\\\\\\\\\\\\\\kappa_v\$ and eddy viscosity \$\\\\\\\\\\\\\\nu_v\$.
 - Relative vertical vorticity \$\\\\\\\\\\\\\\zeta = \\\\\\\\\\\\\\partial v / \\\\\\\\\\\\\\partial x - \\\\\\\\\\\\\\partial u / \\\\\\\\\\\\\\partial y\$.
+
+Salinity (`sal`) is optional. The GeoData store carries u/v/w/T, which is what the output
+callback writes, so a store-backed call passes `nothing`; the density then degrades to its
+thermal term against the reference 35, and ∂S/∂z is 0.0. Neither is filled from a constant a
+run never produced, because such a value would read as observed.
 
 # Mixing provenance
 When `native_κ` / `native_ν` are supplied they are the model-published mixing fields and are
@@ -102,7 +107,7 @@ function compute_hydrodynamic_diagnostics(
     v::AbstractArray{<:Real, 3},
     w::AbstractArray{<:Real, 3},
     temp::AbstractArray{<:Real, 3},
-    sal::AbstractArray{<:Real, 3};
+    sal::Union{Nothing, AbstractArray{<:Real, 3}};
     ν_closure::Real = 1e-2,
     κ_closure::Real = 1e-2,
     native_κ::Union{Nothing, AbstractArray{<:Real, 3}} = nothing,
@@ -122,7 +127,11 @@ function compute_hydrodynamic_diagnostics(
     rho = zeros(Float64, nx, ny, nz)
     for k in 1:nz, j in 1:ny, i in 1:nx
         t_val = Float64(temp[i, j, k])
-        s_val = Float64(sal[i, j, k])
+        # Salinity is optional: the GeoData store carries u/v/w/T, because that is what the
+        # output callback writes. A missing salinity degrades the density to the thermal
+        # term against the reference 35 rather than being filled with a constant the run
+        # never produced -- a constant would read as observed and shift rho.
+        s_val = isnothing(sal) ? S0 : Float64(sal[i, j, k])
         if !isnan(t_val) && !isnan(s_val)
             rho[i, j, k] = rho0 * (1.0 - alpha * (t_val - T0) + beta * (s_val - S0))
         else
@@ -149,7 +158,7 @@ function compute_hydrodynamic_diagnostics(
                 drho = rho[i, j, k_prev] - rho[i, j, k_next]
                 N2[i, j, k] = max(0.0, -(9.81 / rho0) * (drho / dz))
 
-                ds = Float64(sal[i, j, k_prev] - sal[i, j, k_next])
+                ds = isnothing(sal) ? 0.0 : Float64(sal[i, j, k_prev] - sal[i, j, k_next])
                 dS_dz[i, j, k] = ds / dz
 
                 du = Float64(u[i, j, k_prev] - u[i, j, k_next]) / dz
@@ -239,23 +248,66 @@ function compute_hydrodynamic_diagnostics(
 end
 
 """
-    read_immersed_bathymetry(jld2_path::AbstractString) -> Union{Matrix{Float64}, Nothing}
+    read_immersed_bathymetry(location::AbstractString) -> Union{Matrix{Float64}, Nothing}
 
-Read the authoritative seafored bathymetry (metres, negative in the ocean) from the
-`ImmersedBoundaryGrid` serialized inside a simulation JLD2 file.
+Read the authoritative seabed (metres, negative in the ocean) for a realized run.
+
+`location` is the run's output *directory*, which holds the GeoData store -- the ocean
+half's deliverable, and the path `run_segment_simulation` hands back. The seabed is read
+from the store's own `.zattrs`, where `write_grid_metadata!` puts it because it is grid
+metadata that does not vary with time.
 
 The immersed grid's `bottom_height` is the *actual* seabed the simulation ran on, so it is
 the correct reference for masking below-seafloor cells in cross-sections and profiles.
 Falling back to a synthetic flat seabed would silently mask (or fabricate) water column.
 
+A simulation JLD2 *file* is still accepted, for the archives written before the store
+existed: it is read from its `serialized/grid` group. The store is preferred, because it
+is what a run now hands back.
+
 # Inputs
-- `jld2_path`: Path to the simulation JLD2 output file.
+- `location`: Path to the run's output directory (holding `hydrodynamics.zarr`), or to a
+  simulation JLD2 file for older archives.
 
 # Outputs
 - `Matrix{Float64}`: Bottom height on the horizontal grid, indexed `[i_lon, j_lat]`;
-  or `nothing` when the file does not contain a serialized immersed grid.
+  or `nothing` when neither the store nor the file carries an immersed grid.
 """
-function read_immersed_bathymetry(jld2_path::AbstractString)
+function read_immersed_bathymetry(location::AbstractString)
+    # Old archives: a JLD2 file, read from its serialized grid.
+    isfile(location) && endswith(location, ".jld2") && return _read_immersed_bathymetry_jld2(location)
+
+    # The store: `hydrodynamics.zarr` inside the run's output directory.
+    store = output_zarr_path(location)
+    zone = joinpath(store, ".zattrs")
+    isfile(zone) || return nothing
+
+    try
+        attrs = JSON3.read(read(zone, String))
+        haskey(attrs, "bottom_height") || return nothing
+        raw = attrs["bottom_height"]
+        n_lon = length(raw)
+        n_lat = isempty(raw) ? 0 : length(raw[1])
+        mat = Matrix{Float64}(undef, n_lon, n_lat)
+        for i in 1:n_lon, j in 1:n_lat
+            mat[i, j] = Float64(raw[i][j])
+        end
+        return mat
+    catch
+        return nothing
+    end
+end
+
+"""
+    _read_immersed_bathymetry_jld2(jld2_path::AbstractString) -> Union{Matrix{Float64}, Nothing}
+
+Read the immersed seabed from the `serialized/grid` group of a simulation JLD2 file, as
+written by the Oceananigans `JLD2Writer`.
+
+Kept separate from `read_immersed_bathymetry` so the archive-only path is called out by
+name; it exists for runs that predate the store, not as a second way to read a current one.
+"""
+function _read_immersed_bathymetry_jld2(jld2_path::AbstractString)
     isfile(jld2_path) || return nothing
 
     bottom = try
@@ -327,6 +379,37 @@ function resolve_bathymetry_for_plot(lons, lats; sources = (), fallback = nothin
 end
 
 """
+    resolve_land_mask_coastline(
+        coastline;
+        coastline_path::Union{Nothing, AbstractString} = nothing
+    ) -> Vector{NamedTuple}
+
+Land rings the mask is drawn against, in the order the caller can see: the rings
+passed explicitly, else the run's own fetched coastline, else the region's
+bundled rings.
+
+`coastline_path` names the coastline GeoParquet file, or the directory holding
+it as `coastline.parquet`. No file and no path means the region's rings, which
+is the only case where a figure is masked against land the run did not fetch.
+"""
+function resolve_land_mask_coastline(
+    coastline::Union{Nothing, AbstractVector{<:NamedTuple}};
+    coastline_path::Union{Nothing, AbstractString} = nothing
+)
+    isnothing(coastline) || return coastline
+    if !isnothing(coastline_path)
+        candidates = AbstractString[
+            isdir(coastline_path) ? joinpath(coastline_path, "coastline.parquet") :
+                String(coastline_path)
+        ]
+        for candidate in candidates
+            isfile(candidate) && return load_coastline_polygons(candidate)
+        end
+    end
+    return GeoDataSources.SCOTIAN_SHELF_COASTLINE
+end
+
+"""
     extract_hydrodynamic_dataset(
         hydro_input::Any;
         depth::Union{Nothing, Real} = nothing,
@@ -337,7 +420,9 @@ end
         domain_lat::Tuple{<:Real, <:Real} = (40.0, 48.5),
         grid_size::Tuple{Int, Int} = (35, 30),
         target_depths::AbstractVector{<:Real} = [-2.5, -25.0, -50.0, -100.0],
-        run_id::Union{Nothing, AbstractString} = nothing
+        run_id::Union{Nothing, AbstractString} = nothing,
+        coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing,
+        coastline_path::Union{Nothing, AbstractString} = nothing
     ) -> NamedTuple
 
 Extract, normalize, and format 2D and 3D hydrodynamic model fields (advection currents,
@@ -418,7 +503,9 @@ function extract_hydrodynamic_dataset(
     domain_lat::Tuple{<:Real, <:Real} = (40.0, 48.5),
     grid_size::Tuple{Int, Int} = (35, 30),
     target_depths::AbstractVector{<:Real} = [-2.5, -25.0, -50.0, -100.0],
-    run_id::Union{Nothing, AbstractString} = nothing
+    run_id::Union{Nothing, AbstractString} = nothing,
+    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing,
+    coastline_path::Union{Nothing, AbstractString} = nothing
 )
     nx, ny = grid_size
     t_depths = collect(Float64, target_depths)
@@ -701,7 +788,88 @@ function extract_hydrodynamic_dataset(
         )
     end
 
-    # 2. Zarr Storage Connection
+    # 2. GeoData store directory (hydrodynamics.zarr), the ocean half's deliverable
+    #
+    # This is the branch a current run uses. `run_segment_simulation` hands back the run's
+    # output *directory*, so `hydro_input` arrives as that path; the store inside is the only
+    # place the ocean half now writes fields. Before this branch existed such a path fell
+    # through every match and landed on the synthetic synthesis at the bottom, so a figure
+    # of a real run silently drew invented flow.
+    if hydro_input isa AbstractString && isdir(output_zarr_path(hydro_input))
+        store = output_zarr_path(hydro_input)
+        attrs = JSON3.read(read(joinpath(store, ".zattrs"), String))
+        lons_s = Float64.(attrs["lon"])
+        lats_s = Float64.(attrs["lat"])
+        deps_s = Float64.(attrs["depth"])
+        times_s = if isfile(joinpath(store, "time.json"))
+            Float64.(JSON3.read(read(joinpath(store, "time.json"), String), Vector{Float64}))
+        else
+            [0.0]
+        end
+        nt = max(1, length(times_s))
+        m_sel = clamp(resolve_time_index(times_s, time_seconds, time_index), 1, nt) - 1
+
+        # One Zarr array per interval, read from `store/<field>/<m>`. Salinity was never a
+        # store field (the callback writes u/v/w/T), so it stays `nothing` rather than being
+        # filled from a constant the run never used -- `compute_hydrodynamic_diagnostics`
+        # handles a missing salinity, and a value fabricated here would read as observed.
+        #
+        # The store keeps the model's *native* stagger, because the callback writes
+        # `interior(velocities.u)` and friends rather than interpolating: u is one lon face
+        # longer than the centre grid, v one lat face longer, w one depth face longer, and
+        # T already centred. Blending each staggered axis to centres here keeps that fidelity
+        # in the store while giving the figures the regular grid they interpolate against.
+        rd(name) = isdir(joinpath(store, name, string(m_sel))) ?
+                   collect(Zarr.zopen(joinpath(store, name, string(m_sel)))) : nothing
+        _centre(arr::Nothing, ::Int, ::Int, ::Int) = nothing
+        function _centre(arr, n_lon::Int, n_lat::Int, n_z::Int)
+            out = arr
+            size(out, 1) == n_lon + 1 && (out = 0.5 .* (out[1:end-1, :, :] .+ out[2:end, :, :]))
+            size(out, 2) == n_lat + 1 && (out = 0.5 .* (out[:, 1:end-1, :] .+ out[:, 2:end, :]))
+            size(out, 3) == n_z + 1 && (out = 0.5 .* (out[:, :, 1:end-1] .+ out[:, :, 2:end]))
+            return out
+        end
+        shape = (length(lons_s), length(lats_s), length(deps_s))
+        u_s = something(_centre(rd("u"), shape...), fill(NaN, shape...))
+        v_s = something(_centre(rd("v"), shape...), fill(NaN, shape...))
+        w_s = something(_centre(rd("w"), shape...), fill(NaN, shape...))
+        T_s = something(_centre(rd("T"), shape...), fill(NaN, shape...))
+        S_s = nothing
+
+        bathymetry_s = read_immersed_bathymetry(hydro_input)
+        diag = compute_hydrodynamic_diagnostics(lons_s, lats_s, deps_s, u_s, v_s, w_s, T_s, S_s)
+        k_sel = resolve_depth_index(deps_s, depth, depth_level)
+        sel_time = isempty(times_s) ? 0.0 : times_s[clamp(resolve_time_index(times_s, time_seconds, time_index), 1, nt)]
+
+        return (
+            lons = lons_s,
+            lats = lats_s,
+            depths = deps_s,
+            times = times_s,
+            time_seconds = sel_time,
+            resolved_time = sel_time,
+            depth_index = k_sel,
+            depth_m = deps_s[clamp(k_sel, 1, length(deps_s))],
+            resolved_depth = deps_s[clamp(k_sel, 1, length(deps_s))],
+            u = u_s,
+            v = v_s,
+            w = w_s,
+            speed = hypot.(u_s, v_s),
+            temperature = T_s,
+            salinity = S_s,
+            density = diag.density,
+            stratification = diag.stratification,
+            salinity_stratification = diag.salinity_stratification,
+            diffusion = diag.diffusion,
+            viscosity = diag.viscosity,
+            richardson_number = diag.richardson,
+            vorticity = diag.vorticity,
+            elevation = nothing,
+            bathymetry = bathymetry_s
+        )
+    end
+
+    # 3. Zarr Storage Connection
     if !isnothing(hydro_input) && (hydro_input isa Zarr.ZGroup)
         r_id = !isnothing(run_id) ? String(run_id) : begin
             runs_df = list_simulation_runs(hydro_input)
@@ -986,10 +1154,12 @@ function extract_hydrodynamic_dataset(
 
     spd_mat = hypot.(u_mat, v_mat)
 
-    # Mask over land. The rings are passed explicitly: this package is an application layer for
-    # the Scotian Shelf, and the generic data layer no longer defaults to a regional ring set,
-    # so the region's rings are named here where the decision is visible.
-    local coast = GeoDataSources.SCOTIAN_SHELF_COASTLINE
+    # Mask over land. The rings are the run's own fetched coastline when one is
+    # passed, and the region's bundled rings only when it is not: a figure that
+    # masks against a different land than the model ran on silently draws land in
+    # the water. The data layer no longer defaults to a regional ring set, so the
+    # region's rings are named here as the fallback rather than as the choice.
+    local coast = resolve_land_mask_coastline(coastline; coastline_path = coastline_path)
     for i in 1:nx, j in 1:ny
         if is_point_on_land(lons_vec[i], lats_vec[j]; coastline = coast)
             for k in 1:nz

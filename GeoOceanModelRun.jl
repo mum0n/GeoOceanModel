@@ -15,7 +15,7 @@
 #
 #  Usage:
 #      julia --project=. GeoOceanModelRun.jl --help
-#      julia --project=. GeoOceanModelRun.jl --hydro-only
+#      julia --project=. GeoOceanModelRun.jl --all
 #      julia --project=. GeoOceanModelRun.jl --grid
 #
 #  Every name this script imports was checked with `isdefined` against the loaded package,
@@ -87,16 +87,16 @@ function display_help(io::IO = stdout)
       --grid      Build the spherical grid and the immersed-boundary wrapper.
       --model     Configure the hydrostatic free-surface model on that grid.
       --climate   Apply the scenario's warming and freshening to the stratification.
+                  A perturbation, not a prerequisite: it runs only when named.
       --sim       Integrate the primitive equations and write the flow solution.
 
     End to end:
-      --hydro-only   data through --sim: produce the flow solution, then stop.
-      --segment=all  the same.
+      --all        data through --sim, without the climate perturbation: produce the flow
+                   solution, then stop. Use --climate to run the scenario as well.
 
     Configuration:
       --config=FILE      A path, or a name resolved against configs/.
-                         Default: the project's ParticleTracking.toml, else
-                         configs/default.toml.
+                         Default: configs/default.toml.
       --output-dir=DIR   Where the run writes.
       --save-config[=D]  Write the fully-resolved configuration, then exit.
       --help, -h         This message.
@@ -105,12 +105,8 @@ function display_help(io::IO = stdout)
       default         Cape Breton : small box, low resolution, 3 days,
                       keyless data (etopo2022 bathymetry, WOA23, open_meteo
                       winds, synthetic edges). For demos and error testing.
-      scotian_shelf   The full snow-crab Scotian Shelf domain, nwa_bathymetry
-                      and GLORYS12V1 (Copernicus Marine account required).
-
-    The handover:
-      --sim prints the flow-solution path, which is what GeoLarvalTrackingRun.jl
-      --hydro-file takes. This script never calls into GeoLarvalTracking.
+       scotian_shelf   The full snow-crab Scotian Shelf domain, nwa_bathymetry
+                       and GLORYS12V1 (Copernicus Marine account required).
     """)
     return nothing
 end
@@ -125,12 +121,12 @@ wrong thing, which is the failure a CLI should refuse.
 function parse_args(args::Vector{String})
     out = Dict{String, Any}(
         "segments" => String[], "config" => "", "save_config" => nothing,
-        "output_dir" => "", "hydro_only" => false, "help" => false)
+        "output_dir" => "", "all" => false, "help" => false)
     for a in args
         if a in ("--data", "--grid", "--model", "--climate", "--sim")
             push!(out["segments"], replace(a, "--" => ""))
-        elseif a in ("--hydro-only", "--segment=all")
-            out["hydro_only"] = true
+        elseif a == "--all"
+            out["all"] = true
         elseif a in ("--help", "-h")
             out["help"] = true
         elseif a == "--save-config"
@@ -216,12 +212,21 @@ function run_segments(opts::HydrodynamicOptions, requested::Vector{String})
     isempty(unknown) || error("Unknown segment(s): $(join(unknown, ", ")). Known: " *
                               "$(join(SEG_CHAIN, ", ")).")
 
-    # Furthest requested segment defines how far down the chain to run. An empty request is
-    # the same as the old `--hydro-only` default (data, grid, model).
+    # Furthest requested segment defines how far down the chain to run, and every segment
+    # before it runs too because a later one builds on an earlier one's state -- the model
+    # needs the grid's immersed wrapper, the simulation needs the model. An empty request
+    # stops after the model (data, grid, model); `--all` runs every segment.
+    #
+    # climate is the exception. It perturbs the stratification instead of building anything,
+    # so it runs only when named: `--all` and `--sim` alone both produce the flow solution
+    # from the unperturbed model, which is what the larval half tracks through.
     target_idx = isempty(order) ? 3 : maximum(i -> findfirst(==(i), SEG_CHAIN), order)
+    plan = filter(1:target_idx) do i
+        SEG_CHAIN[i] != "climate" || "climate" in order
+    end
 
     data_res = grid_res = model_res = climate_res = sim_res = nothing
-    for i in 1:target_idx
+    for i in plan
         seg = SEG_CHAIN[i]
         if seg == "data"
             data_res = run_segment_data(; opts = opts)
@@ -271,20 +276,14 @@ function main(args::Vector{String})
         return nothing
     end
 
-    # --hydro-only (and --segment=all) run the whole hydrodynamic half, data through the
-    # simulation: that is what produces the flow solution the larval half tracks through.
-    # The segment functions are the package's own `src/driver.jl`, imported above; this
-    # script only decides how far down the chain to go and then dispatches.
-    requested = flags["hydro_only"] ? SEG_CHAIN : flags["segments"]
+    # --all runs the whole chain, data through the simulation, without the climate
+    # perturbation (see `run_segments`: `climate` is named or it does not run). The segment
+    # functions are the package's own `src/driver.jl`, imported above; this script only
+    # decides how far down the chain to go and then dispatches.
+    requested = flags["all"] ? SEG_CHAIN : flags["segments"]
     isempty(requested) && return display_help()
 
     results = run_segments(opts, requested)
-
-    if !isnothing(results.sim)
-        println("\nOcean output written to the GeoData store: $(results.sim.output_path)")
-        println("Track larvae through it with GeoLarvalTrackingRun.jl " *
-                "--hydro-file=$(results.sim.output_path)")
-    end
     return nothing
 end
 

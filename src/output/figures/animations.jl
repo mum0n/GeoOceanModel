@@ -98,7 +98,8 @@ function animate_hydrodynamic_field(
     colormap::Union{Nothing, Symbol} = nothing,
     show_trajectories::Bool = false,
     domain_lon::Tuple{<:Real, <:Real} = (-68.0, -57.0),
-    domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.0)
+    domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.0),
+    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing
 )::String
     mkpath(dirname(output_path))
 
@@ -109,7 +110,8 @@ function animate_hydrodynamic_field(
         depth_level = depth_level,
         time_index = 1,
         domain_lon = domain_lon,
-        domain_lat = domain_lat
+        domain_lat = domain_lat,
+        coastline = coastline
     )
     lons = hydro_init.lons
     lats = hydro_init.lats
@@ -211,7 +213,8 @@ function animate_hydrodynamic_field(
                     depth_level = depth_level,
                     time_index = frame_indices[frame_step],
                     domain_lon = domain_lon,
-                    domain_lat = domain_lat
+                    domain_lat = domain_lat,
+        coastline = coastline
                 )
             else
                 extract_hydrodynamic_dataset(
@@ -220,7 +223,8 @@ function animate_hydrodynamic_field(
                     depth_level = depth_level,
                     time_seconds = frame_indices[frame_step],
                     domain_lon = domain_lon,
-                    domain_lat = domain_lat
+                    domain_lat = domain_lat,
+        coastline = coastline
                 )
             end
 
@@ -361,7 +365,8 @@ function animate_hydrodynamic_dashboard(
     framerate::Int = 10,
     show_trajectories::Bool = false,
     domain_lon::Tuple{<:Real, <:Real} = (-68.0, -57.0),
-    domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.0)
+    domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.0),
+    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing
 )::String
     mkpath(dirname(output_path))
 
@@ -372,7 +377,8 @@ function animate_hydrodynamic_dashboard(
         depth_level = depth_level,
         time_index = 1,
         domain_lon = domain_lon,
-        domain_lat = domain_lat
+        domain_lat = domain_lat,
+        coastline = coastline
     )
     lons = hydro_init.lons
     lats = hydro_init.lats
@@ -486,7 +492,8 @@ function animate_hydrodynamic_dashboard(
                     depth_level = depth_level,
                     time_index = frame_indices[frame_step],
                     domain_lon = domain_lon,
-                    domain_lat = domain_lat
+                    domain_lat = domain_lat,
+        coastline = coastline
                 )
             else
                 extract_hydrodynamic_dataset(
@@ -495,7 +502,8 @@ function animate_hydrodynamic_dashboard(
                     depth_level = depth_level,
                     time_seconds = frame_indices[frame_step],
                     domain_lon = domain_lon,
-                    domain_lat = domain_lat
+                    domain_lat = domain_lat,
+        coastline = coastline
                 )
             end
 

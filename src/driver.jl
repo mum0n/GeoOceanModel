@@ -26,9 +26,14 @@
 """
     resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
 
-Resolve this run's model-file base path and name. If `opts.hydro_model_file` is specified it is
-used directly (or resolved relative to `opts.output_dir` when a bare name is given); if empty it
-is `joinpath(opts.output_dir, default_filename)`. Its directory is the run's output directory,
+Resolve this run's model-file base path and name -- the Oceananigans restart checkpoint,
+not a deliverable. The fields a consumer reads live in the GeoData store at
+`dirname(...)/hydrodynamics.zarr`, written by the output callback; this file is what
+`pickup` resumes from, so `dirname` is what anchors the store and the checkpoints.
+
+If `opts.hydro_model_file` is specified it is used directly (or resolved relative to
+`opts.output_dir` when a bare name is given); if empty it is
+`joinpath(opts.output_dir, default_filename)`. Its directory is the run's output directory,
 where the GeoData store is written, and the base names the JLD2 restart checkpoint; the store
 itself is `output_zarr_path(dirname(...))`.
 
@@ -195,7 +200,10 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
     # The coastline is a fetched input like any other, and is listed in the provenance
     # registry, so it is acquired rather than seeded from a file in this repository. A stale
     # repository copy would let two scenarios mask against different land.
-    coastline_file = joinpath(opts.input_dir, "coastline.dat")
+    # `.parquet`, not `.dat`: the data layer's `load_coastline_polygons` reads GeoParquet and
+    # rejects any other suffix. The `.dat` name it used to carry was Parquet bytes under a
+    # mislabel, which let the fetch succeed and the later read fail.
+    coastline_file = joinpath(opts.input_dir, "coastline.parquet")
     if !isfile(coastline_file)
         src = opts.coastline_source
         println("Retrieving coastline ($(src))...")
@@ -245,13 +253,16 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
     if opts.enable_tides
         src_str = lowercase(strip(String(opts.tides_source)))
         if !(src_str in ("analytic", "synthetic", "none", "off", "false"))
-            tides_file = replace(GeoDataSources.data_source(:tides).cache, "<output_dir>" => opts.output_dir)
+            # `resolved_cache_path`, not the raw `.cache` template: the template names
+            # `<store>`, and a test that substitutes only `<output_dir>` looks at a
+            # `<store>/tpxo9/...` directory that never exists, so it re-fetches every run.
+            tides_file = GeoDataSources.resolved_cache_path(:tides, opts.output_dir)
             if !isfile(tides_file)
                 println("Retrieving tidal solution ($(opts.tides_source))...")
-                GeoDataSources.fetch_input(:tides, opts.output_dir)
-            else
-                println("Using existing real tidal solution file: $tides_file")
+                tides_res = GeoDataSources.fetch_input(:tides, opts.output_dir)
+                tides_file = tides_res isa AbstractString ? String(tides_res) : tides_file
             end
+            println("Tidal solution: $tides_file")
         end
     end
 
@@ -447,10 +458,11 @@ function run_segment_model(;
     tidal_forcing = if opts.enable_tides
         src_str = lowercase(strip(String(opts.tides_source)))
         if !(src_str in ("analytic", "synthetic", "none", "off", "false"))
-            tides_file = replace(GeoDataSources.data_source(:tides).cache, "<output_dir>" => opts.output_dir)
+            tides_file = GeoDataSources.resolved_cache_path(:tides, opts.output_dir)
             if !isfile(tides_file)
                 println("Tidal solution missing at $(tides_file); retrieving via fetch_input(:tides)...")
-                GeoDataSources.fetch_input(:tides, opts.output_dir)
+                tides_res = GeoDataSources.fetch_input(:tides, opts.output_dir)
+                tides_file = tides_res isa AbstractString ? String(tides_res) : tides_file
             end
             if !isfile(tides_file)
                 error(
@@ -888,9 +900,8 @@ function run_segment_simulation(;
         end
     end
 
-    # If reuse-hydro requested or animate-hydro on existing hydrodynamic output: reuse the store
-    can_reuse = (opts.reuse_hydro || (opts.animate_hydro && !isempty(opts.hydro_model_file))) &&
-                file_info.exists && file_info.n_timesteps > 0
+    # If reuse-hydro requested, or animate-hydro on an existing simulation: reuse the store.
+    can_reuse = opts.reuse_hydro && file_info.exists && file_info.n_timesteps > 0
     if can_reuse
         println("\n=================================================================")
         println(" [Segment 5/8] Hydrodynamic Simulation Time Stepping")
@@ -1057,7 +1068,15 @@ function run_segment_simulation(;
     # The larval half opens that through the data layer rather than through Oceananigans'
     # storage layout, which is the coupling the whole split exists to remove. On a resume the
     # store is appended to, not rebuilt.
-    output_store = attach_output_callback!(sim, out_dir_target; fields = ("u", "v", "w", "T"), resume = resume)
+    #
+    # The store's cadence is the same `TimeInterval` the JLD2 writer was given, built here in
+    # one place and handed to both. Constructing it separately would risk two cadences in one
+    # run, and omitting it is worse: an unscheduled Oceananigans `Callback` fires every
+    # timestep, not on the output interval.
+    out_interval = Oceananigans.TimeInterval(
+        (opts.output_schedule_seconds > 0.0) ? opts.output_schedule_seconds : 21600.0)
+    output_store = attach_output_callback!(sim, out_dir_target; fields = ("u", "v", "w", "T"),
+                                           schedule = out_interval, resume = resume)
     @assert output_store == store_path "output store drifted from the resume/reuse target"
     println("Ocean output is a GeoData store: $(output_store)")
 
@@ -1092,6 +1111,13 @@ function render_hydrodynamic_animation_if_requested(
     # The run's own bathymetry, resolved the same way the grid was, so the animation and the
     # model it shows describe one sea floor.
     bathy_data = _run_bathymetry(; opts = opts)
+    # The run's own coastline, fetched in Segment 1 and kept in the run's input directory.
+    # Read here rather than defaulting to the bundled regional rings: a figure that masks
+    # against a different land than the model ran on silently draws land in the water.
+    # Absent file means no rings, and the caller falls back to the region's rings.
+    coastline_rings = let path = joinpath(opts.input_dir, "coastline.parquet")
+        isfile(path) ? load_coastline_polygons(path) : nothing
+    end
     anim_fmt = lowercase(opts.anim_format) == "gif" ? "gif" : "mp4"
     anim_file_path = if !isempty(strip(opts.anim_output_path))
         opts.anim_output_path
@@ -1113,7 +1139,8 @@ function render_hydrodynamic_animation_if_requested(
             framerate = opts.anim_fps,
             show_trajectories = false,
             domain_lon = opts.domain_lon,
-            domain_lat = opts.domain_lat
+            domain_lat = opts.domain_lat,
+            coastline = coastline_rings
         )
     else
         println("Rendering hydrodynamic $(opts.anim_variable) field -> $(anim_file_path)...")
@@ -1127,7 +1154,8 @@ function render_hydrodynamic_animation_if_requested(
             framerate = opts.anim_fps,
             show_trajectories = false,
             domain_lon = opts.domain_lon,
-            domain_lat = opts.domain_lat
+            domain_lat = opts.domain_lat,
+            coastline = coastline_rings
         )
     end
     println("Hydrodynamic animation saved to: $(anim_file_path)")
@@ -1197,13 +1225,16 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
         t_elapsed = round(time() - t_start, digits = 2)
         println("\n=================================================================")
         println(" Hydrodynamics-only execution complete in $(t_elapsed) s (--hydro-only specified).")
-        println(" Flow solution saved to: $(isnothing(sim_res) ? opts.hydro_model_file : sim_res.output_path)")
+        println(" Flow solution saved to: $(isnothing(sim_res) ? store_path : sim_res.output_path)")
         println(" Skipping larval particle tracking and metrics.")
 
         viz_res = nothing
         if opts.animate_hydro
             println(" Generating requested hydrodynamic animations...")
-            hydro_source = isnothing(sim_res) ? opts.hydro_model_file : sim_res.output_path
+            # The store the run just wrote, which is the only data source the figures take.
+            # Before the store existed this read the simulation JLD2, which is now the
+            # restart checkpoint alone -- the fields a figure draws are not in it.
+            hydro_source = isnothing(sim_res) ? store_path : sim_res.output_path
             anim_file = render_hydrodynamic_animation_if_requested(opts, hydro_source)
             viz_res = (animation = anim_file,)
         end

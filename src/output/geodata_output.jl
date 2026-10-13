@@ -180,23 +180,54 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
 end
 
 """
-    attach_output_callback!(sim, output_dir; fields = ("u","v","w","T"))
+    attach_output_callback!(sim, output_dir; fields = ("u","v","w","T"), schedule = nothing,
+                            resume = false)
 
 Build the store and attach the writer to `sim`. Returns the store path, so the caller records
 it in the handover and the larval half is given a location rather than an object.
 
-The callback is `Callback(cb)` with no schedule: Oceananigans supplies one from the
-simulation's own output interval, which is the run's actual cadence. Passing an explicit
-`Schedule.Every(...)` would need `Oceananigans.Schedule`, which this version does not export,
-and would risk two different cadences in one run.
+`schedule` is a `TimeInterval` in simulated seconds, and it must be given: an `Oceananigans`
+`Callback` with no schedule fires on *every* timestep, not on the simulation's output
+interval, so a 30-day adaptive run wrote 4200-odd intervals instead of the ~240 the
+`output_schedule_seconds` in the TOML asked for. `Oceananigans.Schedule` is not exported in
+this version, so the caller passes the interval it already built for the JLD2 writer and both
+writers share one cadence by construction rather than by convention.
 """
 function attach_output_callback!(sim, output_dir::AbstractString;
-                                  fields::Tuple = ("u", "v", "w", "T"), resume::Bool = false)
+                                  fields::Tuple = ("u", "v", "w", "T"),
+                                  schedule = nothing, resume::Bool = false)
     cb = GeodataOutputCallback(output_dir, sim.model; fields = fields, resume = resume)
-    Oceananigans.add_callback!(sim, Oceananigans.Callback(cb))
+    if isnothing(schedule)
+        # A `TimeInterval` is constructed here rather than in the caller so this stays usable
+        # on its own: 6 h is the default the TOML asks for. Both writers are then given the
+        # same object from `run_segment_simulation`, so this default is a fallback, not a
+        # second cadence.
+        schedule = Oceananigans.TimeInterval(6 * 3600.0)
+    end
+    Oceananigans.add_callback!(sim, Oceananigans.Callback(cb, schedule))
     store = output_zarr_path(output_dir)
     write_grid_metadata!(store, sim.model)
     return store
+end
+
+"""
+    seabed_from_model(model) -> Union{Matrix{Float64}, Nothing}
+
+The immersed seabed the simulation actually ran on, as `[i_lon, j_lat]` with the halo
+stripped. `nothing` when the model is not on an immersed grid.
+
+This is the same value the JLD2 `serialized/grid` branch of `read_immersed_bathymetry`
+returns, extracted from a live model so the store can carry it: a figure that masks cells
+against the seabed must see the one the run used, not a re-derived stand-in.
+"""
+function seabed_from_model(model)
+    g = model.grid
+    g isa ImmersedBoundaryGrid || return nothing
+    ib = g.immersed_boundary
+    (hasproperty(ib, :bottom_height) && !isnothing(ib.bottom_height)) || return nothing
+    bh = ib.bottom_height
+    Hx, Hy, Nx, Ny = g.Hx, g.Hy, g.Nx, g.Ny
+    return [Float64(bh[i, j, 1]) for i in (Hx + 1):(Hx + Nx), j in (Hy + 1):(Hy + Ny)]
 end
 
 """
@@ -208,6 +239,10 @@ Written, not derived, because this is the moment the information exists: a reade
 path, and a store that does not say where its cells are on Earth cannot be interpolated
 against. This is what replaced the sidecar -- the same coordinates now travel *inside* the
 store instead of in a second file next to it.
+
+`bottom_height` is written here too, for the reason `read_immersed_bathymetry` explains: it
+is the seabed the run used, it does not vary with time, and a figure that masks below the
+seafloor must not re-derive one.
 """
 function write_grid_metadata!(store::AbstractString, model)
     ax = _field_arrays(model)
@@ -221,6 +256,10 @@ function write_grid_metadata!(store::AbstractString, model)
     e = length(ax.y) > 1 ? ax.y[2] - ax.y[1] : 0.0
     out["dlon"] = d
     out["dlat"] = e
+    seabed = seabed_from_model(model)
+    if !isnothing(seabed)
+        out["bottom_height"] = seabed
+    end
     open(zone, "w") do io
         JSON3.write(io, out)
     end
