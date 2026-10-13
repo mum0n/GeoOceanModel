@@ -102,7 +102,7 @@ function display_help(io::IO = stdout)
       --help, -h         This message.
 
     Two configurations:
-      default         Cape Breton (NENE): small box, low resolution, 3 days,
+      default         Cape Breton : small box, low resolution, 3 days,
                       keyless data (etopo2022 bathymetry, WOA23, open_meteo
                       winds, synthetic edges). For demos and error testing.
       scotian_shelf   The full snow-crab Scotian Shelf domain, nwa_bathymetry
@@ -153,20 +153,14 @@ end
 """
     resolve_config_file(flag::AbstractString) -> String
 
-Which configuration this run uses, as a *path*. A file path is used as given; a bare name is
-resolved against `configs/<name>.toml` beside this script; an empty flag falls back to the
-project's own split file, then its scenario config. This returns a path -- `load_configuration`
-opens the file -- so unlike the package's `resolve_config_name` (which returns a stem for
-checkpoint prefixes) it never reduces a config to just its name.
+Which configuration this run uses, as a *path*. An empty flag is this half's own
+`configs/default.toml`; anything else is resolved through `resolve_config_path`. This returns a
+path -- `load_configuration` opens the file -- so unlike the package's `resolve_config_name`
+(which returns a stem for checkpoint prefixes) it never reduces a config to just its name.
 """
 function resolve_config_file(flag::AbstractString)
-    isempty(strip(flag)) || return resolve_config_path(String(flag))
-    # This package's own split file, then its scenario config. Both are beside this script,
-    # not one directory up: `..` from this package's directory is the workspace root, where
-    # the split deliberately put neither of them.
-    own = joinpath(@__DIR__, "ParticleTracking.toml")
-    isfile(own) && return own
-    return joinpath(@__DIR__, "configs", "default.toml")
+    isempty(strip(flag)) && return joinpath(@__DIR__, "configs", "default.toml")
+    return resolve_config_path(String(flag))
 end
 
 """

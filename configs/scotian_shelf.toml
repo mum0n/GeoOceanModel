@@ -108,9 +108,11 @@ resolution_scale = 1.0
 vertical_stretching_mode = "tanh"
 
 
-[hardware]
+[runtype]
+# Run hardware and RNG seed: the former [hardware] and [paths] merged here.
 use_gpu = false
 fallback_to_cpu = false
+seed = 42
 
 
 [hydrodynamics]
@@ -139,19 +141,15 @@ author = "GeoOceanModel"
 version = "1.0.0"
 
 
-[paths]
-seed = 42
-
-
 [storage]
-output_path = "outputs/scotian_shelf/scotian_shelf.jld2"
+output_path = "../lakehouse/GeoOceanModel/scotian_shelf"
 storage_backend = "zarr"
 output_schedule_seconds = 1800.0
 checkpoint_fields = ["u", "v", "w", "T", "S"]
 enable_checkpoint = true
 checkpoint_prefix = "scotian_shelf_checkpoint"
 checkpoint_schedule_seconds = 3600.0
-checkpoint_dir = "outputs/scotian_shelf/checkpoints"
+checkpoint_dir = "../lakehouse/GeoOceanModel/scotian_shelf/checkpoints"
 cleanup_checkpoints = true
 auto_restart = true
 

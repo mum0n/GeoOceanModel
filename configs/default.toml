@@ -1,9 +1,9 @@
 # ==============================================================================
-#  default.toml — the ocean half, Cape Breton (NENE) demonstration
+#  default.toml — the ocean half, Cape Breton  demonstration
 # ==============================================================================
 #
 #  The default GeoOceanModel config: a SMALL area centred on Cape Breton, the
-#  Northeast Nova Scotia (NENE) corner of the Scotian Shelf, at LOW resolution
+#  Northeast Nova Scotia  corner of the Scotian Shelf, at LOW resolution
 #  and for a 3-DAY run. It exists for demonstrations and error testing of a
 #  realistic-ish run on an ordinary machine -- small enough to finish quickly,
 #  coarse enough to be cheap, keyless enough to need no accounts.
@@ -101,9 +101,11 @@ resolution_scale = 1.0
 vertical_stretching_mode = "tanh"
 
 
-[hardware]
+[runtype]
+# Run hardware and RNG seed: the former [hardware] and [paths] merged here.
 use_gpu = false
 fallback_to_cpu = false
+seed = 42
 
 
 [hydrodynamics]
@@ -126,25 +128,21 @@ enable_checkpoint = true
 
 
 [metadata]
-name = "Cape Breton (NENE) Ocean Demonstration"
+name = "Cape Breton  Ocean Demonstration"
 description = "3-day low-resolution demonstration over Cape Breton of the Scotian Shelf, keyless data only (etopo2022 bathymetry, woa23 hydrography, open_meteo winds)"
 author = "GeoOceanModel"
 version = "1.0.0"
 
 
-[paths]
-seed = 42
-
-
 [storage]
-output_path = "outputs/default/default.jld2"
+output_path = "../lakehouse/GeoOceanModel/default"
 storage_backend = "zarr"
 output_schedule_seconds = 10800.0
 checkpoint_fields = ["u", "v", "w", "T", "S"]
 enable_checkpoint = true
 checkpoint_prefix = "default_checkpoint"
 checkpoint_schedule_seconds = 21600.0
-checkpoint_dir = "outputs/default/checkpoints"
+checkpoint_dir = "../lakehouse/GeoOceanModel/default/checkpoints"
 cleanup_checkpoints = true
 auto_restart = true
 
@@ -164,4 +162,4 @@ tidal_phase = 0.0
 
 [visualization]
 interactive_map = false
-title = "Cape Breton (NENE) Ocean Demonstration"
+title = "Cape Breton  Ocean Demonstration"

@@ -8,14 +8,14 @@
 #
 #  Included LAST in `GeoOceanModel.jl`, after the model builders and the store
 #  writer, so every name these bodies reach for (`build_shelf_grid`,
-#  `build_hydrodynamic_model`, `inspect_hydrodynamic_file`, the tidal helpers,
-#  `attach_output_callback!`, ...) is already defined when a call happens.
+#  `build_hydrodynamic_model`, the tidal helpers, `attach_output_callback!`, ...)
+#  is already defined when a call happens.
 #
-#  What is NOT here: the larval segments and the Zarr storage/analytics API.
-#  `run_production_pipeline` reaches them on the path past the handover, and
-#  `run_segment_simulation` reaches the legacy storage writer inside the
-#  hand-over block. Under the split each is a stub that names where it really
-#  lives, so the coupling is at the call site rather than a `MethodError` later.
+#  What is NOT here: the lar**val** segments and the larval results/analytics
+#  API. `run_production_pipeline` reaches `run_segment_tracking` and its
+#  siblings on the path past the hand-over, and under the split each is a stub
+#  that names where it really lives (`GeoLarvalTracking`), so the coupling is at
+#  the call site rather than a `MethodError` later.
 #
 #  NO `using` statements. The module imports Oceananigans, `prettytime`, the
 #  manifest and `GeoDataSources`; a file included into a package relies on the
@@ -24,15 +24,17 @@
 # ==============================================================================
 
 """
-    resolve_hydro_model_path(opts::HydroDynamicOptions, default_filename::String) -> Tuple{String, String}
+    resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::String) -> Tuple{String, String}
 
-Resolve the target hydrodynamic JLD2 output/input path and filename. If `opts.hydro_model_file`
-is specified, it is used directly (or resolved relative to `opts.output_dir` if a bare filename
-is provided). If empty, returns `(joinpath(opts.output_dir, default_filename), default_filename)`.
+Resolve this run's model-file base path and name. If `opts.hydro_model_file` is specified it is
+used directly (or resolved relative to `opts.output_dir` when a bare name is given); if empty it
+is `joinpath(opts.output_dir, default_filename)`. Its directory is the run's output directory,
+where the GeoData store is written, and the base names the JLD2 restart checkpoint; the store
+itself is `output_zarr_path(dirname(...))`.
 
 # Inputs
 - `opts::HydrodynamicOptions`: Configuration parameters.
-- `default_filename::String`: Default fallback filename when none is specified.
+- `default_filename::String`: Default fallback name when none is specified.
 
 # Outputs
 - `Tuple{String, String}`: `(full_path, file_basename)`
@@ -58,7 +60,10 @@ other halves. `woa23_in_store` picks the first copy that exists.
 """
 function _woa_store_locations(opts::HydrodynamicOptions)
     root = dirname(@__DIR__)   # the GeoOceanModel package directory
-    dirs = AbstractString[opts.input_dir, joinpath(root, "inputs")]
+    # The central GeoData store first (projects/lakehouse/GeoData/woa23), then the run and
+    # its siblings, then the umbrella's. Reading the central copy means a ~1.8 GB
+    # climatology is fetched once per machine, not once per run.
+    dirs = AbstractString[GeoDataSources.store_path("woa23"), opts.input_dir, joinpath(root, "inputs")]
     for scan in (joinpath(root, "work"), joinpath(root, "outputs"),
                  joinpath(root, "..", "ParticleTracking", "outputs"))
         isdir(scan) && for d in readdir(scan; join = true)
@@ -688,7 +693,9 @@ end
                 lon_range = opts.domain_lon,
                 lat_range = opts.domain_lat,
                 month = opts.hydrography_month,
-                output_dir = opts.input_dir
+                # WOA23 is a shared, machine-level product; it lands in the central GeoData
+                # store (GeoDataSources.store_path("woa23")) rather than this run's inputs.
+                output_dir = GeoDataSources.store_path("woa23")
             )
             # Recheck paths after GeoDataSources acquisition (now in this run's input dir).
             t_file = isfile(joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.nc")) ?
@@ -853,7 +860,7 @@ function run_segment_simulation(;
     model = nothing
 )
     default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
-    jld2_path, jld2_filename = resolve_hydro_model_path(opts, default_jld2)
+    jld2_path, _ = resolve_hydro_model_path(opts, default_jld2)
     # The store is where this run's output lives and is what resume/reuse act on; the JLD2 is
     # only the Oceananigans restart checkpoint (state, not a deliverable).
     store_path = output_zarr_path(dirname(jld2_path))
@@ -1150,7 +1157,7 @@ The pipeline is two commands with the handover file between them
 # Outputs
 - `NamedTuple`: Summary of all workflow artifacts.
 """
-function run_production_pipeline(; opts::HydrodynamicOptions = HydroDynamicOptions())
+function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptions())
     println("\n=================================================================")
     println(" Executing Full Hydrodynamic & Particle Tracking Pipeline")
     println("=================================================================")

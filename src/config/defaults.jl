@@ -44,7 +44,7 @@ no statement of what it actually simulated -- it would be indistinguishable from
 was configured deliberately.
 
 Available configurations in this project:
-  configs/default.toml       Cape Breton (NENE): small box, low resolution, 3 days,
+  configs/default.toml       Cape Breton : small box, low resolution, 3 days,
                              keyless data (etopo2022, WOA23, open_meteo). For demos.
   configs/scotian_shelf.toml  The full snow-crab Scotian Shelf domain, nwa_bathymetry
                              and GLORYS12V1 (Copernicus Marine account required).

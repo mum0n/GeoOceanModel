@@ -143,8 +143,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     cv_mortality = Float64(get_val("biology", "cv_mortality", 0.25))
     cv_settlement = Float64(get_val("biology", "cv_settlement", 0.25))
 
-    use_gpu      = Bool(get_val("hardware", "use_gpu", false))
-    fallback_cpu = Bool(get_val("hardware", "fallback_to_cpu", false))
+     use_gpu      = Bool(get_val("runtype", "use_gpu", get_val("hardware", "use_gpu", false)))
+     fallback_cpu = Bool(get_val("runtype", "fallback_to_cpu", get_val("hardware", "fallback_to_cpu", false)))
     interactive  = Bool(get_val("visualization", "interactive_map", true))
     anim_hydro   = Bool(get_val("visualization", "animate_hydro", false))
     anim_var     = Symbol(lowercase(String(get_val("visualization", "anim_variable", "dashboard"))))
@@ -154,7 +154,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     anim_overlay = Bool(get_val("visualization", "anim_overlay_particles", false))
      anim_out_path = String(get_val("visualization", "anim_output_path", ""))
 
-     output_path = String(get_val("storage", "output_path", joinpath("outputs", "particle_tracking.jld2")))
+      output_path = String(get_val("storage", "output_path", joinpath("outputs", "default")))
      zarr_path   = String(get_val("storage", "zarr_path", joinpath("outputs", "particle_tracking.zarr")))
      storage_backend = String(get_val("storage", "storage_backend", "zarr"))
      
@@ -164,16 +164,18 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
      checkpoint_dir = String(get_val("storage", "checkpoint_dir", "outputs/checkpoints"))
      checkpoint_cleanup = Bool(get_val("storage", "checkpoint_cleanup", true))
      
-     # Ingested data lives in `<output_path>` directory's `inputs` subdirectory, beside this
-     # run's outputs, provenance and resolved config. It is deliberately NOT configurable and
-     # NOT shared between runs: a single top-level `inputs/` let a run with a changed domain
-     # silently reuse another domain's bathymetry, which is exactly the quiet mismatch
-     # `resolved_config.toml` and `data_provenance.json` exist to expose. The cost is disk --
-     # a dataset is fetched once per scenario rather than once per machine -- and that is the
-     # intended trade, because it makes each scenario a self-contained, shareable directory.
-     output_dir = dirname(output_path)
+     # `storage.output_path` is this run's output DIRECTORY -- under the lakehouse -- and
+     # everything a run writes lives beneath it: the GeoData store, this run's `inputs/`
+     # ingested-data cache, its provenance and its resolved config. It is deliberately NOT
+     # shared between runs: one shared `inputs/` let a run with a changed domain silently
+     # reuse another domain's bathymetry, the quiet mismatch `resolved_config.toml` and
+     # `data_provenance.json` exist to expose. The cost is disk -- a dataset is fetched once
+     # per scenario rather than once per machine -- and that is the intended trade, because it
+     # makes each scenario a self-contained, shareable directory under
+     # `lakehouse/GeoOceanModel/<name>/`.
+     output_dir = output_path
      input_dir  = joinpath(output_dir, "inputs")
-     seed       = Int(get_val("paths", "seed", 42))
+     seed       = Int(get_val("runtype", "seed", get_val("paths", "seed", 42)))
 
      hydro_file = String(get_val("hydrodynamics", "hydro_model_file", ""))
      hydro_only = Bool(get_val("hydrodynamics", "hydro_only", false))
@@ -190,8 +192,9 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     # Field-output cadence, distinct from the checkpoint cadence. Read from [storage] rather
     # than hardcoded downstream, so the two can legitimately differ.
     out_sched = Float64(get_val("storage", "output_schedule_seconds", 21600.0))
-    cp_dir    = String(get_val("storage", "checkpoint_dir",
-                               get_val("paths", "checkpoint_dir", "")))
+     cp_dir    = String(get_val("storage", "checkpoint_dir",
+                                get_val("runtype", "checkpoint_dir",
+                                        get_val("paths", "checkpoint_dir", ""))))
     cp_clean  = Bool(get_val("storage", "checkpoint_cleanup", true))
     auto_res  = Bool(get_val("hydrodynamics", "auto_restart", true))
 
@@ -529,10 +532,6 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "checkpoint_dir" => opts.checkpoint_dir,
             "checkpoint_cleanup" => opts.checkpoint_cleanup
         ),
-        "hardware" => Dict{String, Any}(
-            "use_gpu" => opts.use_gpu,
-            "fallback_to_cpu" => opts.fallback_to_cpu
-        ),
         "tessellation" => Dict{String, Any}(
             "enable_voronoi" => opts.enable_voronoi,
             "n_units" => opts.voronoi_n_units,
@@ -561,7 +560,9 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "anim_overlay_particles" => opts.anim_overlay_particles,
             "anim_output_path" => opts.anim_output_path
         ),
-        "paths" => Dict{String, Any}(
+        "runtype" => Dict{String, Any}(
+            "use_gpu" => opts.use_gpu,
+            "fallback_to_cpu" => opts.fallback_to_cpu,
             "seed" => opts.seed
         )
     )

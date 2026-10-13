@@ -39,9 +39,8 @@ const CONFIG_SECTION_DOMAIN = Dict{String, Symbol}(
     "domain"                => SHARED,
     "grid"                  => SHARED,
     "storage"               => SHARED,
-    "hardware"              => SHARED,
+    "runtype"               => SHARED,
     "visualization"         => SHARED,
-    "paths"                 => SHARED,
     # Ocean: what the physical model is forced and bounded by.
     "data"                  => OCEAN,
     "climate"               => OCEAN,
