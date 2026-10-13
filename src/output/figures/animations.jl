@@ -8,6 +8,8 @@ Field and dashboard animations.
 
 using CairoMakie
 import CairoMakie: record
+using Zarr
+using JSON3
 
 """
     animate_hydrodynamic_field(
@@ -544,5 +546,226 @@ function animate_hydrodynamic_dashboard(
     end
 
     return output_path
+end
+
+"""
+    animate_variable(hydrodynamics; variable = :temperature, depth = :surface, ...) -> String
+
+Animate **one variable** of **one depth** from a run, with that variable and depth as the only
+two things a caller chooses.
+
+`animate_hydrodynamic_field` is the general animation: it takes a `depth_level`, a time window,
+a stride for quivers, trajectories, a bathymetry overlay, and every diagnostic the model
+produces. This function exists for the common case — *show me the field, at one depth, over
+time* — and it does two things that case needs and the general one cannot know:
+
+* it accepts a **path to a realized run** — the output directory, or its `hydrodynamics.zarr`
+  store — and reads the grid from the store's own `.zattrs` and the output times from its
+  `time.json`, so the caller does not have to assemble the frame source by hand;
+* `depth = :surface` (the default) resolves to the **shallowest level of that run**, rather
+  than to index 1. Index 1 is the deepest level of a written store: its depth axis ascends
+  from the bottom, so the "first" level is the seafloor and a caller asking for the surface
+  gets an abyss. A number is a depth in metres, negative down, and resolves to the nearest
+  level.
+
+Anything else a run can be — an opened model, a JLD2 archive, a NamedTuple — is handed
+straight to `animate_hydrodynamic_field`, unchanged.
+
+Which fields are read depends on the variable: temperature needs `T`, salinity needs `S`,
+speed needs `u` and `v` (the speed is computed, as everywhere else, as `hypot.(u, v)`), and a
+diagnostic such as density needs both. A variable whose store fields are absent is an error
+naming what the store carries, rather than a frame of zeros with a plausible colour bar.
+
+Frames are decimated to `frames` at most, because the whole field is held in memory to be
+animated: a year of hourly slices of a 345×245×13 grid is ~600 MB per field. `frames` is also
+the animation length in seconds at `framerate`.
+"""
+function animate_variable(
+    hydrodynamics;
+    variable::Symbol = :temperature,
+    depth::Union{Symbol, Real} = :surface,
+    depth_level::Union{Nothing, Int} = nothing,
+    frames::Int = 24,
+    title::Union{Nothing, AbstractString} = nothing,
+    output_path::AbstractString = "outputs/variable_animation.gif",
+    framerate::Int = 4,
+    domain_lon::Tuple{<:Real, <:Real} = (-68.0, -57.0),
+    domain_lat::Tuple{<:Real, <:Real} = (42.0, 47.5),
+    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing
+)::String
+    # A path that names neither a run store nor a file is not animated. The figure layer's
+    # fallback for an unrecognised source is a *synthetic* field, and a caller who mistyped a
+    # path would get a plausible animation of a run that does not exist.
+    if hydrodynamics isa AbstractString && isnothing(_run_store_dir(hydrodynamics)) &&
+       !isfile(hydrodynamics)
+        error("No run store and no file at $(hydrodynamics). A path that names neither is " *
+              "not animated: the figure layer would otherwise fall back to a synthetic " *
+              "field, which is not this run.")
+    end
+
+    source = _animation_source(hydrodynamics, variable, frames)
+
+    # The depth is resolved from the source, not from a constant: a run's vertical grid is its
+    # own, and the surface level of one is not that of another.
+    if isnothing(depth_level) && depth == :surface
+        depths = collect(Float64, _animation_depths(source))
+        z = depths[argmin(abs.(depths))]
+    else
+        z = depth == :surface ? -1.0 : Float64(depth)
+    end
+
+    kw = (variable = variable,
+          title = something(title, "Hydrodynamic $(variable) at depth $(round(z, digits = 1)) m"),
+          output_path = output_path,
+          framerate = framerate,
+          domain_lon = domain_lon,
+          domain_lat = domain_lat,
+          coastline = coastline)
+    if isnothing(depth_level)
+        return animate_hydrodynamic_field(source; depth = z, kw...)
+    end
+    return animate_hydrodynamic_field(source; depth_level = depth_level, kw...)
+end
+
+# Which store fields each variable is drawn from, by the names `extract_hydrodynamic_dataset`
+# looks for. The first of each group present in the store is the one used, which is what lets
+# the run's own `T` serve a request for `:temperature` without a second mapping to maintain.
+const _ANIMATION_SOURCE_FIELDS = Dict{Symbol, Tuple{Vararg{Symbol}}}(
+    :temperature => (:temperature, :T, :temp, :theta),
+    :salinity => (:salinity, :S, :sal),
+    :speed => (:u, :u_velocity, :u_mean),
+    :current => (:u, :u_velocity, :u_mean),
+    :velocity => (:u, :u_velocity, :u_mean),
+    :advection => (:u, :u_velocity, :u_mean),
+    :u_h => (:u, :u_velocity, :u_mean),
+    :w => (:w, :w_velocity),
+    :vorticity => (:u, :u_velocity, :u_mean),
+    :density => (:temperature, :T, :temp, :salinity, :S, :sal),
+    :stratification => (:temperature, :T, :temp, :salinity, :S, :sal)
+)
+
+"""
+    _run_store_dir(path) -> Union{String, Nothing}
+
+The `hydrodynamics.zarr` directory a run's output path names, or `nothing` if it names no run
+store. Both spellings are accepted — the output directory, or the store itself — because the
+config writes one and the notes and notebooks quote the other.
+"""
+function _run_store_dir(path::AbstractString)
+    isdir(path) || return nothing
+    isfile(joinpath(path, "time.json")) && isfile(joinpath(path, ".zattrs")) && return path
+    inner = joinpath(path, "hydrodynamics.zarr")
+    (isdir(inner) && isfile(joinpath(inner, "time.json"))) && return inner
+    return nothing
+end
+
+"""
+    _animation_source(hydrodynamics, variable, frames)
+
+The frame source `animate_hydrodynamic_field` should be handed for this run and variable.
+
+A run store is read here, into the NamedTuple the figure layer already accepts; anything else
+is returned unchanged. Reading it here rather than in the figure layer is deliberate: the layer
+reads an opened `Zarr` group, which is a lakehouse record, and a run store is not one — it is a
+directory of arrays with its coordinates carrying in `.zattrs`. Two different things, so this is
+where the store's spelling is turned into the layer's.
+
+Only `frames` intervals are read, spread evenly over the run, because the arrays are held in
+memory for the whole animation rather than streamed.
+"""
+function _animation_source(hydrodynamics, variable::Symbol, frames::Int)
+    store = hydrodynamics isa AbstractString ? _run_store_dir(hydrodynamics) : nothing
+    isnothing(store) && return hydrodynamics
+
+    attrs = JSON3.read(read(joinpath(store, ".zattrs"), String))
+    lons = collect(Float64, attrs["lon"])
+    lats = collect(Float64, attrs["lat"])
+    depths = collect(Float64, attrs["depth"])
+    times = Vector{Float64}(JSON3.read(read(joinpath(store, "time.json"), String)))
+
+    fields = haskey(attrs, "fields") ? [String(f) for f in attrs["fields"]] :
+            [d for d in sort(readdir(store)) if isdir(joinpath(store, d))]
+
+    wanted = String[]
+    for alias in get(_ANIMATION_SOURCE_FIELDS, variable, (variable,))
+        name = findfirst(==(String(alias)), fields)
+        isnothing(name) || (name in wanted || push!(wanted, fields[name]))
+    end
+    isempty(wanted) && error(
+        "The store at $(store) does not carry what $(variable) is made of. It carries " *
+        "$(fields); $(variable) needs $(get(_ANIMATION_SOURCE_FIELDS, variable, (variable,))).")
+
+    keep = _decimated_indices(length(times), frames)
+    data = Dict{Symbol, Array{Float64, 4}}()
+    grid_shape = (length(lons), length(lats), length(depths))
+    for name in wanted
+        arr = Array{Float64, 4}(undef, grid_shape..., length(keep))
+        for (m, i) in enumerate(keep)
+            dir = joinpath(store, name, string(i - 1))
+            isdir(dir) || error(
+                "Interval $i of `$(name)` is declared by $(store)'s time axis but its " *
+                "directory $(dir) is missing. The store and its time axis disagree.")
+            arr[:, :, :, m] = _to_centres(Array(Zarr.zopen(dir)), grid_shape)
+        end
+        data[Symbol(name)] = arr
+    end
+
+    pairs = Pair{Symbol, Any}[:lons => lons, :lats => lats, :depths => depths,
+                             :times => times[keep]]
+    append!(pairs, [Symbol(k) => v for (k, v) in data])
+    return NamedTuple(Tuple(pairs))
+end
+
+"""
+    _to_centres(arr, grid_shape)
+
+A field written on its own staggered grid, moved onto cell centres by averaging the two faces
+that bracket each centre. A field already on the centre grid is returned unchanged.
+
+Which axes move is not a table: it is measured. The writer stores exactly what the model holds,
+so `u` arrives as 346×245×13 for a 345×245×13 grid (one more x-face), `v` as 345×246×13, and
+`w` as 345×245×14, while `T` is already centred. A dimension that is one longer than the grid
+is a face axis and is averaged; anything else must agree, or the field is not of this grid.
+
+Averaging rather than dropping the last face matters because the alternative shifts the field
+by half a cell in the grid's own coordinates, and a shifted current is a different current.
+"""
+function _to_centres(arr::AbstractArray{T, 3}, grid_shape::Tuple{Int, Int, Int}) where {T}
+    out = arr
+    for d in 1:3
+        if size(out, d) == grid_shape[d] + 1
+            out = 0.5 .* (selectdim(out, d, 1:(size(out, d) - 1)) .+
+                          selectdim(out, d, 2:size(out, d)))
+        end
+    end
+    size(out) == grid_shape || error(
+        "Field of size $(size(arr)) on a $(grid_shape) grid: not this grid's field, and not " *
+        "its faces either.")
+    return out
+end
+
+"""
+    _decimated_indices(n, frames) -> Vector{Int}
+
+At most `frames` indices spread over `1:n`, always including both ends. The ends matter: the
+first interval is the initial condition and the last is the end of the run, so a decimation
+that dropped either would animate a run that is not the one that was asked for.
+"""
+function _decimated_indices(n::Int, frames::Int)
+    n <= 0 && return Int[]
+    frames >= n && return collect(1:n)
+    frames < 2 && return [1]
+    return sort!(unique(round.(Int, range(1, n, length = frames))))
+end
+
+"""
+    _animation_depths(source) -> Vector{Float64}
+
+The source's vertical axis. For a NamedTuple it is a field; for anything else the figure layer
+resolves it, which is its job and is not duplicated here.
+"""
+function _animation_depths(source)
+    hasproperty(source, :depths) && return collect(Float64, source.depths)
+    return collect(Float64, extract_hydrodynamic_dataset(source; time_index = 1).depths)
 end
 

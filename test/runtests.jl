@@ -187,4 +187,98 @@ mkpath(OCEAN_TMP)
             grid_size = (11, 11), coastline = NamedTuple[])
         @test !any(isnan, unmasked.u)
     end
+
+    @testset "animation: one variable, one depth, from a run's store" begin
+        # The store is written by hand rather than by a run, so this checks the reading and
+        # the depth choice without a simulation. `u` is shaped (n_x + 1, n_y, n_z) on purpose:
+        # that is the shape the writer puts on disk, and the surface level is the LAST one in
+        # the store's depth axis -- both of which the animation has to get right.
+        local d = joinpath(OCEAN_TMP, "anim_store")
+        local nx, ny, nz, nstep = 5, 4, 3, 4
+        local store = GeoOceanModel.output_zarr_path(d)
+        mkpath(store)
+        open(joinpath(store, ".zgroup"), "w") do io
+            write(io, "{\"zarr_format\": 2}")
+        end
+        open(joinpath(store, ".zattrs"), "w") do io
+            JSON3.write(io, Dict{String, Any}(
+                "fields" => ["u", "T"],
+                "title" => "fixture",
+                "lon" => collect(1.0:nx),
+                "lat" => collect(1.0:ny),
+                # Ascending magnitude means the SHALLOWEST level is last, as the run writes it.
+                "depth" => [-30.0, -10.0, -2.5],
+                "dlon" => 0.1, "dlat" => 0.1))
+        end
+        open(joinpath(store, "time.json"), "w") do io
+            JSON3.write(io, Float64.(0:3600:(3600 * (nstep - 1))))
+        end
+        for (name, shp) in (("u", (nx + 1, ny, nz)), ("T", (nx, ny, nz)))
+            for m in 0:(nstep - 1)
+                local dir = joinpath(store, name, string(m))
+                # The same call the writer makes, so a store written by `zcreate` and a store
+                # written here are the same thing to a reader. Writing `.zarray` by hand does
+                # not work: Zarr reverses the declared shape and, without its
+                # `dimension_separator`, looks for a chunk key this layout does not use.
+                local z = Zarr.zcreate(Float64, Zarr.DirectoryStore(dir), shp...;
+                                       fill_value = 0.0)
+                # Distinct along every axis, so each of the checks below can only pass for
+                # the right interval, the right depth, and the right staggering. Interval 0
+                # is offset by one as well, so no interval's value is zero: a zero-valued
+                # field is impossible to tell apart from an unread one.
+                for k in 1:shp[3], j in 1:shp[2], i in 1:shp[1]
+                    z[i, j, k] = 1.0 + m + i + 10k
+                end
+            end
+        end
+
+        # A store-level variable is animated from the store, and the surface default is the
+        # shallowest level, not index 1.
+        local out = joinpath(OCEAN_TMP, "anim.gif")
+        local path = GeoOceanModel.animate_variable(
+            d; output_path = out, frames = 2, domain_lon = (0.5, nx + 0.5),
+            domain_lat = (0.5, ny + 0.5))
+        @test isfile(path) && filesize(path) > 0
+
+        # The surface level of this store is -2.5 m, and it is the LAST of the three: the
+        # depth axis ascends from the bottom, so index 1 is the seafloor. `:surface` must
+        # resolve to the shallowest level, not to index 1 -- which is what the figure layer
+        # does on its own and is the trap this default exists to avoid.
+        local depths = collect(Float64, [-30.0, -10.0, -2.5])
+        @test argmin(abs.(depths)) == nz
+        local val_at_level(i, k) = 1.0 + 0 + i + 10 * k
+
+        local src = GeoOceanModel._animation_source(d, :temperature, 4)
+        local frame = GeoOceanModel.extract_hydrodynamic_dataset(src; time_index = 1)
+        @test frame.depths == depths
+        # The value is the one written for that level and that interval, not a fabricated
+        # field: interval 0, shallowest level.
+        @test frame.temperature[nx, ny, nz] == val_at_level(nx, nz)
+        # And the deepest level is a different value, so the level choice is observable.
+        @test frame.temperature[nx, ny, 1] != frame.temperature[nx, ny, nz]
+
+        # Speed is built from u and v, and `u` is stored on x-faces: one column wider than
+        # the grid. The centred value is the mean of the two faces that bracket it, not the
+        # first face and not the last. The fixture's value is `1 + m + i + 10k`, so the mean
+        # at centre i is exactly `i + 0.5` plus the constant.
+        local speed_src = GeoOceanModel._animation_source(d, :speed, 4)
+        local speed_frame = GeoOceanModel.extract_hydrodynamic_dataset(
+            speed_src; time_index = 1)
+        @test size(speed_frame.u) == (nx, ny, nz)
+        @test speed_frame.u[1, 1, 1] == 0.5 * (val_at_level(1, 1) + val_at_level(2, 1))
+        # The last centre brackets the last two faces, so the array's extra column is used
+        # rather than dropped at the end.
+        @test speed_frame.u[end, 1, 1] == 0.5 * (val_at_level(nx, 1) + val_at_level(nx + 1, 1))
+
+        # A variable the store cannot supply is an error naming what it does carry, rather
+        # than a frame of zeros.
+        @test_throws Exception GeoOceanModel.animate_variable(
+            d; variable = :salinity, output_path = out, frames = 2)
+
+        # A path naming neither a store nor a file is refused. The figure layer's fallback
+        # for an unrecognised source is a synthetic field, and animating one of those would
+        # show a run that does not exist.
+        @test_throws Exception GeoOceanModel.animate_variable(
+            joinpath(OCEAN_TMP, "nope.zarr"); output_path = out, frames = 2)
+    end
 end

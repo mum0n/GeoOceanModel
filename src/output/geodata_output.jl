@@ -124,11 +124,12 @@ function _field_arrays(model)
         return (x = Float64.(c.lons), y = Float64.(c.lats), z = Float64.(c.depths))
     end
     # Metric/rectilinear grid (the unit tests): Cartesian horizontal centres in metres, halo
-    # stripped, with the vertical centre from `znode` as above.
+    # stripped, with the vertical centre from `znode` as above. `_host_copy` rather than a
+    # comprehension over the range, for the reason in its docstring.
     ix = (base.Hx + 1):(base.Hx + base.Nx)
     iy = (base.Hy + 1):(base.Hy + base.Ny)
-    x = Float64[v for v in base.xᶜᵃᵃ[ix]]
-    y = Float64[v for v in base.yᵃᶜᵃ[iy]]
+    x = Float64.(_host_copy(base.xᶜᵃᵃ)[ix])
+    y = Float64.(_host_copy(base.yᵃᶜᵃ)[iy])
     z = [Float64(Oceananigans.Grids.znode(k, base, Oceananigans.Grids.Center()))
          for k in 1:base.Nz]
     return (x = x, y = y, z = z)
@@ -211,6 +212,21 @@ function attach_output_callback!(sim, output_dir::AbstractString;
 end
 
 """
+    _host_copy(a)
+
+`a` copied to the host, **with its index space unchanged**.
+
+Not `Array(a)`, which for an offset array drops the offsets and so changes what a physical
+index means. And not element-by-element access either: when `a` lives on the GPU — which every
+grid coordinate and the immersed seabed do on a GPU machine — that is scalar indexing, and CUDA
+refuses it. The whole seabed extraction was written that way, so the run died there on a GPU
+and nowhere else, with an error that never mentions the seabed. Copying the storage and
+re-wrapping it in the original axes is one bulk device-to-host transfer, and the caller's
+indices then mean exactly what they meant before.
+"""
+_host_copy(a) = OffsetArray(Array{eltype(a)}(parent(a)), axes(a)...)
+
+"""
     seabed_from_model(model) -> Union{Matrix{Float64}, Nothing}
 
 The immersed seabed the simulation actually ran on, as `[i_lon, j_lat]` with the halo
@@ -225,9 +241,8 @@ function seabed_from_model(model)
     g isa ImmersedBoundaryGrid || return nothing
     ib = g.immersed_boundary
     (hasproperty(ib, :bottom_height) && !isnothing(ib.bottom_height)) || return nothing
-    bh = ib.bottom_height
     Hx, Hy, Nx, Ny = g.Hx, g.Hy, g.Nx, g.Ny
-    return [Float64(bh[i, j, 1]) for i in (Hx + 1):(Hx + Nx), j in (Hy + 1):(Hy + Ny)]
+    return _host_copy(ib.bottom_height)[(Hx + 1):(Hx + Nx), (Hy + 1):(Hy + Ny), 1]
 end
 
 """

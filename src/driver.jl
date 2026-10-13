@@ -763,13 +763,14 @@ end
                 verbose = true
             )
             println("Applying Copernicus Marine hydrography...")
-            # The copernicus file has thetao/so variables; need to open and set
-            # For now, error since we don't have a reader wired up
-            error(
-                "Copernicus file downloaded but no reader for thetao/so variables is implemented. " *
-                "Implement NetCDF reading of thetao/so on the model grid, or " *
-                "set [data] hydrography_source = \"synthetic\" to use the analytic profile."
-            )
+            # The fetch asks for the whole run year and gets twelve monthly steps back, so the
+            # month has to be chosen: `hydrography_month` says which, and 0 (the annual
+            # default) takes January rather than averaging, because a boundary target that
+            # silently averaged twelve months would not be the stated period.
+            hydro_month = opts.hydrography_month == 0 ? 1 : clamp(opts.hydrography_month, 1, 12)
+            cop = copernicus_regridded_tracers(model.grid, copernicus_file; month = hydro_month)
+            set!(model, T = cop.T, S = cop.S)
+            set!(model, u = 0.0, v = 0.0)
         catch err
             error(
                 "hydrography_source = \"$(hydro_src)\" requires Copernicus Marine download " *

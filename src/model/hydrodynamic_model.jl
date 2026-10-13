@@ -435,7 +435,6 @@ end
 """
     woa23_regridded_tracers(grid, temperature_file, salinity_file; oxygen_file=nothing)
         -> (T = (x, y, z) -> …, S = (x, y, z) -> …, O_2 = (x, y, z) -> …)
-
 Read a downloaded WOA23 (or WOA-series) climatology from NetCDF and return **callable
 interpolants** of conservative temperature `T` (°C), practical salinity `S` (PSU) and,
 optionally, dissolved oxygen `O_2` (µmol kg⁻¹) on the model grid.
@@ -496,42 +495,18 @@ function woa23_regridded_tracers(
     # interpolator would throw on out-of-bounds indices; with it, boundary cells take the
     # nearest available value instead of an extrapolation. `read_woa_variable` has already
     # wrapped longitudes into signed degrees East, so longitude needs only clamping.
-    lo_z, hi_z = Float64(first(dep_src)), Float64(last(dep_src))
-    lo_y, hi_y = Float64(first(lat_src)), Float64(last(lat_src))
-    lo_x, hi_x = Float64(first(lon_src)), Float64(last(lon_src))
-
-    # `interpolate` indexes by *index* coordinates (1..n along each axis), not by the
-    # physical values stored in the axes, so the query is converted here. Passing physical
-    # lon/lat/depth straight through is silently wrong and throws a BoundsError whose
-    # reported index is the physical value, which makes the mistake easy to misread.
     #
-    # The conversion is a table lookup, not a linear rescale. The previous version computed
-    # `(x - first) / (last - first) + 1`, which maps the axis onto [1, 2] rather than [1, n] --
-    # so every query, at every location and depth, sampled the FIRST column of the global
-    # file. It did not throw; it returned confident nonsense. A linear rescale would also be
-    # wrong for the depth axis specifically, which is strongly non-uniform (0, 5, 10, ... 5500).
-    to_index(v) = t -> clamp(searchsortedlast(v, Float64(t)), 1, length(v))
-    to_ix, to_iy, to_iz = to_index(lon_src), to_index(lat_src), to_index(dep_src)
-
-    # `read_woa_variable` returns a POSITIVE-down depth axis (it normalises whatever
-    # convention the file used), while the model grid's `z` is NEGATIVE-down: 0 at the
-    # surface and falling. The query is negated before clamping. Clamping a negative `z`
-    # against a positive-down range would pin every query to the surface layer and quietly
-    # return the same temperature and salinity at all depths -- a whole-column field that
-    # looks well-formed and destroys the stratification the model is built on.
-    query(itp) = (x, y, z) -> itp(
-        to_iz(clamp(-Float64(z), lo_z, hi_z)),
-        to_iy(clamp(Float64(y), lo_y, hi_y)),
-        to_ix(clamp(Float64(x), lo_x, hi_x))
-    )
-
-    out = (T = query(T_interp), S = query(S_interp))
+    # The clamping, the coordinate-to-index conversion and the sign of `z` all live in
+    # `_grid_tracer_query`, because they are the three ways a per-source copy of this went
+    # wrong; see its docstring.
+    out = (T = _grid_tracer_query(T_interp, lon_src, lat_src, dep_src),
+           S = _grid_tracer_query(S_interp, lon_src, lat_src, dep_src))
 
     if !isnothing(oxygen_file) && isfile(oxygen_file)
         O_vals, _, _, _ = read_woa_variable(oxygen_file, "o_an")
         if size(O_vals) == size(T_vals)
             O_interp = build_woa_interpolator(O_vals, lon_src, lat_src, dep_src)
-            out = merge(out, (O_2 = query(O_interp),))
+            out = merge(out, (O_2 = _grid_tracer_query(O_interp, lon_src, lat_src, dep_src),))
         else
             @warn "Skipping dissolved oxygen: WOA23 oxygen grid $(size(O_vals)) does not match " *
                   "the temperature/salinity grid $(size(T_vals))."
@@ -539,6 +514,74 @@ function woa23_regridded_tracers(
     end
 
     return out
+end
+
+"""
+    _grid_tracer_query(itp, lon, lat, depth) -> (x, y, z) -> value
+
+Interpolate one source field onto the model grid, given an interpolant `itp` over source axes
+`lon`, `lat` (degrees East/North) and `depth` (positive down).
+
+Three things happen here, and each was wrong in its own copy when this was written per source:
+
+* the query is **clamped** to the source bounds, because the model grid is routinely larger
+  than the subset that was fetched — the alternative is an out-of-bounds throw, or worse, an
+  extrapolation nobody asked for;
+* physical coordinates are converted to the **interpolator's index coordinates** by a table
+  lookup, not a linear rescale — a rescale maps an n-point axis onto [1, 2] rather than [1, n],
+  which samples the first column of the file at every cell and looks like a field;
+* the model grid's `z` is **negated**, since it is negative-down (0 at the surface) while every
+  source axis here is positive-down — without the sign flip every query lands in the top level
+  and the stratification collapses.
+"""
+function _grid_tracer_query(itp, lon, lat, depth)
+    lo_z, hi_z = Float64(first(depth)), Float64(last(depth))
+    lo_y, hi_y = Float64(first(lat)), Float64(last(lat))
+    lo_x, hi_x = Float64(first(lon)), Float64(last(lon))
+
+    to_index(v) = t -> clamp(searchsortedlast(v, Float64(t)), 1, length(v))
+    to_ix, to_iy, to_iz = to_index(lon), to_index(lat), to_index(depth)
+
+    return (x, y, z) -> itp(
+        to_iz(clamp(-Float64(z), lo_z, hi_z)),
+        to_iy(clamp(Float64(y), lo_y, hi_y)),
+        to_ix(clamp(Float64(x), lo_x, hi_x))
+    )
+end
+
+"""
+    copernicus_regridded_tracers(grid, file; month = 1) -> (T = …, S = …)
+
+Read a Copernicus Marine subset and return **callable interpolants** of temperature `T` (°C)
+and salinity `S` (PSU) on the model grid.
+
+The file is the one `fetch_copernicus_physics_subset` writes: `thetao`/`so` on
+`(longitude, latitude, depth, time)` with twelve monthly steps. `month` picks the step.
+
+This is deliberately not a second reader. The variability between hydrography *sources* is
+which variable is called what and how the axes are spelled, and `read_woa_variable` already
+resolves both — it normalises the depth convention, wraps longitudes, selects the time step
+and maps land to NaN. What differs here is only the variable names, so the reader is shared
+and this function supplies them. The alternative — a per-provider reader — is how this
+package came to hold two WOA23 readers that had drifted apart.
+"""
+function copernicus_regridded_tracers(
+    grid,
+    file::AbstractString;
+    month::Int = 1
+)
+    T_vals, lon, lat, dep = read_woa_variable(file, "thetao"; month = month)
+    S_vals, _, _, _ = read_woa_variable(file, "so"; month = month)
+
+    size(T_vals) == size(S_vals) || error(
+        "Copernicus temperature $(size(T_vals)) and salinity $(size(S_vals)) grids disagree; " *
+        "the two variables must come from the same file.")
+
+    T_interp = build_woa_interpolator(T_vals, lon, lat, dep)
+    S_interp = build_woa_interpolator(S_vals, lon, lat, dep)
+
+    return (T = _grid_tracer_query(T_interp, lon, lat, dep),
+            S = _grid_tracer_query(S_interp, lon, lat, dep))
 end
 
 """
