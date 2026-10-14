@@ -70,4 +70,5 @@ include("data/geodata/geodata_integration.jl")
 # The ocean-half run segments, as library code. Included last so every name its
 # bodies reach for is already defined; it adds the run driver the CLI dispatches to.
 include("driver.jl")
+include("assimilation.jl")
 end # module

@@ -53,10 +53,17 @@ The two keys are the only inputs that need something from you: Copernicus Marine
 account, and everything else is keyless. `needs_account` names them.
 """
 function assimilation_status(opts::HydrodynamicOptions)
-    rows = @NamedTuple{role::Symbol, key::Union{Symbol, Nothing}, source::String,
-                       where::String, present::Bool, stale::Bool, note::String}[]
+    rows = @NamedTuple{role::Symbol, key::Union{Symbol, Nothing},
+                       source::Union{Symbol, String}, where::String,
+                       present::Bool, stale::Bool, note::String}[]
 
-    # -- shared products, resolved through the GeoData register -----------------
+    # -- shared products, resolved the way the driver resolves them --------------
+    # Each `where` is the path the run will actually read, not the register's declared
+    # template. For most products those are the same thing; for WOA23 they are not, because
+    # the register declares a tier-1 raw directory (`<store>/woa23_oxygen_00_0.25deg`) while
+    # the driver reads the assimilated products the fetcher writes under `store_path("woa23")`.
+    # Reporting the template would tell a reader the run is missing a file it never reads.
+    woa_dir = GeoDataSources.store_path("woa23")
     shared = [
         (:bathymetry, :bathymetry,
          "measured bathymetry, resolved by coverage (see `preferred_bathymetry_source`)"),
@@ -67,14 +74,18 @@ function assimilation_status(opts::HydrodynamicOptions)
         (:boundary, :glorys, "GLORYS12V1 open-boundary water, **needs a Copernicus account**"),
     ]
     for (role, key, note) in shared
-        where = try
-            GeoDataSources.resolved_cache_path(key, opts.output_dir)
-        catch
-            "unresolved"
+        where = if role == :climatology
+            woa_dir
+        else
+            try
+                GeoDataSources.resolved_cache_path(key, opts.output_dir)
+            catch
+                "unresolved"
+            end
         end
         push!(rows, (role = role, key = key, source = key,
                      where = where,
-                     present = !isnothing(_present_path(where)),
+                     present = _present_path(where) !== nothing,
                      stale = false, note = note))
     end
 
