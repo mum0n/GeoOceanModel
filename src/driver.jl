@@ -709,20 +709,20 @@ end
                 # store (GeoDataSources.store_path("woa23")) rather than this run's inputs.
                 output_dir = GeoDataSources.store_path("woa23")
             )
-            # Recheck paths after GeoDataSources acquisition (now in this run's input dir).
-            t_file = isfile(joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.nc")) ?
-                joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.nc") :
-                (isdir(joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.zarr")) ?
-                 joinpath(opts.input_dir, "woa23_temperature_$(month_str)_0.25deg.zarr") : t_file)
-            s_file = isfile(joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.nc")) ?
-                joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.nc") :
-                (isdir(joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.zarr")) ?
-                 joinpath(opts.input_dir, "woa23_salinity_$(month_str)_0.25deg.zarr") : s_file)
-            if isempty(o_file)
-                o_file = isfile(joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.nc")) ?
-                    joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.nc") :
-                    (isdir(joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.zarr")) ?
-                     joinpath(opts.input_dir, "woa23_oxygen_$(month_str)_0.25deg.zarr") : o_file)
+            # Re-resolve through the same resolver the check above used, not through this
+            # run's input directory. The fetch writes to the store, so looking for the result
+            # only in `inputs/` finds nothing on a machine whose store had no copy yet --
+            # which is every fresh installation. The files are on disk, in the store, and the
+            # run reports them as missing. `_woa_in_store` searches the store first and every
+            # other place a copy may be, so the order is "wherever it is" rather than one
+            # directory that this code path happens to write to.
+            t_file = _woa_in_store(opts, "temperature", month_str)
+            s_file = _woa_in_store(opts, "salinity", month_str)
+            o_file = isempty(o_file) ? _woa_in_store(opts, "oxygen", month_str) : o_file
+            if !isempty(t_file) || !isempty(s_file)
+                println("WOA23 resolved from $(isdir(dirname(t_file)) ? dirname(t_file) : "the store") " *
+                        "after acquisition: $(isempty(t_file) ? "?" : basename(t_file)) / " *
+                        "$(isempty(s_file) ? "?" : basename(s_file))")
             end
         end
 

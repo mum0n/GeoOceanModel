@@ -585,26 +585,66 @@ function copernicus_regridded_tracers(
 end
 
 """
-    read_woa_variable(filepath, varname) -> (values, lon, lat, depth)
+    _woa_axis_names(available::AbstractVector{String}; filepath, varname) -> NamedTuple
 
-Read one WOA23 variable plus its coordinate axes from NetCDF.
+The coordinate axes of a WOA file by provider, probed against what the file declares. WOA23
+spells them `lon`/`lat`/`depth`, GLORYS `longitude`/`latitude`/`depth`, and older NetCDF
+`z`/`lev`. Aliases rather than a fixed spelling are what let one reader serve every source.
+"""
+function _woa_axis_names(available::AbstractVector{String};
+                         filepath::AbstractString = "",
+                         varname::AbstractString = "")
+    pick(names) = begin
+        hit = findfirst(n -> n in available, names)
+        isnothing(hit) && error(
+            "None of $(join(names, "/")) is present in $(basename(filepath)); it declares " *
+            "$(join(sort!(collect(available)), ", ")).")
+        names[hit]
+    end
+    return (lon = pick(("lon", "longitude", "x")),
+            lat = pick(("lat", "latitude", "y")),
+            depth = pick(("depth", "z", "lev", "depths")))
+end
 
-Returns `values` as a `(depth, lat, lon)` `Array` with all three axes in **ascending** order,
-and WOA's missingness mapped to `NaN`.
+"""
+    _woa_sorted_axes(lon_raw, lat_raw, dep_raw) -> (lon, lat, depth, ip, jp, kp)
 
-Real WOA23 files are four-dimensional — `(lon, lat, depth, time)` with a singleton time axis —
-so a length-1 trailing axis is dropped here. Land/ice appears as `Missing` in the current release
-and as a large negative fill value in older ones; both become `NaN`.
+Longitudes wrapped into `[-180, 180)`, depths normalised to positive-down, and the sort
+permutations that put each of the three axes in ascending order.
 
-Two convention differences from the model grid are handled here:
+The depth convention is decided from the data rather than the filename: WOA23 ships both
+(the 1-degree files are negative-down, the 0.25-degree files positive-down), so negating
+unconditionally turns one kind upside down and the boundary sampler then maps every query
+depth to the wrong level — a flattened profile that looks well-formed.
+"""
+function _woa_sorted_axes(lon_raw::AbstractVector{<:Real},
+                          lat_raw::AbstractVector{<:Real},
+                          dep_raw::AbstractVector{<:Real})
+    lon_wrapped = [mod(Float64(v) + 180.0, 360.0) - 180.0 for v in lon_raw]
+    dep_down = (minimum(Float64.(dep_raw)) >= -0.5 * maximum(abs, Float64.(dep_raw))) ?
+               Float64.(dep_raw) : -Float64.(dep_raw)
+    ip = sortperm(lon_wrapped)
+    jp = sortperm(Float64.(lat_raw))
+    kp = sortperm(dep_down)
+    return (lon_wrapped[ip], Float64.(lat_raw)[jp], dep_down[kp], ip, jp, kp)
+end
 
-* WOA stores depth positive-downward (0, 5, 10 … m); the model grid is negative-downward, so
-  depths are negated and re-sorted to ascending (i.e. surface first).
-* Longitudes are wrapped into `[-180, 180)` and re-sorted alongside the data. This is a no-op for
-  the global WOA23 grid (already `-179.88 … 179.88`) but matters for sector files that store the
-  Atlantic as positive longitudes.
+"""
+    read_woa_variable(filepath, varname; month = 1) -> (values, lon, lat, depth)
+
+Read one WOA23 variable and its coordinate axes, in either NetCDF or Zarr form.
+
+Returns `values` as a `(depth, lat, lon)` array with all three axes ascending, and WOA's
+missingness mapped to `NaN`.
+
+Both formats are accepted because a fetched product is written in whichever form the run that
+fetched it chose: the central store holds `woa23_*.zarr`, while a per-run download under a
+run's own `inputs/` is a NetCDF file. The one reader serves both, so a run never fails because
+a product happens to be on disk in the other format — the failure that a fresh installation
+hit, with the data present and unreadable.
 """
 function read_woa_variable(filepath::AbstractString, varname::AbstractString; month::Int = 1)
+    is_zarr_store(filepath) && return _read_woa_variable_zarr(filepath, varname; month = month)
     NCDatasets.NCDataset(filepath, "r") do ds
         haskey(ds, varname) || error(
             "WOA file $(filepath) has no variable '$(varname)'.")
@@ -696,6 +736,111 @@ function read_woa_variable(filepath::AbstractString, varname::AbstractString; mo
 
         return (vals, lon, lat, depth)
     end
+end
+
+"""
+    is_zarr_store(path::AbstractString) -> Bool
+
+Whether `path` names a Zarr store: a directory whose metadata says so. The `.zarr` suffix is
+the convention, not the test — a directory with `.zarray` in it is read as an array store.
+"""
+function is_zarr_store(path::AbstractString)
+    isdir(path) || return false
+    return isfile(joinpath(path, ".zarray")) || isfile(joinpath(path, ".zgroup"))
+end
+
+"""
+    _read_woa_variable_zarr(filepath, varname; month = 1) -> (values, lon, lat, depth)
+
+The Zarr form of `read_woa_variable`, for a store the `GeoData` assimilation wrote.
+
+A Zarr array carries no dimension *names*, so the layout is resolved from the axes it declares:
+each of the variable's dimensions is matched, by length, to the coordinate variable of the same
+length. Matching by length is exact here because lon, lat and depth all differ in length, and it
+means a file written in a different dimension order is still read correctly rather than
+permuted as if it were the expected one — the same class of error the NetCDF branch guards
+against with `dimnames`.
+"""
+function _read_woa_variable_zarr(filepath::AbstractString, varname::AbstractString; month::Int = 1)
+    g = Zarr.zopen(filepath)
+    # A `ZGroup` holds its arrays and its groups as dicts and defines `haskey` but not
+    # `keys`, so the members are enumerated from those dicts. Variables and axes are both
+    # arrays here (the WOA store has no subgroups), so one list serves for probing both.
+    members = String[]
+    for k in keys(g.arrays); push!(members, String(k)); end
+    for k in keys(g.groups); push!(members, String(k)); end
+    sort!(members)
+    hasfield = s -> s in members
+
+    # The variable the caller named, then the aliases this reader serves: a run asks for
+    # `t_an`/`thetao`/`temperature` depending on which product it read. A caller-named
+    # variable wins outright, because it knows which product it opened.
+    probe = unique([varname, "t_an", "thetao", "temperature"])
+    hit = findfirst(hasfield, probe)     # the position, not the name
+    isnothing(hit) && error(
+        "None of $(join(probe, "/")) is present in $(basename(filepath)); it holds " *
+        "$(join(members, ", ")).")
+    var = probe[hit]
+
+    axes = _woa_axis_names(members; filepath = filepath, varname = varname)
+    lon_raw = Array{Float64}(g[axes.lon])
+    lat_raw = Array{Float64}(g[axes.lat])
+    dep_raw = Array{Float64}(g[axes.depth])
+    lon, lat, depth, ip, jp, kp = _woa_sorted_axes(lon_raw, lat_raw, dep_raw)
+
+    z = g[var]
+    raw = Array(z)
+    nd = ndims(raw)
+    nd in (3, 4) || error(
+        "Variable $(var) in $(basename(filepath)) has $(nd) dimensions; expected 3 " *
+        "(the length-$(length(lon)) longitude axis, the length-$(length(lat)) latitude axis and " *
+        "the length-$(length(depth)) depth axis) or 4 with a time axis.")
+
+    # Resolve each dimension to an axis by length, not by position: a store written in a
+    # different order has the same axes in a different order, and the NetCDF path verifies
+    # this by var while here it can only be verified by size.
+    pos_of(n) = let want = n == :lon ? length(lon) : n == :lat ? length(lat) : length(depth)
+        hits = findall(==(want), size(raw))
+        length(hits) == 1 || error(
+            "Variable $(var) is $(size(raw)) and does not have exactly one axis of length " *
+            "$(want) to match $(n). The axes it declares are $(size(raw)); the coordinate " *
+            "variables are lon=$(length(lon)), lat=$(length(lat)), depth=$(length(depth)).")
+        hits[1]
+    end
+    ilon, ilat, idep = pos_of(:lon), pos_of(:lat), pos_of(:depth)
+    other = setdiff(1:nd, (ilon, ilat, idep))
+    length(other) <= 1 || error(
+        "More than one axis of $(var) matches no coordinate variable: $(join(setdiff(1:nd,
+        (ilon, ilat, idep)), ", ")).")
+    tsel = 1
+    if !isempty(other)
+        # A time axis, or a singleton the writer left in place. A genuine 12-month axis is
+        # selected by `month`; a singleton is dropped.
+        ntime = size(raw, other[1])
+        ntime == 1 || month in 1:12 || error(
+            "Variable $(var) has $(ntime) time steps; pass month = 1:12 to choose one. " *
+            "Refusing to average or to guess, because a boundary target that silently averaged " *
+            "twelve months would not be the stated period.")
+        tsel = clamp(month, 1, ntime)
+    end
+    lld = if !isempty(other)
+        # Bring the array to (time, lon, lat, depth), then index the time step. `A[tsel, :, :, :]`
+        # rather than `first(A, tsel)`, which selects the first `tsel` *elements* and yields a
+        # vector rather than a field.
+        A = permutedims(raw, [other[1], ilon, ilat, idep])
+        A[tsel, :, :, :]
+    else
+        permutedims(raw, [ilon, ilat, idep])                           # (lon, lat, depth)
+    end
+    lld = Float64.(coalesce.(lld, NaN))
+
+    vals = permutedims(lld, (3, 2, 1))              # (lon, lat, depth) -> (depth, lat, lon)
+    vals = vals[kp, jp, ip]
+    size(vals) == (length(depth), length(lat), length(lon)) || error(
+        "Unexpected variable $(var) with size $(size(vals)); expected " *
+        "(depth=$(length(depth)), lat=$(length(lat)), lon=$(length(lon))).")
+    vals[vals .<= -1.0e29] .= NaN
+    return (vals, lon, lat, depth)
 end
 
 """

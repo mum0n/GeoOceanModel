@@ -35,7 +35,8 @@ using
     NumericalEarth,
     Distributions,
     GeoData,
-    OffsetArrays
+    OffsetArrays,
+    Zarr
 
 # The provenance registry, as a submodule so its names do not have to be re-exported one by
 # one. Unchanged from ParticleTracking: this is the registry the run reports through.
