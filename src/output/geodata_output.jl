@@ -48,17 +48,36 @@ output_zarr_path(output_dir::AbstractString, name::AbstractString = "hydrodynami
 """
     GeodataOutputCallback
 
-An Oceananigans `Callback` that writes the ocean state into a Zarr store at each firing.
+An Oceananigans `Callback` that writes the ocean state into a store at each firing.
 
 One store per run, appended to at each interval, so a long simulation writes incrementally
-rather than holding its history in memory and losing it on a crash. That is also why the
-writing is through `Zarr`'s directory store directly: a `YAXArrays` dataset built once and
-saved at the end would need the whole history resident.
+rather than holding its history in memory and losing it on a crash.
+
+That store is a **GeoData** store -- the variables are a `GeoDataset`'s, with their axes and
+dimension records, opened once at the first output and written into slice by slice. This is
+what makes a reader use `geoload` and the dataset's own `.variables`/`.dims` rather than
+walking Zarr: an earlier version wrote each interval to `T/<m>/`, and GeoData's Zarr reader
+discovers variables as the root group's *child arrays*, so that store opened as an empty
+dataset and every consumer -- the larval half and the figures -- hand-rolled its own reads.
+
+`store_ds` and `time_array` are held state, which is why this is a `mutable struct`: the store
+is built at the first output and the same dataset is written into at every later one, so the
+callback must remember the handle it opened.
 """
-struct GeodataOutputCallback
+mutable struct GeodataOutputCallback
     store::String
+    output_dir::String
     field_names::Vector{String}
     written::Base.RefValue{Int}
+    store_ds::Union{GeoDataset, Nothing}
+    # The store's own time array, held from the group it was opened with. `nothing` until the
+    # first output, because the store does not exist until then.
+    time_array::Union{Zarr.ZArray, Nothing}
+    # The output interval in simulated seconds, from the schedule the caller attached. A field
+    # rather than a scan of the simulation's callbacks: at the first firing the callback being
+    # fired is not necessarily in `sim.callbacks` yet, and scanning finds nothing -- which sizes
+    # the time axis to one interval and silently truncates the run's output.
+    interval::Float64
 end
 
 """
@@ -69,8 +88,9 @@ Construct the output writer for one run. A fresh run clears the store and starts
 extended/interrupted run appends to its own output instead of re-downloading nothing and
 overwriting the interval it already wrote.
 """
-function GeodataOutputCallback(output_dir::AbstractString, model;
-                               fields::Tuple = ("u", "v", "w", "T"), resume::Bool = false)
+function GeodataOutputCallback(output_dir::AbstractString, interval::Real,
+                               model; fields::Tuple = ("u", "v", "w", "T"),
+                               resume::Bool = false)
     isdir(output_dir) || mkpath(output_dir)
     store = output_zarr_path(output_dir)
     if !resume && ispath(store)
@@ -78,28 +98,120 @@ function GeodataOutputCallback(output_dir::AbstractString, model;
     end
     mkpath(store)
 
-    # On resume, keep the interval this store already holds: the next slice continues at the
-    # existing count. On a fresh run there is no time.json, so the count is 0.
-    start = 0
+    # The first interval a fresh run writes is slice 1, because the store's arrays are
+    # 1-based: `A[:, :, :, 0]` is not "the first slice" in any array, and on a Zarr array it
+    # lands on the *last* interval -- so the first slice stayed zero and the run's own initial
+    # condition was written where its final one goes. The old per-interval directories were
+    # named from 0, which is where this off-by-one came from.
+    #
+    # On resume the count comes from the store's own time coordinate, through `geoload`. The
+    # sidecar this replaced held the same number, written separately, and a reader of the
+    # sidecar and a reader of the store could disagree about how far the run had got.
+    start = 1
     if resume
-        tf = joinpath(store, "time.json")
-        start = isfile(tf) ? length(Vector{Float64}(JSON3.read(read(tf, String)))) : 0
+        start = GeoOceanModel.store_interval_count(store) + 1
     end
+    # The store itself is built at the first output, not here: the grid axes come from the
+    # model, and a callback attached before the fields exist would have to invent them. The
+    # time array is held here only because it is opened with the dataset and the dataset is
+    # opened later, at the first write.
+    return GeodataOutputCallback(store, output_dir, collect(String.(fields)), Ref(start),
+                                 nothing, nothing, Float64(interval))
+end
 
-    # The frame's metadata: which fields, and from when. Written as `.zattrs` so a reader can
-    # tell what it is holding without opening every array.
-    frame = Dict{String, Any}(
-        "fields" => collect(fields),
-        "title" => "Realized hydrodynamic simulation",
-        "created_utc" => string(Dates.now(Dates.UTC)))
-    open(joinpath(store, ".zgroup"), "w") do io
-        write(io, "{\"zarr_format\": 2}")
-    end
-    open(joinpath(store, ".zattrs"), "w") do io
-        JSON3.write(io, frame)
-    end
+"""
+    _interval_count(sim, cb) -> Int
 
-    return GeodataOutputCallback(store, collect(String.(fields)), Ref(start))
+How many output intervals this run will write, so the store's time axis can be sized once
+instead of growing an array that cannot be appended to. The simulation's declared stop time
+and the caller's own output interval give it. A caller with no stop time (a unit test's short
+run) still gets at least one interval, because a zero-sized field is not a field.
+"""
+function _interval_count(sim::Oceananigans.Simulation, cb)
+    stop = Float64(sim.stop_time)
+    cb.interval > 0 || return 1
+    stop > 0 || return 1
+    return max(1, ceil(Int, stop / cb.interval) + 1)
+end
+
+"""
+    _build_store_dataset(store, ax, names, nt, model) -> GeoDataset
+
+The run's output store, created as a GeoData `GeoDataset` and written once so each interval is
+a slice of an already-open array.
+
+Axes, not offsets: `ax` is the interior cell centres in `(lon, lat, depth)` from the model's
+own grid, so the dataset records where its cells are rather than leaving a reader to infer
+positions from indices. `nt` sizes the time axis to the run.
+
+The variables are the named fields, each `(lon, lat, depth, time)`, created empty and filled
+by the callback. `ds` is returned open, and writing `v.data[:, :, :, m] = field` goes
+straight to the Zarr array behind it, so nothing is held in memory.
+"""
+function _build_store_dataset(store::AbstractString, ax, names::Vector{String}, nt::Int,
+                              model)
+    crs = GeoData.CoordinateSystem(crs = "EPSG:4326")
+    nx, ny, nz = length(ax.x), length(ax.y), length(ax.z)
+
+    axe(name, coords, units, std, dim_type) = Dimension(
+        name = name, size = length(coords), coords = coords,
+        units = units, standard_name = std, dim_type = dim_type)
+
+    dl = axe(:lon, ax.x, "degrees_east", "longitude", GeoData.DIM_SPATIAL)
+    dt = axe(:lat, ax.y, "degrees_north", "latitude", GeoData.DIM_SPATIAL)
+    dz = axe(:depth, ax.z, "m", "depth", GeoData.DIM_PARAMETRIC)
+    tim = axe(:time, Float64.(1:nt), "s", "time", GeoData.DIM_TEMPORAL)
+
+    vars = Dict{String, GeoArray}()
+    for name in names
+        d = dims = (dl, dt, dz, tim)
+        vars[name] = GeoArray(zeros(Float64, nx, ny, nz, nt), d, crs, Dict{String, Any}())
+    end
+    coords = Dict{Symbol, GeoArray}(
+        :lon => GeoArray(ax.x, (dl,), crs, Dict{String, Any}()),
+        :lat => GeoArray(ax.y, (dt,), crs, Dict{String, Any}()),
+        :depth => GeoArray(ax.z, (dz,), crs, Dict{String, Any}()),
+        :time => GeoArray(tim.coords, (tim,), crs, Dict{String, Any}()))
+
+    ds = GeoDataset(vars, coords, Dict(:lon => dl, :lat => dt, :depth => dz, :time => tim), crs,
+                    Dict{String, Any}(), GeoData.ZarrBackend(), String(store))
+    GeoData.geosave(String(store), ds; backend = :zarr, overwrite = true)
+    # Reopened for write, because the callback writes into this dataset's arrays: `geoload`
+    # defaults to read-only, and of the Zarr modes only `"w"` hands out a writeable array
+    # here. It does not truncate -- a second `"w"` open appends, which is checked explicitly,
+    # because a writer that silently cleared its earlier intervals would produce a run whose
+    # first slice is missing.
+    return GeoData.geoload(String(store); backend = :zarr, mode = "w")
+end
+
+"""
+    _to_centres(arr, grid_shape)
+
+A field written on its own staggered grid, moved onto cell centres by averaging the two faces
+that bracket each centre. A field already on the centre grid is returned unchanged.
+
+This is where staggering is resolved, once, on the write. `u` arrives as 346×245×13 for a
+345×245×13 grid (one more x-face), `v` as 345×246×13, and `w` as 345×245×14, while `T` is
+already centred -- Oceananigans' own staggering. A dimension that is one longer than the grid
+is a face axis and is averaged; anything else must agree, or the field is not of this grid.
+
+Which axes move is measured rather than looked up, and averaging rather than dropping the last
+face matters because dropping shifts the field by half a cell in the grid's own coordinates, and
+a shifted current is a different current. Doing it here means a reader -- the larval half, the
+figures -- holds one grid and needs no knowledge of staggering at all.
+"""
+function _to_centres(arr::AbstractArray{T, 3}, grid_shape::Tuple{Int, Int, Int}) where {T}
+    out = arr
+    for d in 1:3
+        if size(out, d) == grid_shape[d] + 1
+            out = 0.5 .* (selectdim(out, d, 1:(size(out, d) - 1)) .+
+                          selectdim(out, d, 2:size(out, d)))
+        end
+    end
+    size(out) == grid_shape || error(
+        "Field of size $(size(arr)) on a $(grid_shape) grid: not this grid's field, and not " *
+        "its faces either.")
+    return out
 end
 
 """
@@ -149,33 +261,52 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
             name == "v" ? model.velocities.v :
             name == "w" ? model.velocities.w :
             name == "T" ? model.tracers.T : error("unknown field $(name)")
-        fields[name] = Array{Float64}(interior(f))
+        # `u` is on x-faces, `v` on y-faces, `w` on z-faces: Oceananigans' own staggering. They
+        # are averaged onto cell centres here, in one `_to_centres` call, so the store holds
+        # every field on the one grid its dimension records describe -- and a reader does not
+        # have to know about staggering to read the store.
+        fields[name] = _to_centres(Array{Float64}(interior(f)),
+                                   (length(ax.x), length(ax.y), length(ax.z)))
+    end
+
+    ds = cb.store_ds
+    if isnothing(ds)
+        # First interval: the store is created as a GeoData store, with the time axis sized to
+        # the run. Written through GeoData because a store written by hand -- one directory
+        # per interval -- is one GeoData's `geoload` cannot open: its reader discovers
+        # variables as the root group's *child arrays*, so that store opens as an empty dataset
+        # and every consumer -- the larval half and the figures -- then hand-rolls its own
+        # Zarr walk. That is exactly what they were doing.
+        nt = _interval_count(sim, cb)
+        ds = _build_store_dataset(output_zarr_path(cb.output_dir), ax, cb.field_names, nt,
+                                  sim.model)
+        cb.store_ds = ds
+        record_run_metadata!(ds, model)
+    end
+    if isnothing(cb.time_array)
+        # The store's own time array, opened once. See the note where it is written: this is
+        # the coordinate GeoData's reader materialises, so it is written at the backend.
+        #
+        # The array is taken from the opened group itself. Re-wrapping it -- `Zarr.ZArray(a)`
+        # -- gives an array that reports `writeable = true` and silently writes to nothing:
+        # the blob the group holds is re-wrapped into a second handle whose writes go to a
+        # copy, so a run's time axis stays the placeholder it was created with.
+        g = Zarr.zopen(output_zarr_path(cb.output_dir), "w")
+        cb.time_array = g.arrays["time"]
     end
 
     # `time` lives on the model's clock, not on the Simulation: `Simulation` has no `clock`
     # field, and reaching for one is a FieldError at the first write.
     t = Float64(sim.model.clock.time)
-    time_file = joinpath(cb.store, "time.json")
-    stored = isfile(time_file) ? Vector{Float64}(JSON3.read(read(time_file, String))) :
-                                 Float64[]
-    push!(stored, t)
-    open(time_file, "w") do io
-        JSON3.write(io, stored)
-    end
-
     for (name, arr) in fields
-        idx_dir = joinpath(cb.store, name, string(m))
-        mkpath(idx_dir)
-        # One Zarr array per interval, created with `zcreate` and opened for write. The API is
-        # `zopen`/`zcreate`, not `Zarr.Zarray`: this version has no such type, and the name
-        # exists only in newer releases.
-        d = Zarr.zcreate(Float64, Zarr.DirectoryStore(idx_dir), size(arr)...;
-                         fill_value = 0.0)
-        # Cartesian indexing, so the assignment is one broadcast rather than a loop over the
-        # axes' offsets: a Zarr array is indexed from 1 like any Julia array, but writing it
-        # slice-by-slice is how a transposed field stays invisible.
-        d .= arr
+        ds.variables[name].data[:, :, :, m] = arr
     end
+    # The time coordinate goes through the store's own array, not through `ds.coords[:time]`:
+    # GeoData's Zarr reader materialises a coordinate into a plain host `Vector` when it opens
+    # a store, so writing there would update memory the next read never sees. This is the one
+    # array GeoData's read path cannot write back, and it is a coordinate rather than science,
+    # so it is the one place a backend call belongs.
+    cb.time_array[m] = t
     cb.written[] = m + 1
     return nothing
 end
@@ -195,9 +326,8 @@ this version, so the caller passes the interval it already built for the JLD2 wr
 writers share one cadence by construction rather than by convention.
 """
 function attach_output_callback!(sim, output_dir::AbstractString;
-                                  fields::Tuple = ("u", "v", "w", "T"),
-                                  schedule = nothing, resume::Bool = false)
-    cb = GeodataOutputCallback(output_dir, sim.model; fields = fields, resume = resume)
+                                 fields::Tuple = ("u", "v", "w", "T"),
+                                 schedule = nothing, resume::Bool = false)
     if isnothing(schedule)
         # A `TimeInterval` is constructed here rather than in the caller so this stays usable
         # on its own: 6 h is the default the TOML asks for. Both writers are then given the
@@ -205,10 +335,13 @@ function attach_output_callback!(sim, output_dir::AbstractString;
         # second cadence.
         schedule = Oceananigans.TimeInterval(6 * 3600.0)
     end
+    cb = GeodataOutputCallback(output_dir, schedule.interval, sim.model; fields = fields,
+                               resume = resume)
     Oceananigans.add_callback!(sim, Oceananigans.Callback(cb, schedule))
-    store = output_zarr_path(output_dir)
-    write_grid_metadata!(store, sim.model)
-    return store
+    # The store itself does not exist yet: it is built at the first output, when the grid axes
+    # and the field shapes are known. What is returned is where it *will* be, so the caller can
+    # record a location and hand the larval half a path rather than an object.
+    return output_zarr_path(output_dir)
 end
 
 """
@@ -246,37 +379,23 @@ function seabed_from_model(model)
 end
 
 """
-    write_grid_metadata!(store, model)
+    record_run_metadata!(ds, model)
 
-Record the grid's interior cell centres in the store's own attributes.
+Record what a reader cannot recover from a path, into the dataset's own attributes.
 
-Written, not derived, because this is the moment the information exists: a reader has only a
-path, and a store that does not say where its cells are on Earth cannot be interpolated
-against. This is what replaced the sidecar -- the same coordinates now travel *inside* the
-store instead of in a second file next to it.
-
-`bottom_height` is written here too, for the reason `read_immersed_bathymetry` explains: it
-is the seabed the run used, it does not vary with time, and a figure that masks below the
-seafloor must not re-derive one.
+The grid no longer belongs here: the store's dimension records carry the interior cell centres,
+in GeoData's own structure, because the store is a GeoData dataset. What is left is the seabed
+the run used -- the same value the JLD2 `serialized/grid` branch of
+`read_immersed_bathymetry` returns, extracted from the live model so a figure that masks below
+the seafloor sees the one the run used and not a re-derived stand-in. It does not vary with
+time, and it is not a dimension of any field, so an attribute is where it belongs.
 """
-function write_grid_metadata!(store::AbstractString, model)
-    ax = _field_arrays(model)
-    zone = joinpath(store, ".zattrs")
-    existing = isfile(zone) ? JSON3.read(read(zone, String)) : Dict{String, Any}()
-    out = Dict{String, Any}(string(k) => v for (k, v) in existing)
-    out["lon"] = ax.x
-    out["lat"] = ax.y
-    out["depth"] = ax.z
-    d = length(ax.x) > 1 ? ax.x[2] - ax.x[1] : 0.0
-    e = length(ax.y) > 1 ? ax.y[2] - ax.y[1] : 0.0
-    out["dlon"] = d
-    out["dlat"] = e
+function record_run_metadata!(ds::GeoDataset, model)
     seabed = seabed_from_model(model)
     if !isnothing(seabed)
-        out["bottom_height"] = seabed
+        ds.attrs["bottom_height"] = seabed
     end
-    open(zone, "w") do io
-        JSON3.write(io, out)
-    end
-    return store
+    ds.attrs["title"] = "Realized hydrodynamic simulation"
+    ds.attrs["created_utc"] = string(Dates.now(Dates.UTC))
+    return nothing
 end

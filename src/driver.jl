@@ -99,23 +99,51 @@ end
 """
     _store_sim_info(store_path; stop_time) -> (; exists, is_complete, last_time, n_timesteps)
 
-Resume/reuse state of a run's GeoData (Zarr) store, read from its own `time.json` -- the
-cumulative times the writer appended each interval. `last_time` is the newest, `n_timesteps`
-the count, `is_complete` whether it reached `stop_time`. A missing store, or one with no
-slices, is `exists = false`. This replaced inspecting a JLD2 archive, which the run no longer
-writes: the store is the deliverable, so it is also the record of progress.
+Resume/reuse state of a run's GeoData store, read from the store's own `time` coordinate. This
+is a `geoload` read of the same axis the writer filled, so the record of progress is the store
+itself and cannot drift from what it recorded -- which a `time.json` sidecar could, and did:
+a sidecar written per interval and a coordinate written per interval are two writes of the same
+number.
+
+`last_time` is the newest, `n_timesteps` the count, `is_complete` whether it reached
+`stop_time`. A missing store, or one with no slices, is `exists = false`. This replaced
+inspecting a JLD2 archive, which the run no longer writes: the store is the deliverable, so it
+is also the record of progress.
 """
 function _store_sim_info(store_path::AbstractString; stop_time::Real)
-    tf = joinpath(store_path, "time.json")
-    stored = (isfile(tf) && isdir(store_path)) ?
-        (try Vector{Float64}(JSON3.read(read(tf, String))) catch; Float64[] end) :
+    stored = if isdir(store_path)
+        try
+            ds = GeoData.geoload(store_path; backend = :zarr)
+            isempty(ds.variables) ? Float64[] :
+                collect(Float64, ds.coords[:time].data)
+        catch
+            Float64[]
+        end
+    else
         Float64[]
+    end
     n = length(stored)
     last = n > 0 ? maximum(stored) : 0.0
     return (exists = n > 0,
             is_complete = n > 0 && last >= stop_time - 1e-3,
             last_time = last,
             n_timesteps = n)
+end
+
+"""
+    store_interval_count(store_path) -> Int
+
+How many intervals a run's store holds, from its own `time` coordinate. 0 for a store that
+does not exist or has no slices, so a caller resuming a fresh directory starts at 1.
+"""
+function store_interval_count(store_path::AbstractString)
+    isdir(store_path) || return 0
+    try
+        ds = GeoData.geoload(store_path; backend = :zarr)
+        return isempty(ds.variables) ? 0 : length(ds.coords[:time].data)
+    catch
+        return 0
+    end
 end
 
 """
@@ -1033,7 +1061,7 @@ function run_segment_simulation(;
     # Where this invocation writes: the GeoData store beside this run's outputs. A resume
     # appends to it (the writer keeps the interval already written); a fresh run replaces it.
     # There are no `_partN` JLD2 archives any more -- the store is the deliverable, and its
-    # own `time.json` is the record of progress the resume/reuse logic reads back.
+    # own `time` coordinate is the record of progress the resume/reuse logic reads back.
 
     # Initial time step: start at 10% of the configured sim_dt to allow the
     # CFL wizard to safely ramp up from rest without violating barotropic CFL.

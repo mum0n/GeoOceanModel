@@ -8,8 +8,7 @@ Field and dashboard animations.
 
 using CairoMakie
 import CairoMakie: record
-using Zarr
-using JSON3
+using GeoData
 
 """
     animate_hydrodynamic_field(
@@ -560,8 +559,8 @@ produces. This function exists for the common case — *show me the field, at on
 time* — and it does two things that case needs and the general one cannot know:
 
 * it accepts a **path to a realized run** — the output directory, or its `hydrodynamics.zarr`
-  store — and reads the grid from the store's own `.zattrs` and the output times from its
-  `time.json`, so the caller does not have to assemble the frame source by hand;
+  store — and reads it through `geoload`, so the grid and the output times come from the
+  dataset's own records and the caller does not assemble the frame source by hand;
 * `depth = :surface` (the default) resolves to the **shallowest level of that run**, rather
   than to index 1. Index 1 is the deepest level of a written store: its depth axis ascends
   from the bottom, so the "first" level is the seafloor and a caller asking for the surface
@@ -650,12 +649,30 @@ const _ANIMATION_SOURCE_FIELDS = Dict{Symbol, Tuple{Vararg{Symbol}}}(
 The `hydrodynamics.zarr` directory a run's output path names, or `nothing` if it names no run
 store. Both spellings are accepted — the output directory, or the store itself — because the
 config writes one and the notes and notebooks quote the other.
+
+A store is recognised by opening it, not by the presence of a sidecar: it is a GeoData store,
+so `geoload` either returns a dataset with variables or it does not, and a directory that opens
+as nothing is not a store. The old test — `time.json` and `.zattrs` present — went with the
+sidecar those replaced.
+
+Both spellings are tried, in either order being indistinguishable from a wrong answer: the
+store itself (`.../hydrodynamics.zarr`) and the output directory that contains it. The notes,
+the notebooks and the return value of `attach_output_callback!` are all the first; the config's
+`output_path` is the second.
 """
 function _run_store_dir(path::AbstractString)
     isdir(path) || return nothing
-    isfile(joinpath(path, "time.json")) && isfile(joinpath(path, ".zattrs")) && return path
-    inner = joinpath(path, "hydrodynamics.zarr")
-    (isdir(inner) && isfile(joinpath(inner, "time.json"))) && return inner
+    for candidate in (path, joinpath(path, "hydrodynamics.zarr"))
+        isdir(candidate) || continue
+        ds = try
+            GeoData.geoload(candidate; backend = :zarr)
+        catch
+            nothing
+        end
+        isnothing(ds) && continue
+        isempty(ds.variables) && continue
+        return candidate
+    end
     return nothing
 end
 
@@ -665,10 +682,11 @@ end
 The frame source `animate_hydrodynamic_field` should be handed for this run and variable.
 
 A run store is read here, into the NamedTuple the figure layer already accepts; anything else
-is returned unchanged. Reading it here rather than in the figure layer is deliberate: the layer
-reads an opened `Zarr` group, which is a lakehouse record, and a run store is not one — it is a
-directory of arrays with its coordinates carrying in `.zattrs`. Two different things, so this is
-where the store's spelling is turned into the layer's.
+is returned unchanged. The store is a GeoData store, so this is `geoload` plus the dataset's own
+variables and dimension records — the same read the larval half uses, and not a walk over Zarr.
+That matters beyond tidiness: while the writer put each interval in its own directory, GeoData's
+Zarr reader could not open the store at all, so this function had to build the arrays itself, and
+so did `store_reader`, and so did the WOA reader. One format, one reader.
 
 Only `frames` intervals are read, spread evenly over the run, because the arrays are held in
 memory for the whole animation rather than streamed.
@@ -677,19 +695,17 @@ function _animation_source(hydrodynamics, variable::Symbol, frames::Int)
     store = hydrodynamics isa AbstractString ? _run_store_dir(hydrodynamics) : nothing
     isnothing(store) && return hydrodynamics
 
-    attrs = JSON3.read(read(joinpath(store, ".zattrs"), String))
-    lons = collect(Float64, attrs["lon"])
-    lats = collect(Float64, attrs["lat"])
-    depths = collect(Float64, attrs["depth"])
-    times = Vector{Float64}(JSON3.read(read(joinpath(store, "time.json"), String)))
-
-    fields = haskey(attrs, "fields") ? [String(f) for f in attrs["fields"]] :
-            [d for d in sort(readdir(store)) if isdir(joinpath(store, d))]
+    ds = GeoData.geoload(store; backend = :zarr)
+    lons = collect(Float64, ds.dims[:lon].coords)
+    lats = collect(Float64, ds.dims[:lat].coords)
+    depths = collect(Float64, ds.dims[:depth].coords)
+    times = collect(Float64, ds.coords[:time].data)
+    fields = collect(keys(ds.variables))
 
     wanted = String[]
     for alias in get(_ANIMATION_SOURCE_FIELDS, variable, (variable,))
-        name = findfirst(==(String(alias)), fields)
-        isnothing(name) || (name in wanted || push!(wanted, fields[name]))
+        name = String(alias)
+        (name in fields) && (name in wanted || push!(wanted, name))
     end
     isempty(wanted) && error(
         "The store at $(store) does not carry what $(variable) is made of. It carries " *
@@ -698,50 +714,23 @@ function _animation_source(hydrodynamics, variable::Symbol, frames::Int)
     keep = _decimated_indices(length(times), frames)
     data = Dict{Symbol, Array{Float64, 4}}()
     grid_shape = (length(lons), length(lats), length(depths))
+    nt = length(times)
     for name in wanted
         arr = Array{Float64, 4}(undef, grid_shape..., length(keep))
         for (m, i) in enumerate(keep)
-            dir = joinpath(store, name, string(i - 1))
-            isdir(dir) || error(
-                "Interval $i of `$(name)` is declared by $(store)'s time axis but its " *
-                "directory $(dir) is missing. The store and its time axis disagree.")
-            arr[:, :, :, m] = _to_centres(Array(Zarr.zopen(dir)), grid_shape)
+            (1 <= i <= size(ds.variables[name].data, 4)) || error(
+                "Interval $(i) is declared by $(store)'s time axis but field $(name) has " *
+                "$(size(ds.variables[name].data, 4)) interval(s). The store and its time axis " *
+                "disagree.")
+            arr[:, :, :, m] = ds.variables[name].data[:, :, :, i]
         end
         data[Symbol(name)] = arr
     end
 
     pairs = Pair{Symbol, Any}[:lons => lons, :lats => lats, :depths => depths,
-                             :times => times[keep]]
+                              :times => times[keep]]
     append!(pairs, [Symbol(k) => v for (k, v) in data])
     return NamedTuple(Tuple(pairs))
-end
-
-"""
-    _to_centres(arr, grid_shape)
-
-A field written on its own staggered grid, moved onto cell centres by averaging the two faces
-that bracket each centre. A field already on the centre grid is returned unchanged.
-
-Which axes move is not a table: it is measured. The writer stores exactly what the model holds,
-so `u` arrives as 346×245×13 for a 345×245×13 grid (one more x-face), `v` as 345×246×13, and
-`w` as 345×245×14, while `T` is already centred. A dimension that is one longer than the grid
-is a face axis and is averaged; anything else must agree, or the field is not of this grid.
-
-Averaging rather than dropping the last face matters because the alternative shifts the field
-by half a cell in the grid's own coordinates, and a shifted current is a different current.
-"""
-function _to_centres(arr::AbstractArray{T, 3}, grid_shape::Tuple{Int, Int, Int}) where {T}
-    out = arr
-    for d in 1:3
-        if size(out, d) == grid_shape[d] + 1
-            out = 0.5 .* (selectdim(out, d, 1:(size(out, d) - 1)) .+
-                          selectdim(out, d, 2:size(out, d)))
-        end
-    end
-    size(out) == grid_shape || error(
-        "Field of size $(size(arr)) on a $(grid_shape) grid: not this grid's field, and not " *
-        "its faces either.")
-    return out
 end
 
 """

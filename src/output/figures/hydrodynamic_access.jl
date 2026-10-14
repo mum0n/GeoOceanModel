@@ -797,49 +797,40 @@ function extract_hydrodynamic_dataset(
     # of a real run silently drew invented flow.
     if hydro_input isa AbstractString && isdir(output_zarr_path(hydro_input))
         store = output_zarr_path(hydro_input)
-        attrs = JSON3.read(read(joinpath(store, ".zattrs"), String))
-        lons_s = Float64.(attrs["lon"])
-        lats_s = Float64.(attrs["lat"])
-        deps_s = Float64.(attrs["depth"])
-        times_s = if isfile(joinpath(store, "time.json"))
-            Float64.(JSON3.read(read(joinpath(store, "time.json"), String), Vector{Float64}))
-        else
-            [0.0]
-        end
+        # A GeoData read, not a walk over the store's directories. This branch used to open
+        # `.<field>/<m>` itself, take `.zattrs` for the axes and `time.json` for the times, and
+        # re-derive the face averaging the writer now does -- three separate hand-rolled reads
+        # of one dataset. The store is a GeoData store, so there is one read and the fields come
+        # back already on the grid the dimension records describe.
+        ds = GeoData.geoload(store; backend = :zarr)
+        isempty(ds.variables) && error(
+            "The store at $(store) opens as a GeoData dataset with no variables. It was " *
+            "written by an older writer that placed each interval in its own directory; " *
+            "re-run the simulation to produce a GeoData store.")
+        lons_s = collect(Float64, ds.dims[:lon].coords)
+        lats_s = collect(Float64, ds.dims[:lat].coords)
+        deps_s = collect(Float64, ds.dims[:depth].coords)
+        times_s = collect(Float64, ds.coords[:time].data)
         nt = max(1, length(times_s))
-        m_sel = clamp(resolve_time_index(times_s, time_seconds, time_index), 1, nt) - 1
+        m_sel = clamp(resolve_time_index(times_s, time_seconds, time_index), 1, nt)
 
-        # One Zarr array per interval, read from `store/<field>/<m>`. Salinity was never a
-        # store field (the callback writes u/v/w/T), so it stays `nothing` rather than being
-        # filled from a constant the run never used -- `compute_hydrodynamic_diagnostics`
-        # handles a missing salinity, and a value fabricated here would read as observed.
-        #
-        # The store keeps the model's *native* stagger, because the callback writes
-        # `interior(velocities.u)` and friends rather than interpolating: u is one lon face
-        # longer than the centre grid, v one lat face longer, w one depth face longer, and
-        # T already centred. Blending each staggered axis to centres here keeps that fidelity
-        # in the store while giving the figures the regular grid they interpolate against.
-        rd(name) = isdir(joinpath(store, name, string(m_sel))) ?
-                   collect(Zarr.zopen(joinpath(store, name, string(m_sel)))) : nothing
-        _centre(arr::Nothing, ::Int, ::Int, ::Int) = nothing
-        function _centre(arr, n_lon::Int, n_lat::Int, n_z::Int)
-            out = arr
-            size(out, 1) == n_lon + 1 && (out = 0.5 .* (out[1:end-1, :, :] .+ out[2:end, :, :]))
-            size(out, 2) == n_lat + 1 && (out = 0.5 .* (out[:, 1:end-1, :] .+ out[:, 2:end, :]))
-            size(out, 3) == n_z + 1 && (out = 0.5 .* (out[:, :, 1:end-1] .+ out[:, :, 2:end]))
-            return out
-        end
+        # A field the store does not carry is `nothing` rather than a constant: the callback
+        # writes u/v/w/T, so salinity stays absent, and `compute_hydrodynamic_diagnostics`
+        # handles a missing salinity. A value fabricated here would read as observed.
+        field(name) = haskey(ds.variables, name) ?
+                      Array{Float64}(ds.variables[name].data[:, :, :, m_sel]) : nothing
         shape = (length(lons_s), length(lats_s), length(deps_s))
-        u_s = something(_centre(rd("u"), shape...), fill(NaN, shape...))
-        v_s = something(_centre(rd("v"), shape...), fill(NaN, shape...))
-        w_s = something(_centre(rd("w"), shape...), fill(NaN, shape...))
-        T_s = something(_centre(rd("T"), shape...), fill(NaN, shape...))
-        S_s = nothing
+        u_s = something(field("u"), fill(NaN, shape...))
+        v_s = something(field("v"), fill(NaN, shape...))
+        w_s = something(field("w"), fill(NaN, shape...))
+        T_s = something(field("T"), fill(NaN, shape...))
+        S_s = field("S")
 
         bathymetry_s = read_immersed_bathymetry(hydro_input)
         diag = compute_hydrodynamic_diagnostics(lons_s, lats_s, deps_s, u_s, v_s, w_s, T_s, S_s)
         k_sel = resolve_depth_index(deps_s, depth, depth_level)
-        sel_time = isempty(times_s) ? 0.0 : times_s[clamp(resolve_time_index(times_s, time_seconds, time_index), 1, nt)]
+        sel_time = isempty(times_s) ? 0.0 :
+                   times_s[clamp(resolve_time_index(times_s, time_seconds, time_index), 1, nt)]
 
         return (
             lons = lons_s,
