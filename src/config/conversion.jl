@@ -101,6 +101,10 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     else
         Bool(get_val("hydrodynamics", "bulk_heat_flux", true))
     end
+    sst_damping = Float64(get_val("hydrodynamics", "sst_damping_coefficient", 0.0))
+    sst_target_val = Float64(get_val("hydrodynamics", "sst_target", 12.0))
+    spinup_hours_val = Float64(get_val("hydrodynamics", "spinup_hours", 720.0))
+    div_vel_lim = Float64(get_val("hydrodynamics", "divergence_velocity_limit", 20.0))
     # Cap on how many hydrodynamic snapshots are held in memory when building the 4D flow
     # interpolator for particle tracking. A production run stores thousands of snapshots and
     # materialising all of them for u, v, w and T is hundreds of gigabytes; the snapshots are
@@ -320,9 +324,13 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         min_dt_seconds = min_dt_seconds,
         adaptive_cfl = adapt_cfl,
         target_cfl = tgt_cfl,
-          surface_heat_flux = heat_flux,
-          bulk_heat_flux = Bool(bulk_heat_flux),
-    max_flow_snapshots = max_flow_snapshots,
+        surface_heat_flux = heat_flux,
+        bulk_heat_flux = Bool(bulk_heat_flux),
+        sst_damping_coefficient = sst_damping,
+        sst_target = sst_target_val,
+        spinup_hours = spinup_hours_val,
+        divergence_velocity_limit = div_vel_lim,
+        max_flow_snapshots = max_flow_snapshots,
     allow_analytical_fallback = allow_analytical_fallback,
     max_current_speed = (max_current_speed isa Real && max_current_speed > 0) ?
                         Float64(max_current_speed) : nothing,
@@ -360,6 +368,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         checkpoint_dir = cp_dir,
         checkpoint_cleanup = cp_clean,
         auto_restart = auto_res,
+        overwrite = Bool(get_val("storage", "overwrite", false)),
         run_id = run_id_val,
         vertical_stretching_mode = v_mode,
         nz_above = nz_above_cfg,

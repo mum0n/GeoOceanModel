@@ -123,8 +123,7 @@ function build_hydrodynamic_model(
     # construct a FluxBoundaryCondition with `field_dependencies = :T` which evaluates
     # dynamically on both CPU and GPU.
     T_flux_bc = if surface_heat_flux isa Function && applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0)
-        kinematic_flux_T = (x, y, t, T) -> -surface_heat_flux(x, y, t, T) / rho0_cp
-        FluxBoundaryCondition(kinematic_flux_T, field_dependencies = :T)
+        FluxBoundaryCondition(KinematicSurfaceHeatFlux(surface_heat_flux, rho0_cp), field_dependencies = :T)
     elseif surface_heat_flux isa Function
         kinematic_T_flux = if applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0, 0.0)
             (x, y, z, t, S) -> -surface_heat_flux(x, y, z, t, S) / rho0_cp

@@ -99,6 +99,7 @@ function display_help(io::IO = stdout)
                          Default: configs/default.toml.
       --output-dir=DIR   Where the run writes.
       --save-config[=D]  Write the fully-resolved configuration, then exit.
+      --overwrite        Purge previous output store and checkpoints; start at t = 0.
       --help, -h         This message.
 
     Two configurations:
@@ -121,7 +122,7 @@ wrong thing, which is the failure a CLI should refuse.
 function parse_args(args::Vector{String})
     out = Dict{String, Any}(
         "segments" => String[], "config" => "", "save_config" => nothing,
-        "output_dir" => "", "all" => false, "help" => false)
+        "output_dir" => "", "all" => false, "overwrite" => false, "help" => false)
     for a in args
         if a in ("--data", "--grid", "--model", "--climate", "--sim")
             push!(out["segments"], replace(a, "--" => ""))
@@ -129,6 +130,8 @@ function parse_args(args::Vector{String})
             out["all"] = true
         elseif a in ("--help", "-h")
             out["help"] = true
+        elseif a in ("--overwrite", "--fresh")
+            out["overwrite"] = true
         elseif a == "--save-config"
             out["save_config"] = ""
         elseif startswith(a, "--save-config=")
@@ -183,8 +186,15 @@ The resolved configuration as the model builders take it. `load_configuration` r
 and validates its sections against the domain map, so a misspelled section is an error here
 rather than a silent default later.
 """
-function load_options(flag::AbstractString)
-    return configuration_to_options(load_configuration(resolve_config_file(flag)))
+function load_options(flag::AbstractString; overwrite::Bool = false)
+    cfg = load_configuration(resolve_config_file(flag))
+    if overwrite
+        if !haskey(cfg, "storage")
+            cfg["storage"] = Dict{String, Any}()
+        end
+        cfg["storage"]["overwrite"] = true
+    end
+    return configuration_to_options(cfg)
 end
 
 """
@@ -252,7 +262,7 @@ function main(args::Vector{String})
     flags["help"] && return display_help()
 
     opts = try
-        load_options(flags["config"])
+        load_options(flags["config"]; overwrite = flags["overwrite"])
     catch err
         println("Configuration error: $(sprint(showerror, err))")
         return display_help()

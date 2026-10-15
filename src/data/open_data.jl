@@ -171,33 +171,184 @@ function read_wind_stress(filepath::AbstractString)
 end
 
 """
+    TimeSeriesBulkHeatFlux{N}
+
+Bitstype surface net heat flux evaluator for atmospheric boundary forcing.
+
+Evaluates bulk surface net heat flux Q(x, y, t, T_surf) in W m-2 from atmospheric state time series
+(air temperature, surface pressure, relative humidity, cloud fraction, shortwave downwelling,
+kinematic wind stress) using standard bulk aerodynamic and radiative formulas:
+```math
+Q_{\\text{net}} = Q_{\\text{sw}} - Q_{\\text{lw}} - Q_{\\text{sens}} - Q_{\\text{lat}}
+```
+All state time series are stored as NTuples of length N, ensuring the struct is strictly `isbits`
+and directly executable on both CPU and GPU architectures.
+"""
+struct TimeSeriesBulkHeatFlux{N} <: Function
+    ta::NTuple{N, Float64}
+    ps::NTuple{N, Float64}
+    rh::NTuple{N, Float64}
+    cc::NTuple{N, Float64}
+    sw::NTuple{N, Float64}
+    tau_mag::NTuple{N, Float64}
+    horizon::Float64
+    tstep::Float64
+    albedo::Float64
+end
+
+Adapt.adapt_structure(to, s::TimeSeriesBulkHeatFlux) = s
+
+@inline function _wind_speed_from_stress_inline(tau::Float64)
+    t = abs(tau)
+    t <= 0.0 && return 0.0
+    lo, hi = 0.0, 120.0
+    # Inlined 30-iteration bisection for root-finding wind speed from kinematic stress
+    for _ in 1:30
+        mid = 0.5 * (lo + hi)
+        cd = mid <= 11.0 ? 1.2e-3 : (0.49 + 0.065 * mid) * 1e-3
+        s = (1.225 / 1025.0) * cd * (mid * mid)
+        if s < t
+            lo = mid
+        else
+            hi = mid
+        end
+    end
+    return 0.5 * (lo + hi)
+end
+
+@inline function (s::TimeSeriesBulkHeatFlux{N})(x, y, t, T_surf) where {N}
+    k = if s.horizon <= 0.0 || N <= 1
+        1
+    else
+        k_calc = Int(floor(mod(Float64(t), s.horizon) / s.tstep)) + 1
+        k_calc > N ? 1 : (k_calc < 1 ? 1 : k_calc)
+    end
+
+    Ta = @inbounds s.ta[k]
+    p_s = @inbounds s.ps[k]
+    r_h = (@inbounds s.rh[k]) / 100.0
+    c_f = (@inbounds s.cc[k]) / 100.0
+    c_f = c_f < 0.0 ? 0.0 : (c_f > 1.0 ? 1.0 : c_f)
+    sw_d = @inbounds s.sw[k]
+    tau = @inbounds s.tau_mag[k]
+
+    sigma = 5.670374419e-8
+    rho_a = 1.225
+    cp_a = 1005.0
+    Lv = 2.501e6
+    Cd = 1.3e-3
+    Ce = 1.5e-3
+
+    # Vapor pressure and saturation formulas (August-Roche-Magnus approximation)
+    esat_Ta = 611.2 * exp(17.67 * (Ta - 273.15) / (Ta - 29.65))
+    e_a = r_h * esat_Ta
+    esat_Ts = 611.2 * exp(17.67 * (T_surf - 273.15) / (T_surf - 29.65))
+    qsat_Ts = 0.622 * esat_Ts / (p_s - 0.378 * esat_Ts)
+    q_a = 0.622 * e_a / (p_s - 0.378 * e_a)
+
+    U = _wind_speed_from_stress_inline(tau)
+    sw_net = (1.0 - s.albedo) * (1.0 - 0.65 * c_f * c_f) * sw_d
+    lw_factor = (0.34 - 0.14 * e_a / 1000.0) * (1.0 - 0.8 * c_f)
+    lw_net = sigma * (T_surf^4 - Ta^4) * lw_factor
+    sens = rho_a * cp_a * Cd * U * (T_surf - Ta)
+    lat = rho_a * Lv * Ce * U * (qsat_Ts - q_a)
+
+    return sw_net - lw_net - sens - lat
+end
+
+@inline (s::TimeSeriesBulkHeatFlux{N})(x, y, z, t, T_surf) where {N} = s(x, y, t, T_surf)
+
+"""
+    HaneyRelaxedHeatFlux{F}
+
+Bitstype wrapper adding Haney sea-surface temperature relaxation to a base heat flux:
+```math
+Q_{\\text{applied}} = Q_{\\text{base}}(x, y, t, T_s) + \\lambda (T_{\\text{target}} - T_s)
+```
+"""
+struct HaneyRelaxedHeatFlux{F} <: Function
+    base_flux::F
+    lambda::Float64
+    t_target::Float64
+end
+
+Adapt.adapt_structure(to, h::HaneyRelaxedHeatFlux) =
+    HaneyRelaxedHeatFlux(Adapt.adapt(to, h.base_flux), h.lambda, h.t_target)
+
+@inline (h::HaneyRelaxedHeatFlux)(x, y, t, T_surf) =
+    h.base_flux(x, y, t, T_surf) + h.lambda * (h.t_target - T_surf)
+
+@inline (h::HaneyRelaxedHeatFlux)(x, y, z, t, T_surf) =
+    h(x, y, t, T_surf)
+
+"""
+    KinematicSurfaceHeatFlux{F}
+
+Bitstype wrapper converting a net heat flux Q (W m-2) to kinematic temperature flux (K m s-1):
+```math
+F_T = -\\frac{Q}{\\rho_0 c_p}
+```
+"""
+struct KinematicSurfaceHeatFlux{F} <: Function
+    flux::F
+    rho0_cp::Float64
+end
+
+Adapt.adapt_structure(to, k::KinematicSurfaceHeatFlux) =
+    KinematicSurfaceHeatFlux(Adapt.adapt(to, k.flux), k.rho0_cp)
+
+@inline (k::KinematicSurfaceHeatFlux)(x, y, t, T) =
+    -k.flux(x, y, t, T) / k.rho0_cp
+
+@inline (k::KinematicSurfaceHeatFlux)(x, y, z, t, T) =
+    k(x, y, t, T)
+
+"""
     build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
 
 Read a surface-wind file and return `(stress_x, stress_y, heat_flux)` callables.
-Uses `build_bulk_surface_flux_geodata` and wraps the horizontal stresses in
-`TimeSeriesSurfaceStress` for GPU and boundary condition compatibility.
+Returns `TimeSeriesSurfaceStress` and `TimeSeriesBulkHeatFlux` structs for GPU and
+boundary condition compatibility.
 """
 function build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
     try
-        tx_arr, ty_arr, heat_flux = build_bulk_surface_flux_geodata(
-            wind_file; albedo = albedo
-        )
-        if !isnothing(tx_arr)
-            ds = geoload(wind_file)
+        ds = geoload(wind_file)
+        needed = ("tau_x", "tau_y", "air_temperature", "surface_pressure",
+                  "relative_humidity", "cloud_fraction", "sw_down")
+        if all(v -> haskey(ds.variables, v), needed) && haskey(ds.coords, :time)
+            tx = Float64.(ds.variables["tau_x"].data)
+            ty = Float64.(ds.variables["tau_y"].data)
+            ta = Float64.(ds.variables["air_temperature"].data)
+            ps = Float64.(ds.variables["surface_pressure"].data)
+            rh = Float64.(ds.variables["relative_humidity"].data)
+            cc = Float64.(ds.variables["cloud_fraction"].data)
+            sw = Float64.(ds.variables["sw_down"].data)
             tvec = first(GeoData.axis(ds, :time))
-            nt = size(tx_arr, 3)
+
+            nt = size(tx, 3)
             tstep = nt > 1 ? (tvec[end] - tvec[1]) / (nt - 1) : 3600.0
             horizon = nt > 1 ? tvec[end] - tvec[1] : 3600.0
 
-            tx_tuple = ntuple(k -> Float64(tx_arr[1, 1, k]), nt)
-            ty_tuple = ntuple(k -> Float64(ty_arr[1, 1, k]), nt)
+            tx_tuple = ntuple(k -> Float64(tx[1, 1, k]), nt)
+            ty_tuple = ntuple(k -> Float64(ty[1, 1, k]), nt)
+            ta_tuple = ntuple(k -> Float64(ta[1, 1, k]), nt)
+            ps_tuple = ntuple(k -> Float64(ps[1, 1, k]), nt)
+            rh_tuple = ntuple(k -> Float64(rh[1, 1, k]), nt)
+            cc_tuple = ntuple(k -> Float64(cc[1, 1, k]), nt)
+            sw_tuple = ntuple(k -> Float64(sw[1, 1, k]), nt)
+            tau_tuple = ntuple(k -> hypot(Float64(tx[1, 1, k]), Float64(ty[1, 1, k])), nt)
+
             stress_x = TimeSeriesSurfaceStress{nt}(tx_tuple, horizon, tstep)
             stress_y = TimeSeriesSurfaceStress{nt}(ty_tuple, horizon, tstep)
+            heat_flux = TimeSeriesBulkHeatFlux{nt}(
+                ta_tuple, ps_tuple, rh_tuple, cc_tuple, sw_tuple, tau_tuple,
+                horizon, tstep, Float64(albedo)
+            )
 
             return (stress_x, stress_y, heat_flux)
         end
     catch
-        # Fallback reading directly via NCDatasets when DateTime decoding fails in GeoData
+        # Fallback reading directly via NCDatasets
     end
 
     return NCDatasets.NCDataset(wind_file) do ds

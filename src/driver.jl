@@ -644,13 +644,34 @@ end
                 "`surface_heat_flux` instead."
             )
         end
-        applied_flux = want_bulk ? hx : opts.surface_heat_flux
+        raw_flux = want_bulk ? hx : opts.surface_heat_flux
+        applied_flux = if opts.sst_damping_coefficient > 0.0
+            λ = opts.sst_damping_coefficient
+            T_target = opts.sst_target
+            if raw_flux isa Function
+                HaneyRelaxedHeatFlux(raw_flux, λ, T_target)
+            else
+                HaneyRelaxedHeatFlux((x, y, t, T_surf) -> Float64(raw_flux), λ, T_target)
+            end
+        else
+            raw_flux
+        end
         if want_bulk
-            println("Atmospheric forcing: time-varying stress from ERA5 surface state, " *
-                    "with a bulk net heat flux.")
+            if opts.sst_damping_coefficient > 0.0
+                println("Atmospheric forcing: time-varying stress from ERA5 surface state, " *
+                        "with bulk net heat flux + Haney SST relaxation (λ = $(opts.sst_damping_coefficient) W m-2 K-1).")
+            else
+                println("Atmospheric forcing: time-varying stress from ERA5 surface state, " *
+                        "with a bulk net heat flux.")
+            end
         elseif opts.surface_heat_flux != 0.0
-            println("Atmospheric forcing: time-varying stress from ERA5; constant heat flux " *
-                    "of $(opts.surface_heat_flux) W m-2 (bulk_heat_flux = false).")
+            if opts.sst_damping_coefficient > 0.0
+                println("Atmospheric forcing: time-varying stress from ERA5; constant heat flux " *
+                        "of $(opts.surface_heat_flux) W m-2 + Haney SST relaxation (λ = $(opts.sst_damping_coefficient) W m-2 K-1).")
+            else
+                println("Atmospheric forcing: time-varying stress from ERA5; constant heat flux " *
+                        "of $(opts.surface_heat_flux) W m-2 (bulk_heat_flux = false).")
+            end
         else
             println("Atmospheric forcing: time-varying stress from ERA5; heat flux disabled.")
         end
@@ -1010,7 +1031,9 @@ function run_segment_simulation(;
     failed_before = !isnan(attempted_at) && attempted_at == file_info.last_time
 
     resume = false
-    if file_info.exists && !file_info.is_complete && file_info.last_time <= 0
+    if opts.overwrite
+        discard_run!("Flag --overwrite requested: purging existing GeoData store and checkpoints.")
+    elseif file_info.exists && !file_info.is_complete && file_info.last_time <= 0
         discard_run!("Existing store $(basename(store_path)) is incomplete with no recorded progress.")
     elseif file_info.exists && failed_before && opts.auto_restart
         discard_run!(
@@ -1068,18 +1091,18 @@ function run_segment_simulation(;
     init_Δt  = Float64(opts.sim_dt) * 0.10
     max_Δt   = Float64(opts.max_dt)
 
-    println("Setting up simulation (stop_time=$(opts.sim_duration)s, Δt₀=$(init_Δt)s, max_Δt=$(max_Δt)s, min_Δt=$(opts.min_dt_seconds)s)...")
+    spinup_sec = opts.spinup_hours * 3600.0
+    total_sim_duration = opts.sim_duration + spinup_sec
+
+    println("Setting up simulation (target_duration=$(opts.sim_duration)s, spinup=$(spinup_sec)s, total_stop_time=$(total_sim_duration)s, Δt₀=$(init_Δt)s, max_Δt=$(max_Δt)s, min_Δt=$(opts.min_dt_seconds)s)...")
     sim = setup_hydrodynamic_simulation(
         target_model,
         Δt = init_Δt,
-        stop_time = opts.sim_duration,
+        stop_time = total_sim_duration,
         adaptive_time_step = opts.adaptive_cfl,
         target_cfl = opts.target_cfl,
         max_Δt = max_Δt,
         min_Δt = opts.min_dt_seconds,
-        # The simulated output is NOT a JLD2 timeseries: it is written straight into the
-        # GeoData layer (below). JLD2 keeps its one job it can do better than anything --
-        # the Oceananigans checkpoint for restart.
         enable_output = false,
         output_schedule = (opts.output_schedule_seconds > 0.0) ?
             opts.output_schedule_seconds : 21600.0,
@@ -1089,23 +1112,15 @@ function run_segment_simulation(;
         checkpoint_prefix = opts.checkpoint_prefix,
         checkpoint_schedule = opts.checkpoint_schedule > 0 ? opts.checkpoint_schedule : nothing,
         cleanup_checkpoints = opts.checkpoint_cleanup,
-        pickup = resume ? :auto : false
+        pickup = resume ? :auto : false,
+        divergence_velocity_limit = opts.divergence_velocity_limit
     )
 
-    # Write the simulated fields (u, v, w, T) into a GeoData Zarr store at the run's own
-    # output interval, with the grid's interior cell centres carried in the store itself.
-    # The larval half opens that through the data layer rather than through Oceananigans'
-    # storage layout, which is the coupling the whole split exists to remove. On a resume the
-    # store is appended to, not rebuilt.
-    #
-    # The store's cadence is the same `TimeInterval` the JLD2 writer was given, built here in
-    # one place and handed to both. Constructing it separately would risk two cadences in one
-    # run, and omitting it is worse: an unscheduled Oceananigans `Callback` fires every
-    # timestep, not on the output interval.
     out_interval = Oceananigans.TimeInterval(
         (opts.output_schedule_seconds > 0.0) ? opts.output_schedule_seconds : 21600.0)
     output_store = attach_output_callback!(sim, out_dir_target; fields = ("u", "v", "w", "T"),
-                                           schedule = out_interval, resume = resume)
+                                           schedule = out_interval, resume = resume,
+                                           spinup_seconds = spinup_sec)
     @assert output_store == store_path "output store drifted from the resume/reuse target"
     println("Ocean output is a GeoData store: $(output_store)")
 

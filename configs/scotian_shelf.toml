@@ -22,33 +22,19 @@
 #  Sections are the ocean schema's; the larval half's settings live in
 #  ../GeoLarvalTracking/configs/biology.toml and are read from this run's
 #  output, not from a TOML.
-#
-#  Knobs for a longer/fully tidal production run: raise sim_duration_hours, and
-#  set [tides] tides_source = "tpxo9_atlas" with enable_tides = true and
-#  constituents = ["M2", "S2"] (TPXO9 is keyless via GeoDataSources). They are
-#  left off here so a short spin-up matches default.toml's other settings.
+#  Tidal forcing is enabled via TPXO9 atlas (`enable_tides = true`,
+#  `tides_source = "tpxo9_atlas"`) incorporating M2 and S2 harmonic constituents.
+#  Adjust `sim_duration_hours` under [hydrodynamics] for the target run window.
 # ==============================================================================
  
 
 [atmosphere]
 # What the weather does to the sea surface: wind stirring it, sunlight warming it, and the
 # loss of heat back to the air.
-forcing = "era5_climatology"     # A fixed typical year of weather, repeated; nothing downloaded
-# Chosen over the fetched alternative ("open_meteo") because this is a 120-day climatological
-# run: a repeating monthly envelope spans several distinct seasonal states, whereas a single
-# dated fetch is one day's weather cycled 120 times, which is a coarser forcing than the
-# climatology it would replace. "open_meteo" is the one to use for a run about a particular
-# period, where the point is the actual weather of those days.
 climatology = true              # Repeat the weather cycle rather than running out of it
 variables = ["u10", "v10", "t2m", "ssrd", "strd"]  # Wind, air temperature, sunlight, and heat radiated back down
 drag_formulation = "garratt_1977"  # How strongly the wind drags on the surface; stronger wind means more drag
-bulk_heat_flux = false          # See note below
-# `build_bulk_surface_flux` needs the sea-surface temperature, and in Oceananigans 0.111.0
-# a surface boundary condition cannot be given that tracer: declaring
-# `field_dependencies = (:T,)` on a `ContinuousBoundaryFunction` raises StackOverflowError
-# for every call signature, and omitting it means the condition is called as f(x, y, t)
-# with no tracer. Set this false to apply the constant `surface_heat_flux` below instead.
-# Restore to true only once a fixed Oceananigans makes that dependency lower.
+bulk_heat_flux = true           # Compute prognostic bulk fluxes (latent, sensible, shortwave, longwave)
 
 
 [bathymetry]
@@ -91,9 +77,6 @@ embedding_lat_max = 48.5
 # keyless) when one is not available. 
 # Lateral boundary hydrography source: "glorys12v1" (Copernicus Marine 1/12° reanalysis),
 # "woa23" (NOAA climatology), or "synthetic" (unconstrained).
-# `parent_ocean` is supported as an alias for `ocean_boundary_source`.
-parent_ocean = "glorys12v1"
-
 ocean_boundary_source = "glorys12v1"    # Global reanalysis subset via Copernicus Marine (~9 km)
 # This is the one input in this file that needs an account. GLORYS12V1 comes from Copernicus
 # Marine, which is free but asks you to register, and then read a username and key from
@@ -179,26 +162,9 @@ buffer_km = 50.0                 # Spatial buffer for particle seeding (km)
 # distributes nz cells across z_min..z_max when neither is set.
 nx = 345
 ny = 245
-nz = 13
-depths = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 150.0, 200.0, 300.0, 400.0, 800.0, 2000.0, 5000.0]
+nz = 29
+depths = [0.0, 5.0, 10.0, 15.0, 22.0, 30.0, 40.0, 50.0, 62.0, 75.0, 90.0, 110.0, 130.0, 155.0, 185.0, 220.0, 260.0, 310.0, 370.0, 440.0, 525.0, 630.0, 760.0, 930.0, 1150.0, 1450.0, 1900.0, 2600.0, 3600.0, 5000.0]
 resolution_scale = 1.0
-
-# Two-segment vertical grid.
-#
-# A single tanh over 0 to -5000 m puts its COARSEST cell at the surface: with nz = 20 the
-# shallowest cell centre sat at -258 m, giving 0 cell centres above -200 m and none at all in the
-# 0-50 m nursery settlement band, so the cold intermediate layer, the thermocline and
-# settlement_max_depth = -50 m were all unresolved.
-#
-# "two_segment" splits the column at vertical_break_depth: a surface-refined upper segment that
-# resolves the 10-400 m active layer, plus a coarse lower segment that still spans the Laurentian
-# Fan (22% of this domain is deeper than 400 m, reaching ~4850 m). nz is the TOTAL; nz_above = 0
-# derives the split as 60% of nz, so nz = 40 -> 24 levels in 0-400 m and 16 below.
-#
-# Resulting resolution (nz = 40): top cell 5.4 m, 7 cell centres in 0-50 m, 11 in 0-100 m,
-# 24 in 0-400 m, shallowest centre -2.7 m.
-nz_above = 0                             # unused in "csv/depths" mode
-vertical_break_depth = -400.0            # unused in "csv/depths" mode
 
 
 
@@ -210,10 +176,11 @@ seed = 42
 
  
 [hydrodynamics]
-# Multi-year climatological simulation (2 years = 17,520 hours)
 # sim_duration_hours = 17520          # 2 yrs days
-sim_duration_hours = 72.0             # short test 3 day
 # sim_duration_hours = 8760           # 1 year
+# sim_duration_hours = 72.0           # 3 days
+sim_duration_hours = 336.0            # 14 days (scientific production window)
+spinup_hours = 720.0                  # 30 days initial spin-up period (transient outputs excluded from store)
 sim_dt_seconds = 60.0               # Initial time step (seconds); adaptive limiter adjusts
                                      # dynamically using layer-resolved vertical Courant numbers.
 adaptive_cfl = true                 # Dynamic CFL adaptive time-stepping
@@ -223,10 +190,10 @@ max_dt_seconds = 360.0              # Maximum time step ceiling (seconds)
 min_dt_seconds = 1.0                # Minimum allowable time step floor (seconds)
 coriolis_latitude = 44.5            # Reference Coriolis latitude (°N)
 divergence_velocity_limit = 10.0    # Stability watchdog threshold (m/s)
-surface_heat_flux = 50.0            # Summer net surface heat flux (W/m²)
+surface_heat_flux = 50.0            # Fallback constant surface heat flux (W/m²) when bulk_heat_flux=false
+sst_damping_coefficient = 35.0      # Haney (1971) thermal restoring strength (W/m²/K; e-folding ~30 days)
+sst_target = 12.0                   # Regional climatological target surface temperature (°C)
 turbulence_closure = "nemotke"      # ClimaOcean NEMO-TKE vertical turbulence closure
-enable_sea_ice = true               # Thermodynamic seawater freezing and frazil diagnostics
-enable_oxygen = true                # Dissolved oxygen (O2) prognostic tracer
  
 
 [metadata]
@@ -283,4 +250,4 @@ tidal_relaxation_timescale_seconds = 3600.0
 
 [visualization]
 interactive_map = false
-title = "Scotian Shelf Ocean (production)"
+title = "Scotian Shelf Ocean"

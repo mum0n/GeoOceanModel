@@ -127,8 +127,12 @@ struct HydrodynamicOptions
     min_dt_seconds           :: Float64
     adaptive_cfl             :: Bool
     target_cfl               :: Float64
-      surface_heat_flux        :: Float64
-      bulk_heat_flux           :: Bool
+    surface_heat_flux        :: Float64
+    bulk_heat_flux           :: Bool
+    sst_damping_coefficient  :: Float64
+    sst_target               :: Float64
+    spinup_hours             :: Float64
+    divergence_velocity_limit :: Float64
     max_flow_snapshots       :: Int
     allow_analytical_fallback :: Bool
     max_current_speed        :: Union{Nothing, Float64}
@@ -168,6 +172,7 @@ struct HydrodynamicOptions
     checkpoint_dir           :: String
     checkpoint_cleanup       :: Bool
     auto_restart             :: Bool
+    overwrite                :: Bool
     run_id                   :: String
     vertical_stretching_mode :: Symbol
     nz_above :: Int
@@ -328,8 +333,12 @@ function HydrodynamicOptions(;
     min_dt_seconds        :: Real = 2.0,
     adaptive_cfl          :: Bool = true,
     target_cfl            :: Real = 0.2,
-      surface_heat_flux     :: Real = 50.0,
-      bulk_heat_flux        :: Bool = true,
+    surface_heat_flux     :: Real = 50.0,
+    bulk_heat_flux        :: Bool = true,
+    sst_damping_coefficient :: Real = 0.0,
+    sst_target            :: Real = 12.0,
+    spinup_hours          :: Real = 720.0,
+    divergence_velocity_limit :: Real = 20.0,
     max_flow_snapshots    :: Int = 400,
     allow_analytical_fallback :: Bool = false,
     max_current_speed     :: Union{Nothing, Real} = 3.0,
@@ -369,6 +378,7 @@ function HydrodynamicOptions(;
     checkpoint_dir        :: AbstractString = "",
     checkpoint_cleanup    :: Bool = true,
     auto_restart             :: Bool = true,
+    overwrite                :: Bool = false,
     run_id                   :: AbstractString = "",
     vertical_stretching_mode :: Symbol = :oceananigans,
     nz_above :: Int = 0,
@@ -457,9 +467,13 @@ function HydrodynamicOptions(;
         Float64(min_dt_seconds),
         adaptive_cfl,
         Float64(target_cfl),
-  Float64(surface_heat_flux),
-  bulk_heat_flux,
-  Int(max_flow_snapshots),
+        Float64(surface_heat_flux),
+        bulk_heat_flux,
+        Float64(sst_damping_coefficient),
+        Float64(sst_target),
+        Float64(spinup_hours),
+        Float64(divergence_velocity_limit),
+        Int(max_flow_snapshots),
         allow_analytical_fallback,
         (max_current_speed isa Real && max_current_speed > 0) ? Float64(max_current_speed) : nothing,
         n_particles,
@@ -498,6 +512,7 @@ function HydrodynamicOptions(;
         String(checkpoint_dir),
         checkpoint_cleanup,
         auto_restart,
+        overwrite,
         String(run_id),
         vertical_stretching_mode,
         Int(nz_above),

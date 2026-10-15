@@ -78,6 +78,8 @@ mutable struct GeodataOutputCallback
     # fired is not necessarily in `sim.callbacks` yet, and scanning finds nothing -- which sizes
     # the time axis to one interval and silently truncates the run's output.
     interval::Float64
+    # Spin-up interval in seconds. Time-slices prior to this are excluded from storage.
+    spinup_seconds::Float64
 end
 
 """
@@ -90,7 +92,7 @@ overwriting the interval it already wrote.
 """
 function GeodataOutputCallback(output_dir::AbstractString, interval::Real,
                                model; fields::Tuple = ("u", "v", "w", "T"),
-                               resume::Bool = false)
+                               resume::Bool = false, spinup_seconds::Real = 0.0)
     isdir(output_dir) || mkpath(output_dir)
     store = output_zarr_path(output_dir)
     if !resume && ispath(store)
@@ -98,40 +100,27 @@ function GeodataOutputCallback(output_dir::AbstractString, interval::Real,
     end
     mkpath(store)
 
-    # The first interval a fresh run writes is slice 1, because the store's arrays are
-    # 1-based: `A[:, :, :, 0]` is not "the first slice" in any array, and on a Zarr array it
-    # lands on the *last* interval -- so the first slice stayed zero and the run's own initial
-    # condition was written where its final one goes. The old per-interval directories were
-    # named from 0, which is where this off-by-one came from.
-    #
-    # On resume the count comes from the store's own time coordinate, through `geoload`. The
-    # sidecar this replaced held the same number, written separately, and a reader of the
-    # sidecar and a reader of the store could disagree about how far the run had got.
     start = 1
     if resume
         start = GeoOceanModel.store_interval_count(store) + 1
     end
-    # The store itself is built at the first output, not here: the grid axes come from the
-    # model, and a callback attached before the fields exist would have to invent them. The
-    # time array is held here only because it is opened with the dataset and the dataset is
-    # opened later, at the first write.
     return GeodataOutputCallback(store, output_dir, collect(String.(fields)), Ref(start),
-                                 nothing, nothing, Float64(interval))
+                                 nothing, nothing, Float64(interval), Float64(spinup_seconds))
 end
 
 """
     _interval_count(sim, cb) -> Int
 
 How many output intervals this run will write, so the store's time axis can be sized once
-instead of growing an array that cannot be appended to. The simulation's declared stop time
-and the caller's own output interval give it. A caller with no stop time (a unit test's short
-run) still gets at least one interval, because a zero-sized field is not a field.
+instead of growing an array that cannot be appended to. Intervals falling strictly within
+the spin-up period [0, spinup_seconds) are excluded from the output store.
 """
 function _interval_count(sim::Oceananigans.Simulation, cb)
     stop = Float64(sim.stop_time)
+    effective_duration = max(0.0, stop - cb.spinup_seconds)
     cb.interval > 0 || return 1
-    stop > 0 || return 1
-    return max(1, ceil(Int, stop / cb.interval) + 1)
+    effective_duration > 0 || return 1
+    return max(1, ceil(Int, effective_duration / cb.interval) + 1)
 end
 
 """
@@ -249,6 +238,10 @@ end
 
 function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
     model = sim.model
+    t = Float64(model.clock.time)
+    if t < cb.spinup_seconds
+        return nothing
+    end
     m = cb.written[]
 
     # The interior cell centres, resolved from the model's own grid, so the store states where
@@ -327,16 +320,13 @@ writers share one cadence by construction rather than by convention.
 """
 function attach_output_callback!(sim, output_dir::AbstractString;
                                  fields::Tuple = ("u", "v", "w", "T"),
-                                 schedule = nothing, resume::Bool = false)
+                                 schedule = nothing, resume::Bool = false,
+                                 spinup_seconds::Real = 0.0)
     if isnothing(schedule)
-        # A `TimeInterval` is constructed here rather than in the caller so this stays usable
-        # on its own: 6 h is the default the TOML asks for. Both writers are then given the
-        # same object from `run_segment_simulation`, so this default is a fallback, not a
-        # second cadence.
         schedule = Oceananigans.TimeInterval(6 * 3600.0)
     end
     cb = GeodataOutputCallback(output_dir, schedule.interval, sim.model; fields = fields,
-                               resume = resume)
+                               resume = resume, spinup_seconds = spinup_seconds)
     Oceananigans.add_callback!(sim, Oceananigans.Callback(cb, schedule))
     # The store itself does not exist yet: it is built at the first output, when the grid axes
     # and the field shapes are known. What is returned is where it *will* be, so the caller can

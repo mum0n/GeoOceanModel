@@ -120,8 +120,6 @@ coriolis_latitude = 45.95
 divergence_velocity_limit = 10.0
 surface_heat_flux = 50.0
 turbulence_closure = "nemotke"
-enable_sea_ice = false
-enable_oxygen = false 
 
 
 [metadata]
