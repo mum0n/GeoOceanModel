@@ -212,8 +212,8 @@ seed = 42
 [hydrodynamics]
 # Multi-year climatological simulation (2 years = 17,520 hours)
 # sim_duration_hours = 17520          # 2 yrs days
-# sim_duration_hours = 72             # short test 3 day
-sim_duration_hours = 8760           # 1 year
+sim_duration_hours = 72.0             # short test 3 day
+# sim_duration_hours = 8760           # 1 year
 sim_dt_seconds = 60.0               # Initial time step (seconds); adaptive limiter adjusts
                                      # dynamically using layer-resolved vertical Courant numbers.
 adaptive_cfl = true                 # Dynamic CFL adaptive time-stepping
