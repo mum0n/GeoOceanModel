@@ -1,253 +1,128 @@
-# ==============================================================================
-#  scotian_shelf.toml — the ocean half, Scotian Shelf (production)
-# ==============================================================================
+# =============================================================================
+# GeoOceanModel - Scotian Shelf Production Hydrodynamic Configuration
+# =============================================================================
+# High-resolution hydrodynamic configuration for the Scotian Shelf and Gulf of
+# Maine. Drives the 3D circulation model using real ETOPO/NWA bathymetry,
+# Open-Meteo ERA5 surface wind forcing, TPXO9 tidal harmonics, and Copernicus
+# Marine GLORYS12V1 boundary relaxation.
 #
-#  The production/realistic Scotian Shelf configuration: the snow-crab study
-#  domain and grid (SPLIT_PLAN.md), forced with the best available real data
-#  through the GeoData abstraction layer. This is the config to run for real
-#  analysis; `default.toml` is its small keyless demonstration twin.
-#
-#  Every physical input is piped in through GeoData (`GeoDataSources`), named
-#  once in [data]/[boundaries]; nothing is embedded:
-#    bathymetry  nwa_bathymetry   measured Northwest Atlantic shelf soundings
-#                                 (bundled tier-1 raw data; the right product for
-#                                 the Scotian Shelf, not a global model).
-#    coastline   natural_earth_10m
-#    wind        open_meteo       (GeoDataSources wind fetcher)
-#    boundary    glorys12v1       Copernicus Marine reanalysis for the open-edge
-#                                 hydrography and velocity (needs a Copernicus
-#                                 Marine account — see README/AGENTS).
-#    hydrography glorys12v1       the same reanalysis seeds the initial T/S
-#
-#  Sections are the ocean schema's; the larval half's settings live in
-#  ../GeoLarvalTracking/configs/biology.toml and are read from this run's
-#  output, not from a TOML.
-#  Tidal forcing is enabled via TPXO9 atlas (`enable_tides = true`,
-#  `tides_source = "tpxo9_atlas"`) incorporating M2 and S2 harmonic constituents.
-#  Adjust `sim_duration_hours` under [hydrodynamics] for the target run window.
-# ==============================================================================
- 
-
-[atmosphere]
-# What the weather does to the sea surface: wind stirring it, sunlight warming it, and the
-# loss of heat back to the air.
-climatology = true              # Repeat the weather cycle rather than running out of it
-variables = ["u10", "v10", "t2m", "ssrd", "strd"]  # Wind, air temperature, sunlight, and heat radiated back down
-drag_formulation = "garratt_1977"  # How strongly the wind drags on the surface; stronger wind means more drag
-bulk_heat_flux = true           # Compute prognostic bulk fluxes (latent, sensible, shortwave, longwave)
-
-
-[bathymetry]
-# The dataset is named once, as `bathy_source` in [data]; `ingest_library` says which library
-# performs the ingestion and regridding. There is no fallback dataset: ETOPO 180-arcsec
-# is deliberately not offered, so an unavailable ETOPO 2022 fails instead of silently
-# running on coarser relief.
-# ingest_library = "numerical_earth"      # Use NumericalEarth.jl for ingestion and regridding
-ingest_library = "geodata"
-resolution_arcsec = 15          # 15 arc-second resolution (~500 m at mid-latitudes)
-inshore_depth = -20.0           # Coastal boundary depth (meters)
-shelf_slope = 500.0             # Bathymetric continental slope scale (meters)
-mask_bay_of_fundy = true        # Mask hypertidal Bay of Fundy shallows to solid land (0.0 m)
-                                # to eliminate spurious vertical velocities (w ~ 1.3 m/s) and
-                                # unlock large adaptive time steps (dt ~ 30-60 s). Snow crab
-                                # inhabit 50-350 m shelf waters and do not enter the bay.
-
-
-
-[bottom_boundary_layer]
-# Quadratic bottom drag with TKE mixing closure
-cd_drag = 0.0025                    # Quadratic bottom drag coefficient (Cd)
-bottom_drag = 0.0001                # Background linear friction rate (s^-1)
-bbl_mixing_closure = "tke"          # Benthic boundary layer turbulent kinetic energy closure
-
-
-[boundaries]
-# The model is a rectangle of ocean cut out of a larger sea, so three of its edges are
-# imaginary lines where water flows in and out. The model has to be told what the water is
-# doing just outside those lines. The band next to each edge is eased back toward those
-# outside conditions over about an hour, so the middle of the domain stays free to do its own
-# thing.
-embedding_lon_min = -71.0
-embedding_lon_max = -53.0
-embedding_lat_min = 40.0
-embedding_lat_max = 48.5
-
-# Open edges constrained by GLORYS12V1 (Copernicus Marine). This needs a
-# configured Copernicus Marine account; use default.toml (synthetic edges,
-# keyless) when one is not available. 
-# Lateral boundary hydrography source: "glorys12v1" (Copernicus Marine 1/12° reanalysis),
-# "woa23" (NOAA climatology), or "synthetic" (unconstrained).
-ocean_boundary_source = "glorys12v1"    # Global reanalysis subset via Copernicus Marine (~9 km)
-# This is the one input in this file that needs an account. GLORYS12V1 comes from Copernicus
-# Marine, which is free but asks you to register, and then read a username and key from
-# ~/.copernicusmarine/credentials. Without that file the download is refused and the run
-# stops -- it will not quietly drop to a rougher dataset, because the edges would then hold
-# different water and nothing in the results would show it.
-#
-# Chosen over the keyless alternatives for one reason: it carries currents. WOA23 is free and
-# would constrain the boundary temperature and salt, but not how fast water crosses the edge,
-# and for a dispersal calculation the volume coming through is the thing that matters. The
-# full comparison of the four accepted values is in src/config/configuration.jl.
-# method = "flather_chapman"
-method = "relaxation"                   # Ease the edge band back toward the outside conditions
-climatology = true                      # Let the boundary repeat rather than run out of data
-obc_type = "flather_chapman"            # Standard treatment for the sea surface height and depth-averaged flow
-active_boundaries = ["east", "south", "west"]   # Which edges are open
-sponge_layer_width = 0.25               # Width of the eased band, in degrees
-sponge_timescale_seconds = 3600.0       # How long that band takes to be pulled back, in seconds
-u_inflow = -0.15                        # Speed of water coming in from the north-east, m/s
-v_inflow = 0.05                         # Speed of that water across the shelf, m/s
-
-
-
-[climate]
-scenario = "climatology"
-projection_year = 2022
-baseline_year = 2020
-horizon_year = 2050
-
- 
-[data]
-# Where the real-world information comes from. There is no on/off switch for "real data" and
-# no backup product: if a download fails the run stops rather than quietly standing in a
-# different dataset. Every key below names an actual published product, and the values this
-# file accepts are documented once, in src/config/configuration.jl.
-#
-# The choices here, briefly:
-#   bathy_source       ETOPO 2022, a global sea floor map at about 450 m detail, free.
-#   wind_source        Open-Meteo, which republishes real past weather through a free API. It
-#                      also supplies air temperature, pressure, humidity, cloud and sunlight,
-#                      so the model can work out the sea's heat gain hour by hour.
-#   hydrography_source WOA23, a free NOAA monthly average of temperature and salt.
-#   coastline_source   Natural Earth, public domain, at its most detailed.
-#
-# Two were considered and set aside, recorded so they are not re-proposed: NOAA's own
-# reanalysis is free but stores its numbers in a layout with no latitude/longitude labels,
-# and reconstructing that layout wrongly would displace the wind by a whole degree of
-# longitude without any obvious error; the Global Wind Atlas is free but hands over a picture
-# file needing extra software, and the earlier version of this code wrote an empty
-# placeholder instead of real wind, which is worse than not trying.
-#
-# The open edges of the domain are set separately, under [boundaries] below.
-coastline_source = "natural_earth_10m"  # Land outline at full detail, public domain
-# bathy_source = "etopo2022"      # Sea floor map, NOAA, free
-bathy_source = "nwa_bathymetry"
-wind_source = "open_meteo"      # Real weather via a free website; "era5" is the same thing
-# hydrography_source = "woa23"            # Monthly average temperature and salt, NOAA, free
-hydrography_source = "glorys12v1"
-wind_time_iso = "2020-06-01T00:00:00Z"   # Which moment of 2020 to take the weather from
-
+#   julia --project=. GeoOceanModelRun.jl --config=configs/scotian_shelf.toml --all
+# =============================================================================
 
 [domain]
-# Study Domain (Scotian Shelf): the core region of interest
-# lon/lat in degrees East/North; z in meters (negative = depth)
-lon_min = -68.0
-lon_max = -57.0
-lat_min = 42.0
-lat_max = 47.5
-z_min = -5000.0
-z_max = 0.0
-buffer_km = 50.0                 # Spatial buffer for particle seeding (km)
- 
-
+# Geographic bounding box in degrees (WGS84, EPSG:4326)
+lon_min = -68.0               # Western boundary longitude (°E)
+lon_max = -56.5               # Eastern boundary longitude (°E)
+lat_min = 41.2                # Southern boundary latitude (°N)
+lat_max = 47.5                # Northern boundary latitude (°N)
+z_min = -1500.0               # Maximum bathymetric water depth (m, negative down)
+z_max = 0.0                   # Free surface elevation (m)
+buffer_km = 50.0              # Boundary buffer margin in kilometres
 
 [grid]
-# High-resolution grid for Scotian Shelf (~2.5 km resolution)
-# nx/ny: horizontal grid cell counts (zonal/meridional)
-# nz: vertical layers (stretched for surface/bottom resolution)
-# resolution_scale: multiplier for base 1/12° grid (2.5 = ~2.5 km cells)
-# vertical_stretching_mode: "tanh" (hyperbolic tangent, surface-refined) or "uniform" or "csv" (from file)
-# depths: discretised vertical faces, positive downward from 0 m. Must hold nz+1 entries and
-# reach z_min. Naming a vertical_grid_file instead is the alternative; Oceananigans
-# distributes nz cells across z_min..z_max when neither is set.
-nx = 345
-ny = 245
-nz = 29
-depths = [0.0, 5.0, 10.0, 15.0, 22.0, 30.0, 40.0, 50.0, 62.0, 75.0, 90.0, 110.0, 130.0, 155.0, 185.0, 220.0, 260.0, 310.0, 370.0, 440.0, 525.0, 630.0, 760.0, 930.0, 1150.0, 1450.0, 1900.0, 2600.0, 3600.0, 5000.0]
-resolution_scale = 1.0
+# High-resolution spatial discretization
+nx = 240                      # Zonal grid cell count
+ny = 180                      # Meridional grid cell count
+nz = 12                       # Vertical layer count
+vertical_stretching_mode = "oceananigans" # Coordinate stretching mode
+nz_above = 0                  # Layers allocated to upper shelf stratum
+vertical_break_depth = -400.0 # Shelf-slope break depth (m)
+vertical_grid_file = ""       # Optional CSV specifying vertical faces
+# Explicit vertical layer face depths starting at 0.0 down to domain bottom (1500 m)
+# Surface layer of 15-20m allows stable larger dt under wind stirring without violating vertical CFL
+depths = [0.0, 15.0, 35.0, 60.0, 90.0, 130.0, 180.0, 250.0, 350.0, 500.0, 800.0, 1100.0, 1500.0]
 
+[bathymetry]
+# Real shelf topography and geometry controls
+inshore_depth = -20.0         # Water depth at inshore boundary (m)
+shelf_slope = 500.0           # Total rise across continental shelf (m)
+mask_bay_of_fundy = true      # Damp excessive non-linear resonance in Bay of Fundy
 
+[data]
+# Real-world assimilated data sources
+bathy_source = "nwa_bathymetry" # Northwest Atlantic high-resolution bathymetry
+coastline_source = "natural_earth_10m" # High-resolution coastline vector
+wind_source = "open_meteo"    # Hourly surface wind stress from ERA5 reanalysis
+wind_time_iso = "2020-06-01T00:00:00Z" # Epoch for wind stress forcing
+hydrography_source = "glorys12v1" # 3D ocean state: Copernicus Marine GLORYS12V1
+hydrography_month = 0         # Month index (0 = dynamic seasonal climatology)
 
-[runtype]
-# Run hardware and RNG seed: the former [hardware] and [paths] merged here.
-use_gpu = true
-fallback_to_cpu = false
-seed = 42
+[atmosphere]
+# Atmospheric forcing and surface boundary fluxes
+source = "open_meteo"         # ERA5 hourly atmospheric state
+bulk_heat_flux = true         # Compute dynamic air-sea heat fluxes
 
- 
+[boundaries]
+# Open boundary conditions via lateral sponge relaxation
+method = "relaxation"         # Lateral boundary relaxation
+obc_type = "flather_chapman"  # Radiation boundary formulation
+ocean_boundary_source = "glorys12v1" # Target tracer and velocity state from GLORYS12V1
+sponge_layer_width = 0.45     # Increased from 0.25 to 0.45 (~50 km)
+sponge_timescale_seconds = 3600.0 # Robust 1-hour sponge relaxation timescale
+u_inflow = -0.10              # Southwestward Labrador / Nova Scotia Current (m/s)
+v_inflow = 0.0                # Zero cross-isobath inflow into deep continental slope (m/s)
+
+[tides]
+# Astronomical tidal body and boundary forcing
+enable_tides = true           # Enable astronomical tidal forcing
+tides_source = "tpxo9_atlas"  # TPXO9.v5a global tidal solution
+tidal_constituents = ["M2", "S2"] # Semidiurnal tidal components
+tidal_u_amp = 0.25            # M2 zonal tidal amplitude (m/s)
+tidal_v_amp = 0.12            # M2 meridional tidal amplitude (m/s)
+s2_u_amp = 0.11               # S2 zonal tidal amplitude (m/s)
+s2_v_amp = 0.05               # S2 meridional tidal amplitude (m/s)
+
+[climate]
+# Climate scenario configuration
+scenario = "climatology"      # "climatology" for verified historical run
+projection_year = 2022        # Target simulation year
+
 [hydrodynamics]
-# sim_duration_hours = 17520          # 2 yrs days
-# sim_duration_hours = 8760           # 1 year
-# sim_duration_hours = 72.0           # 3 days
-sim_duration_hours = 336.0            # 14 days (scientific production window)
-spinup_hours = 720.0                  # 30 days initial spin-up period (transient outputs excluded from store)
-sim_dt_seconds = 60.0               # Initial time step (seconds); adaptive limiter adjusts
-                                     # dynamically using layer-resolved vertical Courant numbers.
-adaptive_cfl = true                 # Dynamic CFL adaptive time-stepping
-target_cfl = 0.50                   # Target advective CFL (0.70 is stable for 3D WENO5)
-target_wave_cfl = 0.50              # Target wave CFL
-max_dt_seconds = 360.0              # Maximum time step ceiling (seconds)
-min_dt_seconds = 1.0                # Minimum allowable time step floor (seconds)
-coriolis_latitude = 44.5            # Reference Coriolis latitude (°N)
-divergence_velocity_limit = 10.0    # Stability watchdog threshold (m/s)
-surface_heat_flux = 50.0            # Fallback constant surface heat flux (W/m²) when bulk_heat_flux=false
-sst_damping_coefficient = 35.0      # Haney (1971) thermal restoring strength (W/m²/K; e-folding ~30 days)
-sst_target = 12.0                   # Regional climatological target surface temperature (°C)
-turbulence_closure = "nemotke"      # ClimaOcean NEMO-TKE vertical turbulence closure
- 
-
-[metadata]
-name = "Scotian Shelf Ocean (production)"
-description = "Scotian Shelf snow-crab domain forced with real data through the GeoData layer: nwa_bathymetry, GLORYS12V1 boundary and hydrography, open_meteo winds"
-author = "GeoOceanModel"
-version = "1.0.0"
+# Numerical solver controls and adaptive stepping
+sim_duration_hours = 720.0    # 30-day simulation duration (720 hours)
+sim_dt_seconds = 15.0         # Baseline time step in seconds
+min_dt_seconds = 1.0          # Minimum adaptive time step floor (seconds)
+max_dt_seconds = 20.0         # Maximum adaptive time step ceiling (C_wave <= 0.65 in 1500m depth)
+adaptive_cfl = true           # Modulate dt according to advective and wave CFL
+target_cfl = 0.15             # Target advective CFL limit
+target_wave_cfl = 0.12        # Target barotropic gravity wave CFL limit
+surface_heat_flux = 50.0      # Baseline sensible heat flux (W/m^2)
+max_current_speed = 3.0       # Current velocity ceiling in m/s
+max_flow_snapshots = 400      # Snapshot memory retention limit
+spinup_hours = 24.0           # Spinup time before saving outputs (24 hours)
+allow_analytical_fallback = false # Fail loudly if real inputs unavailable
+hydro_model_file = ""         # Hydrodynamic model checkpoint
+reuse_hydro = false           # Reuse existing flow fields if present
 
 
 [storage]
-output_path = "../lakehouse/GeoOceanModel/scotian_shelf"
-storage_backend = "zarr"
-output_schedule_seconds = 1800.0
-checkpoint_fields = ["u", "v", "w", "T", "S"]
-enable_checkpoint = true
-checkpoint_prefix = "scotian_shelf_checkpoint"
-checkpoint_schedule_seconds = 3600.0
-checkpoint_dir = "../lakehouse/GeoOceanModel/scotian_shelf/checkpoints"
-cleanup_checkpoints = true
-auto_restart = true
-
-
-[tides]
-# Astronomical tidal forcing with M2 + S2 spring-neap envelope
-# Where the size of the tides comes from. TPXO9 is measured tides from satellites and tide
-# gauges, free and with no account, and it is the best of the available for this part of the
-# Atlantic. The alternative ("analytic") builds the tides from the amplitude numbers below
-# instead, with nothing downloaded and the same tide everywhere in the domain -- fine for
-# checking the machinery, not for a realistic tide.
-# Tidal forcing switch. When true, the TPXO9 global harmonic velocity solution
-# (u_tpxo9.v1.nc) is retrieved automatically into inputs/tpxo9/ via HTTP range stream.
-# Set false to disable tidal forcing.
-enable_tides = true
-tides_source = "tpxo9_atlas"
-# The two tides that together make the spring-neap cycle: M2 and S2 each arrive about twice
-# a day, and the two line up roughly every two weeks to give the biggest tides ("springs")
-# and then cancel out to give the smallest ("neaps").
-constituents = ["M2", "S2"]
-tidal_u_amp = 0.25      # How strongly M2 pushes water along the shelf, m/s
-tidal_v_amp = 0.12      # How strongly M2 pushes it across the shelf, m/s
-s2_u_amp = 0.11         # The same for S2, along the shelf
-s2_v_amp = 0.05         # The same for S2, across the shelf
-tidal_period = 44712.0  # How long one M2 cycle lasts, in seconds (about 12.4 hours)
-tidal_phase = 0.0       # Where in its cycle the model starts, in radians
-# The atlas gives a tidal VELOCITY (the amplitudes above are m/s, and the run reports the
-# M2 boundary speed in m/s). A velocity cannot be fed to a momentum `Forcing`, which wants
-# an acceleration in m/s^2: doing so injected `u_tide * dt` every step and diverged the run
-# at iteration 80. The tide is instead relaxed toward, which is the correct expression of a
-# prescribed oscillating velocity. This is the relaxation timescale in seconds, and it is a
-# physics choice: small pins the flow to the tide and suppresses wind and buoyancy, large
-# lets the tide contribute while the rest of the model evolves freely.
-tidal_relaxation_timescale_seconds = 3600.0
-
+# Output persistence and Lakehouse state archiving
+output_dir = "../lakehouse/GeoOceanModel/scotian_shelf" # Target Lakehouse directory
+output_schedule_seconds = 21600.0 # Field snapshot output frequency (6 hours for slowly-evolving background flow; tides reconstructed analytically or via TPXO9)
+max_save_depth = 400.0        # Subsample epipelagic/mesopelagic layers (0-400m) for larval drift, saving ~50% vertical array volume
+enable_zarr = true            # Persist 4D simulation tensor to Zarr
+zarr_path = "outputs/ocean_hydrodynamics.zarr" # Destination Zarr path
+storage_backend = "zarr"      # Backend ("zarr" or "geoparquet")
+enable_checkpoint = true      # Enable state checkpointer
+checkpoint_dir = "../lakehouse/GeoOceanModel/scotian_shelf/checkpoints" # Checkpoint folder
+checkpoint_prefix = "scotian_shelf_checkpoint" # Checkpoint prefix
+checkpoint_schedule_seconds = 3600.0 # Checkpoint interval (1 hour)
+checkpoint_cleanup = true     # Automatically prune older checkpoints
+run_id = ""                   # Unique identifier
 
 [visualization]
-interactive_map = false
-title = "Scotian Shelf Ocean"
+# Diagnostics and interactive visualization
+interactive_map = true        # Export interactive HTML5 Leaflet map
+animate_hydro = false         # Generate hydrodynamic flow animation
+anim_variable = "dashboard"   # Variable to animate
+anim_fps = 10                 # Animation FPS
+anim_format = "mp4"           # Video format
+anim_depth = -2.5             # Animation depth level (m)
+anim_overlay_particles = false# Overlay Lagrangian particles on flow fields
+anim_output_path = ""         # Video output path
+
+[runtype]
+# Execution environment and reproducibility
+use_gpu = true                # Run on NVIDIA CUDA GPU
+fallback_to_cpu = false       # Fail loudly if GPU is unavailable
+seed = 42                     # Master RNG seed

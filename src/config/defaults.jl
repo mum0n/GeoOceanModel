@@ -146,7 +146,6 @@ function get_default_configuration()::Dict{String, Any}
             "nx" => 50,
             "ny" => 50,
             "nz" => 10,
-            "resolution_scale" => 1.0,
             "vertical_stretching_mode" => "oceananigans",
             "vertical_grid_file" => ""
         ),

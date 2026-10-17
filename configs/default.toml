@@ -1,160 +1,124 @@
-# ==============================================================================
-#  default.toml — the ocean half, Cape Breton  demonstration
-# ==============================================================================
+# =============================================================================
+# GeoOceanModel - Default Demonstration Configuration
+# =============================================================================
+# Baseline configuration for 3D regional ocean hydrodynamics, tidal forcing,
+# and surface boundary interactions.
 #
-#  The default GeoOceanModel config: a SMALL area centred on Cape Breton, the
-#  Northeast Nova Scotia  corner of the Scotian Shelf, at LOW resolution
-#  and for a 3-DAY run. It exists for demonstrations and error testing of a
-#  realistic-ish run on an ordinary machine -- small enough to finish quickly,
-#  coarse enough to be cheap, keyless enough to need no accounts.
-#
-#  Requires: GeoData and GeoDataSources
-#
-#  Everything is piped in through the GeoData abstraction layer (GeoDataSources)
-#  with KEYLESS products -- no Copernicus Marine account, no tidal-atlas
-#  download:
-#    bathymetry  etopo2022        global modelled topo (keyless; downloaded).
-#    coastline   natural_earth_10m
-#    wind        open_meteo       (GeoDataSources wind fetcher)
-#    hydrography woa23            keyless NOAA World Ocean Atlas climatology
-#    boundaries  synthetic        open edges unconstrained (offline)
-#    tides       analytic/off     keyless
-#
-#  `julia --project=. GeoOceanModelRun.jl --hydro-only` runs THIS config by default.
-# ==============================================================================
-
-[atmosphere]
-forcing = "era5_climatology"
-climatology = true
-variables = ["u10", "v10"]
-drag_formulation = "garratt_1977"
-bulk_heat_flux = false
-
-
-[bathymetry]
-ingest_library = "geodata"
-resolution_arcsec = 60
-inshore_depth = -20.0
-shelf_slope = 500.0
-mask_bay_of_fundy = false
-
-
-[bottom_boundary_layer]
-cd_drag = 0.0025
-bottom_drag = 0.0001
-bbl_mixing_closure = "tke"
-
-
-[boundaries]
-# Synthetic (unconstrained) open edges: keyless, no account, offline-convergent
-# for a demo 
-method = "none"
-parent_ocean = "synthetic"
-ocean_boundary_source = "synthetic"
-climatology = true
-obc_type = "flather_chapman"
-active_boundaries = ["east", "south", "west"]
-sponge_layer_width = 0.25
-sponge_timescale_seconds = 3600.0
-u_inflow = -0.15
-v_inflow = 0.05
-
-embedding_lon_min = -61.2
-embedding_lon_max = -59.6
-embedding_lat_min = 45.0
-embedding_lat_max = 46.9
-
-
-[climate]
-scenario = "climatology"
-projection_year = 2022
-baseline_year = 2020
-horizon_year = 2050
-
-
-[data]
-coastline_source = "natural_earth_10m"
-bathy_source = "etopo2022"
-wind_source = "open_meteo"
-hydrography_source = "woa23"
-wind_time_iso = "2020-06-01T00:00:00Z"
-
+#   julia --project=. GeoOceanModelRun.jl --config=configs/default.toml --all
+# =============================================================================
 
 [domain]
-# Cape Breton / Northeast Nova Scotia corner of the Scotian Shelf.
-lon_min = -61.2
-lon_max = -59.6
-lat_min = 45.0
-lat_max = 46.9
-z_min = -1500.0
-z_max = 0.0
-buffer_km = 20.0
-
+# Geographic bounding box in degrees (WGS84, EPSG:4326)
+lon_min = -61.2               # Western boundary longitude (°E)
+lon_max = -59.6               # Eastern boundary longitude (°E)
+lat_min = 45.0                # Southern boundary latitude (°N)
+lat_max = 46.9                # Northern boundary latitude (°N)
+z_min = -1500.0               # Maximum bathymetric water depth (m, negative down)
+z_max = 0.0                   # Free surface elevation (m)
+buffer_km = 20.0              # Boundary buffer margin in kilometres
 
 [grid]
-# Low resolution for a cheap 3-day demonstration.
-nx = 32
-ny = 38
-nz = 8
+# Discretization resolution and coordinate stretching
+nx = 32                       # Zonal grid cell count
+ny = 38                       # Meridional grid cell count
+nz = 8                        # Vertical layer count
+vertical_stretching_mode = "tanh" # "tanh", "oceananigans", or "uniform"
+nz_above = 0                  # Layers allocated to upper stratum (0 = auto 60%)
+vertical_break_depth = -400.0 # Depth separating refined shelf from deep basin (m)
+vertical_grid_file = ""       # Optional side-car CSV specifying vertical faces
+# Explicit vertical layer face depths starting at 0.0 (surface) to domain bottom
 depths = [0.0, 20.0, 50.0, 100.0, 150.0, 300.0, 600.0, 1000.0, 1500.0]
-resolution_scale = 1.0
-vertical_stretching_mode = "tanh"
 
+[bathymetry]
+# Analytical and geometric shelf controls
+inshore_depth = -20.0         # Water depth at landward edge (m, negative)
+shelf_slope = 500.0           # Total seabed rise across the continental shelf (m)
+mask_bay_of_fundy = false     # Damp resonance in the Bay of Fundy if in domain
 
-[runtype]
-# Run hardware and RNG seed: the former [hardware] and [paths] merged here.
-use_gpu = true
-fallback_to_cpu = false
-seed = 42
+[data]
+# Environmental data sources and assimilation settings
+bathy_source = "etopo2022"    # Bathymetry provider: "etopo2022", "nwa_bathymetry"
+coastline_source = "natural_earth_10m" # Coastline provider: "natural_earth_10m"
+wind_source = "open_meteo"    # Surface winds provider: "open_meteo" (ERA5), "cds"
+wind_time_iso = "2020-06-01T00:00:00Z" # Reference timestamp for wind forcing
+hydrography_source = "woa23"  # Climatology: "woa23" (NOAA), "glorys12v1", "synthetic"
+hydrography_month = 0         # Month index (0 = annual climatological mean, 1..12)
 
+[atmosphere]
+# Atmospheric forcing and heat exchange
+source = "era5_climatology"   # "open_meteo", "era5_climatology", or "synthetic"
+bulk_heat_flux = true         # Compute bulk sensible/latent flux from air state
+
+[boundaries]
+# Lateral open boundary conditions and sponge relaxation
+method = "none"               # "none" (unconstrained) or "relaxation" (sponge)
+obc_type = "flather_chapman"  # "flather_chapman", "radiation", or "clamped"
+ocean_boundary_source = "synthetic" # "glorys12v1", "woa23", "hycom", or "synthetic"
+sponge_layer_width = 0.25     # Width of lateral sponge zone in degrees
+sponge_timescale_seconds = 3600.0 # Relaxation timescale in seconds (1 hour)
+u_inflow = -0.15              # Prescribed background zonal inflow velocity (m/s)
+v_inflow = 0.05               # Prescribed background meridional inflow velocity (m/s)
+
+[tides]
+# Astronomical tidal body and boundary forcing
+enable_tides = false          # Whether to enable astronomical tidal dynamics
+tides_source = "analytic"     # "tpxo9_atlas", "tpxo9", or "analytic"
+tidal_constituents = []       # Active constituents (e.g. ["M2", "S2"])
+tidal_u_amp = 0.25            # M2 zonal velocity amplitude (m/s)
+tidal_v_amp = 0.12            # M2 meridional velocity amplitude (m/s)
+s2_u_amp = 0.11               # S2 zonal velocity amplitude (m/s)
+s2_v_amp = 0.05               # S2 meridional velocity amplitude (m/s)
+
+[climate]
+# Long-term climate scenario projections
+scenario = "climatology"      # "climatology", "historical", "ssp126", "ssp245", "ssp585"
+projection_year = 2022        # Target simulation climate year
 
 [hydrodynamics]
-sim_duration_hours = 72.0
-sim_dt_seconds = 120.0
-adaptive_cfl = true
-target_cfl = 0.2
-target_wave_cfl = 0.2
-max_dt_seconds = 900.0
-min_dt_seconds = 5.0
-coriolis_latitude = 45.95
-divergence_velocity_limit = 10.0
-surface_heat_flux = 50.0
-turbulence_closure = "nemotke"
-
-
-[metadata]
-name = "Cape Breton  Ocean Demonstration"
-description = "3-day low-resolution demonstration over Cape Breton of the Scotian Shelf, keyless data only (etopo2022 bathymetry, woa23 hydrography, open_meteo winds)"
-author = "GeoOceanModel"
-version = "1.0.0"
+# Numerical solver controls and time-stepping
+sim_duration_hours = 72.0     # Total simulation duration in hours
+sim_dt_seconds = 120.0        # Initial numerical time step in seconds
+min_dt_seconds = 5.0          # Minimum allowable time step floor (seconds)
+max_dt_seconds = 900.0        # Maximum allowable time step ceiling (seconds)
+adaptive_cfl = true           # Enable adaptive time stepping based on CFL
+target_cfl = 0.2              # Target Courant-Friedrichs-Lewy condition limit
+target_wave_cfl = 0.20        # Target wave CFL limit for barotropic gravity waves
+surface_heat_flux = 50.0      # Prescribed surface heat flux (W/m^2)
+max_current_speed = 3.0       # Current speed ceiling in m/s (negative disables clamp)
+max_flow_snapshots = 400      # Snapshot memory retention limit (0 = all)
+spinup_hours = 0.0            # Spinup duration before saving outputs (hours)
+allow_analytical_fallback = false # Fall back to synthetic jet if inputs unavailable
+hydro_model_file = ""         # Hydrodynamic checkpoint file (input or output)
+reuse_hydro = false           # Reuse existing flow fields if found on disk
 
 
 [storage]
-output_path = "../lakehouse/GeoOceanModel/default"
-storage_backend = "zarr"
-output_schedule_seconds = 21600.0
-checkpoint_fields = ["u", "v", "w", "T", "S"]
-enable_checkpoint = true
-checkpoint_prefix = "default_checkpoint"
-checkpoint_schedule_seconds = 21600.0
-checkpoint_dir = "../lakehouse/GeoOceanModel/default/checkpoints"
-cleanup_checkpoints = true
-auto_restart = true
-
-
-[tides]
-# Analytic/off: keyless, no tidal-atlas download. Enough for a demonstration.
-tides_source = "analytic"
-constituents = []
-enable_tides = false
-tidal_u_amp = 0.25
-tidal_v_amp = 0.12
-s2_u_amp = 0.11
-s2_v_amp = 0.05
-tidal_period = 44712.0
-tidal_phase = 0.0
-
+# Output lakehouse persistence and state serialization
+output_dir = "../lakehouse/GeoOceanModel/default" # Target Lakehouse output directory
+output_schedule_seconds = 21600.0 # Field-output interval (seconds, 6 hours)
+enable_zarr = true            # Persist 4D ocean state to chunked Zarr store
+zarr_path = "outputs/ocean_hydrodynamics.zarr" # Relative or absolute Zarr path
+storage_backend = "zarr"      # Persistence format ("zarr" or "geoparquet")
+enable_checkpoint = true      # Save Oceananigans simulation checkpointer state
+checkpoint_dir = "../lakehouse/GeoOceanModel/default/checkpoints" # Checkpoint folder
+checkpoint_prefix = "default_checkpoint" # Filename prefix for checkpoint files
+checkpoint_schedule_seconds = 21600.0 # State checkpoint frequency in seconds
+checkpoint_cleanup = true     # Automatically purge older intermediate checkpoints
+run_id = ""                   # Unique run identifier tag
 
 [visualization]
-interactive_map = true
-title = "Cape Breton Ocean Demonstration"
+# Diagnostics, animations, and interactive mapping
+interactive_map = true        # Export interactive HTML5 Leaflet map
+animate_hydro = false         # Generate hydrodynamic simulation animation
+anim_variable = "dashboard"   # Variable: "dashboard", "speed", "temperature", "eta"
+anim_fps = 10                 # Animation frames per second
+anim_format = "mp4"           # Video container format: "mp4", "gif", or "webm"
+anim_depth = -2.5             # Depth slice for 2D flow animation (m)
+anim_overlay_particles = false# Render particle positions on top of flow field
+anim_output_path = ""         # Custom destination path for animation video
+
+[runtype]
+# Execution hardware and reproducibility
+use_gpu = true                # Enable NVIDIA CUDA GPU acceleration
+fallback_to_cpu = false       # Reject silent degradation to CPU if GPU requested
+seed = 42                     # Master RNG seed

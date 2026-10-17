@@ -175,11 +175,10 @@ function compute_advective_cfl(
             cfl_z = (w_max * Δt) / max(1.0, dz_k)
         elseif dz_raw isa AbstractArray
             dz_vec = to_cpu_offset_array(dz_raw)
-            w_int_cpu = Array(w_int)
             for k in 1:nz
                 dz_k = Float64(dz_vec[k])
-                w_bot = maximum(abs, @view(w_int_cpu[:, :, k]))
-                w_top = maximum(abs, @view(w_int_cpu[:, :, k + 1]))
+                w_bot = maximum(abs, @view(w_int[:, :, k]))
+                w_top = maximum(abs, @view(w_int[:, :, k + 1]))
                 w_k = max(w_bot, w_top)
                 cfl_z = max(cfl_z, (w_k * Δt) / max(1.0, dz_k))
             end
@@ -1498,7 +1497,7 @@ function setup_hydrodynamic_simulation(
             end
             return nothing
         end
-        sim.callbacks[:wizard] = Callback(adapt_fn, IterationInterval(5))
+        sim.callbacks[:wizard] = Callback(adapt_fn, IterationInterval(1))
     end
 
     # 3. Numerical stability watchdog callback

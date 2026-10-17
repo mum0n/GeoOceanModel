@@ -191,6 +191,23 @@ where the artefact is kept.
 function _run_bathymetry(; opts::HydrodynamicOptions, force::Bool = false)
     source = _run_bathymetry_source(opts)
     output_path = _run_bathymetry_path(opts)
+    
+    # Fast path: If the bathymetry dataset has already been fetched and cached,
+    # load it directly via GeoData.geoload without invoking GeoDataSources.
+    if !force && (isfile(output_path) || isdir(output_path))
+        ds = GeoData.geoload(output_path)
+        elev_var = haskey(ds.variables, "elevation") ? "elevation" :
+                   first(GeoData.variables_like(ds, ["elevation", "altitude", "z", "topo"]))
+        elev_ga = ds.variables[elev_var]
+        perm = GeoData.dim_permutation(elev_ga.dims, :lon, :lat)
+        lon, _ = GeoData.axis(ds, :lon)
+        lat, _ = GeoData.axis(ds, :lat)
+        raw = Array{Float64}(elev_ga.data)
+        elevation = ndims(raw) == 1 ? reshape(raw, :, 1) : permutedims(raw, perm)
+        return (source = source, output_path = output_path, elevation = elevation,
+                lon = lon, lat = lat)
+    end
+
     bathy = GeoDataSources.bathymetry_field(;
         source = source,
         lon_range = opts.domain_lon,
@@ -415,6 +432,7 @@ function run_segment_grid(; opts::HydrodynamicOptions = HydrodynamicOptions())
         source = _run_bathymetry_source(opts),
         output_path = _run_bathymetry_path(opts),
         min_water_depth = abs(opts.inshore_depth),
+        max_water_depth = 1500.0,
         mask_bay_of_fundy = opts.mask_bay_of_fundy
     )
 
@@ -721,10 +739,12 @@ end
         ν = 1e-2,
         κ = 1e-2,
         tracers = (:T, :S),
+        free_surface = free_surf,
         lon_range = opts.domain_lon,
         lat_range = opts.domain_lat,
         mask_bay_of_fundy = opts.mask_bay_of_fundy,
-        active_boundaries = (:east, :south, :west)
+        active_boundaries = (:east, :south, :west),
+        tidal_placement = :boundary
     )
 
     # Initial thermal and haline stratification.
@@ -798,35 +818,40 @@ end
             )
         end
     elseif hydro_src in (:glorys12v1, :glorys_climatology, :copernicus, :cmesms)
-        # Try to fetch from Copernicus Marine with dataset fallback chain
-        copernicus_file = joinpath(opts.input_dir, "copernicus_ts.nc")
-        start_yr = hasproperty(opts, :start_year) ? opts.start_year : opts.projection_year
-        try
-            println("Fetching Copernicus Marine hydrography (trying GLOPHY-2 → GLO12 → GLORYS12 → NRT)...")
-            fetch_copernicus_hydrography_with_fallback(
-                lon_range = opts.domain_lon,
-                lat_range = opts.domain_lat,
-                start_date = "$(start_yr)-01-01",
-                end_date = "$(start_yr)-12-31",
-                output_path = copernicus_file,
-                verbose = true
-            )
-            println("Applying Copernicus Marine hydrography...")
-            # The fetch asks for the whole run year and gets twelve monthly steps back, so the
-            # month has to be chosen: `hydrography_month` says which, and 0 (the annual
-            # default) takes January rather than averaging, because a boundary target that
-            # silently averaged twelve months would not be the stated period.
-            hydro_month = opts.hydrography_month == 0 ? 1 : clamp(opts.hydrography_month, 1, 12)
-            cop = copernicus_regridded_tracers(model.grid, copernicus_file; month = hydro_month)
-            set!(model, T = cop.T, S = cop.S)
+        if boundary_tracer_data !== nothing && hasproperty(boundary_tracer_data, :T) && hasproperty(boundary_tracer_data, :S)
+            println("Initializing hydrography from GeoData boundary tracer field ($hydro_src)...")
+            set!(model, T = boundary_tracer_data.T, S = boundary_tracer_data.S)
             set!(model, u = 0.0, v = 0.0)
-        catch err
-            error(
-                "hydrography_source = \"$(hydro_src)\" requires Copernicus Marine download " *
-                "which failed: $err. " *
-                "Ensure 'copernicusmarine' is installed and credentials configured. " *
-                "To use the analytic profile instead, set [data] hydrography_source = \"synthetic\"."
-            )
+        else
+            copernicus_file = joinpath(opts.input_dir, "copernicus_ts.nc")
+            start_yr = hasproperty(opts, :start_year) ? opts.start_year : opts.projection_year
+            try
+                if !isfile(copernicus_file)
+                    println("Fetching Copernicus Marine hydrography (trying GLOPHY-2 → GLO12 → GLORYS12 → NRT)...")
+                    fetch_copernicus_hydrography_with_fallback(
+                        lon_range = opts.domain_lon,
+                        lat_range = opts.domain_lat,
+                        start_date = "$(start_yr)-01-01",
+                        end_date = "$(start_yr)-12-31",
+                        output_path = copernicus_file,
+                        verbose = true
+                    )
+                else
+                    println("Using cached Copernicus Marine hydrography: $copernicus_file")
+                end
+                println("Applying Copernicus Marine hydrography...")
+                hydro_month = opts.hydrography_month == 0 ? 1 : clamp(opts.hydrography_month, 1, 12)
+                cop = copernicus_regridded_tracers(model.grid, copernicus_file; month = hydro_month)
+                set!(model, T = cop.T, S = cop.S)
+                set!(model, u = 0.0, v = 0.0)
+            catch err
+                error(
+                    "hydrography_source = \"$(hydro_src)\" requires Copernicus Marine download " *
+                    "which failed: $err. " *
+                    "Ensure 'copernicusmarine' is installed and credentials configured. " *
+                    "To use the analytic profile instead, set [data] hydrography_source = \"synthetic\"."
+                )
+            end
         end
     else
         println("Applying baseline thermal stratification (T_surf=15°C, dT/dz=0.01°C/m)...")
@@ -1120,7 +1145,8 @@ function run_segment_simulation(;
         (opts.output_schedule_seconds > 0.0) ? opts.output_schedule_seconds : 21600.0)
     output_store = attach_output_callback!(sim, out_dir_target; fields = ("u", "v", "w", "T"),
                                            schedule = out_interval, resume = resume,
-                                           spinup_seconds = spinup_sec)
+                                           spinup_seconds = spinup_sec,
+                                           max_save_depth = opts.max_save_depth)
     @assert output_store == store_path "output store drifted from the resume/reuse target"
     println("Ocean output is a GeoData store: $(output_store)")
 

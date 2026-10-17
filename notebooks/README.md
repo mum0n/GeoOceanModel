@@ -44,9 +44,15 @@ The notebook re-derives its options from that value, so the TOML itself is never
 ## What a notebook reads
 
 Every input comes from the shared lakehouse through the GeoData layer:
+* bathymetry, coastline and winds via `GeoDataSources`, under `lakehouse/GeoData/`
+* the realized flow, written to `lakehouse/GeoOceanModel/<run>/hydrodynamics.zarr`
 
-- bathymetry, coastline and winds via `GeoDataSources`, under `lakehouse/GeoData/`
-- the realized flow, written to `lakehouse/GeoOceanModel/<run>/hydrodynamics.zarr`
+The shared lakehouse path is canonically resolved through `GeoData.lakehouse_dir()`.
+Precedence:
+* `ENV["GEOCEAN_STORE_ROOT"]` or `ENV["GEODATA_LAKEHOUSE"]`
+* `LocalPreferences.toml` (`[GeoData] lakehouse_dir`)
+* `~/.geodata/storage.toml` (`[storage] store_root`)
+* Proximity fallback (`projects/lakehouse/`)
 
 Cells are ordinary package calls, so each one can be re-run on its own while you inspect what it
 returned.

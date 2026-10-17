@@ -148,7 +148,12 @@ function build_immersed_grid(
     varname::AbstractString = "elevation"
 )
     topo_matrix::Matrix{Float64} = if bathymetry isa GeoDataset
-        Matrix{Float64}(GeoDataSources.bathymetry_arrays(bathymetry; varname = varname).elevation)
+        elev_var = haskey(bathymetry.variables, varname) ? varname :
+                   first(GeoData.variables_like(bathymetry, ["elevation", "altitude", "z", "topo"]))
+        elev_ga = bathymetry.variables[elev_var]
+        perm = GeoData.dim_permutation(elev_ga.dims, :lon, :lat)
+        raw = Array{Float64}(elev_ga.data)
+        ndims(raw) == 1 ? reshape(raw, :, 1) : permutedims(raw, perm)
     else
         Matrix{Float64}(bathymetry)
     end
@@ -254,6 +259,7 @@ function _fit_bathymetry_to_grid(
     lon::AbstractVector,
     lat::AbstractVector;
     min_water_depth::Real = 10.0,
+    max_water_depth::Real = 0.0,
     mask_bay_of_fundy::Bool = false
 )
     nx, ny, _ = size(grid)
@@ -277,11 +283,13 @@ function _fit_bathymetry_to_grid(
 
     # Condition bathymetry
     h_floor = Float64(min_water_depth)
+    h_ceiling = Float64(max_water_depth)
     conditioned_topo = smooth_bathymetry(
         regridded_topo,
         passes = 4,
         alpha = 0.5,
-        h_min = h_floor
+        h_min = h_floor,
+        h_max = h_ceiling
     )
 
     if mask_bay_of_fundy
@@ -338,6 +346,7 @@ function build_immersed_grid_from_real_data(
     output_path::Union{Nothing, AbstractString} = nothing,
     force::Bool = false,
     min_water_depth::Real = 10.0,
+    max_water_depth::Real = 0.0,
     mask_bay_of_fundy::Bool = false,
     kwargs...
 )
@@ -349,20 +358,35 @@ function build_immersed_grid_from_real_data(
     lon_range = (Float64(base_g.λᶠᵃᵃ[1]), Float64(base_g.λᶠᵃᵃ[base_g.Nx + 1]))
     lat_range = (Float64(base_g.φᵃᶠᵃ[1]), Float64(base_g.φᵃᶠᵃ[base_g.Ny + 1]))
 
-    bathy = GeoDataSources.bathymetry_field(;
-        source = source,
-        lon_range = lon_range,
-        lat_range = lat_range,
-        tier = tier,
-        varname = varname,
-        output_path = output_path,
-        force = force,
-        kwargs...
-    )
+    bathy_elevation, bathy_lon, bathy_lat = if !force && !isnothing(output_path) && (isfile(output_path) || isdir(output_path))
+        ds = GeoData.geoload(output_path)
+        elev_var = haskey(ds.variables, varname) ? varname :
+                   first(GeoData.variables_like(ds, ["elevation", "altitude", "z", "topo"]))
+        elev_ga = ds.variables[elev_var]
+        perm = GeoData.dim_permutation(elev_ga.dims, :lon, :lat)
+        lon_c, _ = GeoData.axis(ds, :lon)
+        lat_c, _ = GeoData.axis(ds, :lat)
+        raw = Array{Float64}(elev_ga.data)
+        elev = ndims(raw) == 1 ? reshape(raw, :, 1) : permutedims(raw, perm)
+        (elev, lon_c, lat_c)
+    else
+        bathy = GeoDataSources.bathymetry_field(;
+            source = source,
+            lon_range = lon_range,
+            lat_range = lat_range,
+            tier = tier,
+            varname = varname,
+            output_path = output_path,
+            force = force,
+            kwargs...
+        )
+        (bathy.elevation, bathy.lon, bathy.lat)
+    end
 
     conditioned_topo = _fit_bathymetry_to_grid(
-        base_g, bathy.elevation, bathy.lon, bathy.lat;
+        base_g, bathy_elevation, bathy_lon, bathy_lat;
         min_water_depth = min_water_depth,
+        max_water_depth = max_water_depth,
         mask_bay_of_fundy = mask_bay_of_fundy
     )
 

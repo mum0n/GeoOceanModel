@@ -31,7 +31,7 @@ script.
 function ocean_store_root()
     override = get(ENV, "GEOCEAN_STORE_ROOT", "")
     isempty(override) || return abspath(override)
-    return normpath(joinpath(@__DIR__, "..", "..", "..", "lakehouse", "GeoOceanModel"))
+    return GeoData.lakehouse_dir("GeoOceanModel")
 end
 
 """

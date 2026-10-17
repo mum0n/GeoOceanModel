@@ -4,9 +4,25 @@
 using Markdown
 using InteractiveUtils
 
+# This Pluto notebook uses @bind for interactivity.
+macro bind(def, element)
+    #! format: off
+    return quote
+        local iv = try Base.loaded_modules[Base.PkgId(Base.UUID("6e696c72-6542-2067-7265-42206c756150"), "AbstractPlutoDingetjes")].Bonds.initial_value catch; b -> missing; end
+        local el = $(esc(element))
+        global $(esc(def)) = Core.applicable(Base.get, el) ? Base.get(el) : iv(el)
+        el
+    end
+    #! format: on
+end
+
 # ╔═╡ d7f2c0a4-9e18-4b63-8f52-0a1c5e9b3d64
 # ╠═╡
-using Pkg
+begin
+    using Pkg
+    using PlutoUI
+    using Base64
+end
 
 # ╔═╡ 1e0b94f7-6c82-4d51-9b7a-3f8e2c0a6b15
 # ╠═╡
@@ -296,14 +312,26 @@ Re-running with a larger `sim_duration_hours` resumes from the checkpoint, rathe
 over.
 """
 
+# ╔═╡ d0000001-0001-0001-0001-000000000006
+@bind reuse_saved_simulation PlutoUI.CheckBox(default = true)
+
 # ╔═╡ 1b1542d7-2c69-4e0c-9e48-9d8f7a6c2f70
 # ╠═╡
-import GeoOceanModel: run_segment_simulation
+import GeoOceanModel: run_segment_simulation, output_zarr_path
 
-sim_res = run_segment_simulation(; opts = opts, model = built.model)
-
-println("flow solution: ", sim_res.output_path)
-sim_res
+sim_res = begin
+    expected_store = output_zarr_path(opts.output_dir)
+    store_exists = ispath(joinpath(expected_store, "time.json"))
+    if reuse_saved_simulation && store_exists
+        println("Reusing pre-computed hydrodynamic solution from: ", expected_store)
+        (output_path = opts.output_dir, model = built.model)
+    else
+        println("Running hydrodynamic model integration...")
+        res = run_segment_simulation(; opts = opts, model = built.model)
+        println("Simulation completed. Flow solution saved to: ", res.output_path)
+        res
+    end
+end
 
 # ╔═╡ 2c2653e8-3d7a-4e1d-9a59-0e9f8b7d3a81
 # ╠═╡
@@ -379,42 +407,187 @@ end
 # ╔═╡ 71b7a8d3-82cf-4e6c-9eae-5d4e3a2c8f36
 # ╠═╡
 md"""
-## Plot a slice
+## Interactive hydrodynamics: Leaflet coordinate probe & depth slice
 
-Surface speed and temperature, land masked out. White cells are the emerged land from the seabed
-resolved above, which is what makes the coastline visible instead of a blank rectangle.
+Explore the flow and stratification in the Cape Breton test domain.
+The domain represents a 32 x 38 x 8 grid over [45.0, 46.9]°N and [-61.4, -59.8]°W.
+Click anywhere on the interactive Leaflet map to select coordinates for vertical profile inspection,
+or use the depth level slider below to examine flow at different vertical layers.
 
-Cape Breton is heavily fringed by land, so a high dry fraction is expected here; anything
-approaching *all* dry would mean the seabed is wrong.
+### Physical Assumptions & Utility
+- **Model Utility**: Provides a fast, self-contained reference workflow for testing numerical schemes, boundary sponge geometry, and post-processing diagnostics without external authentication or proprietary datasets.
+- **Topographic Smoothing**: Relies on ETOPO2022 global 60 arcsec bathymetry. Coarse relief means steep shelf breaks and narrow inlets are softened compared to multibeam soundings.
+- **Open Boundaries**: Unconstrained synthetic open edges with geometric sponge relaxation. Inflowing water carries ambient interior state rather than prescribed boundary currents.
+- **Tidal Forcing**: Disabled (`enable_tides = false`). The velocity field reflects purely wind-driven and baroclinic circulation.
+"""
 
-The mask is drawn against **the run's own fetched coastline** — read from
-`<output_dir>/inputs/coastline.parquet` — not against a bundled regional outline.
+# ╔═╡ d0000001-0001-0001-0001-000000000001
+# ╠═╡
+@bind cb_coords html"""
+<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 900px; margin: 0 0 10px 0;">
+  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+    <span style="font-size: 13px; font-weight: 600; color: #1e293b;">
+      Cape Breton Domain (Click on map to probe water column)
+    </span>
+    <span id="cb_coord_display" style="font-size: 12px; font-family: monospace; color: #475569; background: #f1f5f9; padding: 2px 8px; border-radius: 4px;">
+      Selected: 45.9500°N, -60.6000°W
+    </span>
+  </div>
+  <div id="cb_ocean_map" style="height: 360px; width: 100%; border-radius: 8px; border: 1px solid #cbd5e1; box-shadow: 0 1px 3px rgba(0,0,0,0.1); z-index: 1;"></div>
+</div>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+const container = currentScript.parentElement;
+const mapDiv = container.querySelector('#cb_ocean_map');
+const displaySpan = container.querySelector('#cb_coord_display');
+
+let currentVal = { lon: -60.6, lat: 45.95 };
+container.value = currentVal;
+
+function setupCbMap() {
+  if (typeof L === 'undefined') {
+    setTimeout(setupCbMap, 60);
+    return;
+  }
+  if (mapDiv._leaflet_id) {
+    return;
+  }
+  const map = L.map(mapDiv, {
+    center: [currentVal.lat, currentVal.lon],
+    zoom: 7,
+    minZoom: 5,
+    maxZoom: 11
+  });
+
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}', {
+    attribution: 'Tiles &copy; Esri, GEBCO, NOAA',
+    maxZoom: 11
+  }).addTo(map);
+
+  const cbBounds = [[45.0, -61.4], [46.9, -59.8]];
+  L.rectangle(cbBounds, {
+    color: "#2563eb",
+    weight: 2,
+    fillColor: "#3b82f6",
+    fillOpacity: 0.1,
+    dashArray: "4, 4"
+  }).addTo(map);
+
+  let marker = L.marker([currentVal.lat, currentVal.lon], {
+    draggable: true,
+    title: "Cape Breton Column Station"
+  }).addTo(map);
+
+  function updatePoint(lat, lon) {
+    const clat = Math.max(45.0, Math.min(46.9, lat));
+    const clon = Math.max(-61.4, Math.min(-59.8, lon));
+    marker.setLatLng([clat, clon]);
+    displaySpan.innerText = 'Selected: ' + clat.toFixed(4) + '°N, ' + clon.toFixed(4) + '°W';
+    currentVal = { lon: clon, lat: clat };
+    container.value = currentVal;
+    container.dispatchEvent(new CustomEvent('input'));
+  }
+
+  map.on('click', function(e) {
+    updatePoint(e.latlng.lat, e.latlng.lng);
+  });
+
+  marker.on('dragend', function(e) {
+    const ll = marker.getLatLng();
+    updatePoint(ll.lat, ll.lng);
+  });
+
+  setTimeout(() => map.invalidateSize(), 200);
+}
+
+setupCbMap();
+</script>
+"""
+
+# ╔═╡ d0000001-0001-0001-0001-000000000002
+# ╠═╡
+@bind selected_depth_idx PlutoUI.Slider(1:length(ds.depths), default = argmin(abs.(ds.depths)), show_value = false)
+
+# ╔═╡ d0000001-0001-0001-0001-000000000003
+# ╠═╡
+md"""
+**Depth layer control**: Slider index: `$(selected_depth_idx)` → Depth level: **`$(round(ds.depths[selected_depth_idx], digits = 1))` m**
 """
 
 # ╔═╡ 82c8b9e4-93d0-4e7d-9abf-6e5f4b3d9a47
 # ╠═╡
-using CairoMakie
+begin
+    using CairoMakie
 
-# The surface cell centre, chosen by depth rather than by position: `ds.depths` runs from the
-# deepest centre to the shallowest, and assuming an order is how a figure ends up plotting the
-# seabed.
-k_surface = argmin(abs.(ds.depths))
-surface_speed = hypot.(ds.u[:, :, k_surface], ds.v[:, :, k_surface])
-surface_temp = ds.temperature[:, :, k_surface]
+    k_idx = selected_depth_idx
+    actual_depth = round(ds.depths[k_idx], digits = 1)
+    
+    speed_slice = hypot.(ds.u[:, :, k_idx], ds.v[:, :, k_idx])
+    temp_slice = ds.temperature[:, :, k_idx]
 
-fig = Figure(size = (960, 400))
+    fig_slice = Figure(size = (960, 420))
 
-ax_speed = Axis(fig[1, 1], title = "surface |u, v|  (m/s)", xlabel = "lon", ylabel = "lat")
-hm_speed = heatmap!(ax_speed, ds.lons, ds.lats, surface_speed';
-                   colormap = :thermal, nan_color = :white)
-Colorbar(fig[1, 2], hm_speed, label = "m/s")
+    ax_speed = Axis(fig_slice[1, 1], title = "Horizontal Velocity |u, v| at z = $(actual_depth) m (m/s)",
+                    xlabel = "Longitude (°E)", ylabel = "Latitude (°N)")
+    hm_speed = heatmap!(ax_speed, ds.lons, ds.lats, speed_slice';
+                        colormap = :thermal, nan_color = :white)
+    Colorbar(fig_slice[1, 2], hm_speed, label = "Speed (m/s)")
 
-ax_temp = Axis(fig[1, 3], title = "surface temperature (degC)", xlabel = "lon", ylabel = "lat")
-hm_temp = heatmap!(ax_temp, ds.lons, ds.lats, surface_temp';
-                  colormap = :thermometer, nan_color = :white)
-Colorbar(fig[1, 4], hm_temp, label = "degC")
+    ax_temp = Axis(fig_slice[1, 3], title = "Potential Temperature T at z = $(actual_depth) m (°C)",
+                   xlabel = "Longitude (°E)", ylabel = "Latitude (°N)")
+    hm_temp = heatmap!(ax_temp, ds.lons, ds.lats, temp_slice';
+                      colormap = :thermometer, nan_color = :white)
+    Colorbar(fig_slice[1, 4], hm_temp, label = "°C")
 
-fig
+    # Mark probe station location on both panels
+    scatter!(ax_speed, [cb_coords.lon], [cb_coords.lat], color = :cyan, markersize = 14, strokecolor = :black, strokewidth = 1.5)
+    scatter!(ax_temp, [cb_coords.lon], [cb_coords.lat], color = :yellow, markersize = 14, strokecolor = :black, strokewidth = 1.5)
+
+    fig_slice
+end
+
+# ╔═╡ d0000001-0001-0001-0001-000000000004
+# ╠═╡
+md"""
+## Vertical water column hydrographic profile
+
+Vertical structure extracted at the probed station (**`$(round(cb_coords.lat, digits = 4))`°N, `$(round(cb_coords.lon, digits = 4))`°W**):
+temperature $T(z)$, horizontal velocity magnitude $|u, v|(z)$, and potential density $\rho(z)$.
+"""
+
+# ╔═╡ d0000001-0001-0001-0001-000000000005
+# ╠═╡
+begin
+    # Find nearest grid indices for the probe point
+    ilon_p = argmin(abs.(ds.lons .- cb_coords.lon))
+    ilat_p = argmin(abs.(ds.lats .- cb_coords.lat))
+
+    col_z = ds.depths
+    col_t = ds.temperature[ilon_p, ilat_p, :]
+    col_u = ds.u[ilon_p, ilat_p, :]
+    col_v = ds.v[ilon_p, ilat_p, :]
+    col_spd = hypot.(col_u, col_v)
+    col_rho = diag.density[ilon_p, ilat_p, :]
+
+    fig_col = Figure(size = (960, 360))
+
+    ax_tcol = Axis(fig_col[1, 1], title = "Temperature (°C)", xlabel = "T (°C)", ylabel = "Depth (m)")
+    lines!(ax_tcol, col_t, col_z; color = :crimson, linewidth = 2.5)
+    scatter!(ax_tcol, col_t, col_z; color = :crimson, markersize = 8)
+
+    ax_scol = Axis(fig_col[1, 2], title = "Speed |u, v| (m/s)", xlabel = "|u, v| (m/s)", ylabel = "Depth (m)")
+    lines!(ax_scol, col_spd, col_z; color = :navy, linewidth = 2.5)
+    scatter!(ax_scol, col_spd, col_z; color = :navy, markersize = 8)
+
+    ax_dcol = Axis(fig_col[1, 3], title = "Potential Density (kg/m³)", xlabel = "ρ (kg/m³)", ylabel = "Depth (m)")
+    lines!(ax_dcol, col_rho, col_z; color = :darkgreen, linewidth = 2.5)
+    scatter!(ax_dcol, col_rho, col_z; color = :darkgreen, markersize = 8)
+
+    fig_col
+end
 
 # ╔═╡ 93d9c0f5-0a41-4e8e-9bc0-7f6a5c4e0b58
 # ╠═╡
@@ -440,32 +613,36 @@ Knobs worth turning first, in the order they matter:
   checkpoint.
 """
 
-# ╔═╡ 04ea1a06-1b52-4e9f-9cd1-8a7b6d5f1c69
-# ╠═╡ Cell order:
-# ╠═d7f2c0a4-9e18-4b63-8f52-0a1c5e9b3d64
-# ╠═1e0b94f7-6c82-4d51-9b7a-3f8e2c0a6b15
-# ╠═2a1c05e8-7d39-4e72-9c8b-4a9f3d1b7c26
-# ╠═b3d2e6f9-84a1-4b93-9a0c-5b4f3e2c8d37
-# ╠═c4e3f70a-95b2-4ca4-9b1d-6c5f4a3d9e48
-# ╠═d5f4081b-0a63-4db5-9c2e-7d6f5b4e0f59
-# ╠═e60a192c-1b74-4ec6-9d3f-8e7f6c5f1a6b
-# ╠═f71b2a3d-2c8f-4fd7-9e4f-9f8f7d6e2b7c
-# ╠═082c3b4e-3d90-4e18-9a5f-0a9f8e7f3c8d
-# ╠═193d4c5f-4e01-4f29-9b60-1b0f9f8a4d9e
-# ╠═2a4e5d60-5f12-4e3a-9b71-2c1f0a9b5e0f
-# ╠═3b5f6e71-60a3-4e4b-9c82-3d2f1b0c6f1a
-# ╠═4c607f82-71b4-4e5c-9d93-4e3a2c1d7a2b
-# ╠═5d710893-82c5-4e6d-9a04-5f4b3d2e8b3c
-# ╠═6e8219a4-93d6-4e7f-9b15-6a5c4e3f9c4d
-# ╠═7f9320b5-0a47-4e8a-9c26-7b6d5f4a0d5e
-# ╠═0a0431c6-1b58-4e9b-9d37-8c7e6f5b1e6f
-# ╠═1b1542d7-2c69-4e0c-9e48-9d8f7a6c2f70
-# ╠═2c2653e8-3d7a-4e1d-9a59-0e9f8b7d3a81
-# ╠═3d3764f9-4e8b-4e2e-9b6a-1f0a9c8e4b92
-# ╠═4e4875a0-5f9c-4e3f-9c7b-2a1b0d9f5c03
-# ╠═5f5986b1-60ad-4e4a-9d8c-3b2c1e0a6d14
-# ╠═60a697c2-71be-4e5b-9e9d-4c3d2f1b7e25
-# ╠═71b7a8d3-82cf-4e6c-9eae-5d4e3a2c8f36
-# ╠═82c8b9e4-93d0-4e7d-9abf-6e5f4b3d9a47
-# ╠═93d9c0f5-0a41-4e8e-9bc0-7f6a5c4e0b58
-# ╠═04ea1a06-1b52-4e9f-9cd1-8a7b6d5f1c69
+# ╔═╡ Cell order:
+# ╠═╡ d7f2c0a4-9e18-4b63-8f52-0a1c5e9b3d64 => 1
+# ╠═╡ 1e0b94f7-6c82-4d51-9b7a-3f8e2c0a6b15 => 2
+# ╠═╡ 2a1c05e8-7d39-4e72-9c8b-4a9f3d1b7c26 => 3
+# ╠═╡ b3d2e6f9-84a1-4b93-9a0c-5b4f3e2c8d37 => 4
+# ╠═╡ c4e3f70a-95b2-4ca4-9b1d-6c5f4a3d9e48 => 5
+# ╠═╡ d5f4081b-0a63-4db5-9c2e-7d6f5b4e0f59 => 6
+# ╠═╡ e60a192c-1b74-4ec6-9d3f-8e7f6c5f1a6b => 7
+# ╠═╡ f71b2a3d-2c8f-4fd7-9e4f-9f8f7d6e2b7c => 8
+# ╠═╡ 082c3b4e-3d90-4e18-9a5f-0a9f8e7f3c8d => 9
+# ╠═╡ 193d4c5f-4e01-4f29-9b60-1b0f9f8a4d9e => 10
+# ╠═╡ 2a4e5d60-5f12-4e3a-9b71-2c1f0a9b5e0f => 11
+# ╠═╡ 3b5f6e71-60a3-4e4b-9c82-3d2f1b0c6f1a => 12
+# ╠═╡ 4c607f82-71b4-4e5c-9d93-4e3a2c1d7a2b => 13
+# ╠═╡ 5d710893-82c5-4e6d-9a04-5f4b3d2e8b3c => 14
+# ╠═╡ 6e8219a4-93d6-4e7f-9b15-6a5c4e3f9c4d => 15
+# ╠═╡ 7f9320b5-0a47-4e8a-9c26-7b6d5f4a0d5e => 16
+# ╠═╡ 0a0431c6-1b58-4e9b-9d37-8c7e6f5b1e6f => 17
+# ╠═╡ d0000001-0001-0001-0001-000000000006
+# ╠═╡ 1b1542d7-2c69-4e0c-9e48-9d8f7a6c2f70 => 18
+# ╠═╡ 2c2653e8-3d7a-4e1d-9a59-0e9f8b7d3a81 => 19
+# ╠═╡ 3d3764f9-4e8b-4e2e-9b6a-1f0a9c8e4b92 => 20
+# ╠═╡ 4e4875a0-5f9c-4e3f-9c7b-2a1b0d9f5c03 => 21
+# ╠═╡ 5f5986b1-60ad-4e4a-9d8c-3b2c1e0a6d14 => 22
+# ╠═╡ 60a697c2-71be-4e5b-9e9d-4c3d2f1b7e25 => 23
+# ╠═╡ 71b7a8d3-82cf-4e6c-9eae-5d4e3a2c8f36 => 24
+# ╠═╡ d0000001-0001-0001-0001-000000000001 => 25
+# ╠═╡ d0000001-0001-0001-0001-000000000002 => 26
+# ╠═╡ d0000001-0001-0001-0001-000000000003 => 27
+# ╠═╡ 82c8b9e4-93d0-4e7d-9abf-6e5f4b3d9a47 => 28
+# ╠═╡ d0000001-0001-0001-0001-000000000004 => 29
+# ╠═╡ d0000001-0001-0001-0001-000000000005 => 30
+# ╠═╡ 93d9c0f5-0a41-4e8e-9bc0-7f6a5c4e0b58 => 31

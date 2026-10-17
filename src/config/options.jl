@@ -80,7 +80,6 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `run_id::String`: Unique cohort identifier for Zarr persistence and figures.
 - `vertical_stretching_mode::Symbol`: Vertical grid stretching mode (:tanh, :uniform, or :csv).
 - `vertical_grid_file::String`: Path to CSV file specifying vertical layer boundary faces.
-- `resolution_scale::Float64`: Horizontal grid resolution scale multiplier / divisor.
 - `atmospheric_source::Symbol`: Atmospheric forcing provider (:era5, :synthetic, :climatology).
 - `ocean_boundary_source::Symbol`: Open boundary hydrographic data provider (:glorys12v1, :synthetic).
   See the field comments for the full accepted set.
@@ -163,6 +162,7 @@ struct HydrodynamicOptions
      checkpoint_prefix        :: String
      checkpoint_schedule      :: Float64
      output_schedule_seconds  :: Float64
+     max_save_depth           :: Float64
      output_path              :: AbstractString
      storage_backend          :: String
      enable_zarr              :: Bool
@@ -179,7 +179,6 @@ struct HydrodynamicOptions
     vertical_break_depth :: Float64
     vertical_grid_file       :: String
     vertical_depths          :: Vector{Float64}
-    resolution_scale         :: Float64
     atmospheric_source :: Symbol
     ocean_boundary_source :: Symbol
     # The larger region the open-boundary data is cut from. These are separate from
@@ -375,6 +374,7 @@ function HydrodynamicOptions(;
     checkpoint_prefix     :: AbstractString = "",
     checkpoint_schedule   :: Real = 0.0,
     output_schedule_seconds :: Real = 21600.0,
+    max_save_depth        :: Real = Inf,
     checkpoint_dir        :: AbstractString = "",
     checkpoint_cleanup    :: Bool = true,
     auto_restart             :: Bool = true,
@@ -385,7 +385,6 @@ function HydrodynamicOptions(;
     vertical_break_depth :: Real = -400.0,
     vertical_grid_file       :: AbstractString = "",
     vertical_depths          :: AbstractVector{<:Real} = Float64[],
-    resolution_scale         :: Real = 1.0,
     atmospheric_source       :: Symbol = :era5,
     ocean_boundary_source    :: Symbol = :glorys12v1,
     embedding_lon            :: Tuple{Float64, Float64} = (-71.0, -53.0),
@@ -503,6 +502,7 @@ function HydrodynamicOptions(;
         resolved_cp_prefix,
         Float64(checkpoint_schedule),
         Float64(output_schedule_seconds),
+        Float64(max_save_depth),
         String(output_path),
         String(storage_backend),
         enable_zarr,
@@ -519,7 +519,6 @@ function HydrodynamicOptions(;
         Float64(vertical_break_depth),
         String(vertical_grid_file),
         Float64[Float64(d) for d in vertical_depths],
-        Float64(resolution_scale),
         atmospheric_source,
         ocean_boundary_source,
         embedding_lon,
@@ -582,7 +581,6 @@ struct HydrodynamicConfig
     vertical_break_depth :: Float64
     vertical_grid_file       :: String
     vertical_depths          :: Vector{Float64}
-    resolution_scale         :: Float64
     bathymetry_source        :: Symbol
     bathy_source             :: String
     coastline_source         :: String
@@ -629,61 +627,4 @@ struct HydrodynamicConfig
        fallback_to_cpu          :: Bool
        storage_backend          :: String
 end
-
-"""
-    LarvalDispersalConfig
-
-Biological parameters specifying Lagrangian particle tracking, active vertical
-locomotion, degree-day molting, thermal mortality, and benthic settlement.
-"""
-struct LarvalDispersalConfig
-    n_particles              :: Int
-    track_duration_seconds   :: Float64
-    track_dt_seconds         :: Float64
-    diffusivity_h            :: Float64
-    diffusivity_v            :: Float64
-    min_seabed_depth         :: Float64
-    buffer_km                :: Float64
-    release_depth_mode       :: Symbol
-    bottom_release_offset    :: Tuple{Float64, Float64}
-    enable_initial_ascent    :: Bool
-    ascent_speed             :: Float64
-    ascent_target_depth      :: Float64
-    enable_dvm               :: Bool
-    megalopa_day_depth       :: Float64
-    megalopa_night_depth     :: Float64
-    zoea2_depth_factor       :: Float64
-    megalopa_swim_factor     :: Float64
-    enable_molting           :: Bool
-    t_base                   :: Float64
-    dd_zoea1_to_zoea2        :: Float64
-    dd_zoea2_to_megalopa     :: Float64
-    dd_megalopa_to_settle    :: Float64
-    mortality_base           :: Float64
-    mortality_thermal_thresh :: Float64
-    mortality_thermal_sens   :: Float64
-    mortality_cold_thresh    :: Float64
-    mortality_cold_sens      :: Float64
-    settlement_min_depth     :: Float64
-    settlement_max_depth     :: Float64
-    settlement_max_temp      :: Float64
-    settlement_stochastic    :: Bool
-    cv_molt                  :: Float64
-    cv_mortality             :: Float64
-    cv_settlement            :: Float64
-    enable_zarr            :: Bool
-    zarr_path              :: String
-    run_id                   :: String
-    seed                     :: Int
-end
-
-"""
-    CoupledSimulationConfig
-
-Unified configuration aggregating physical `HydrodynamicConfig` and biological
-`LarvalDispersalConfig` for integrated end-to-end simulations.
-"""
-struct CoupledSimulationConfig
-    hydro  :: HydrodynamicConfig
-    larval :: LarvalDispersalConfig
-end
+

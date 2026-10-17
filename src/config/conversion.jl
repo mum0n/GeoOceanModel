@@ -158,7 +158,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     anim_overlay = Bool(get_val("visualization", "anim_overlay_particles", false))
      anim_out_path = String(get_val("visualization", "anim_output_path", ""))
 
-      output_path = String(get_val("storage", "output_path", joinpath("outputs", "default")))
+     output_path = String(get_val("storage", "output_path",
+                          get_val("storage", "output_dir", joinpath("outputs", "default"))))
      zarr_path   = String(get_val("storage", "zarr_path", joinpath("outputs", "particle_tracking.zarr")))
      storage_backend = String(get_val("storage", "storage_backend", "zarr"))
      
@@ -196,13 +197,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     # Field-output cadence, distinct from the checkpoint cadence. Read from [storage] rather
     # than hardcoded downstream, so the two can legitimately differ.
     out_sched = Float64(get_val("storage", "output_schedule_seconds", 21600.0))
+    max_save_d = Float64(get_val("storage", "max_save_depth", Inf))
      cp_dir    = String(get_val("storage", "checkpoint_dir",
                                 get_val("runtype", "checkpoint_dir",
                                         get_val("paths", "checkpoint_dir", ""))))
     cp_clean  = Bool(get_val("storage", "checkpoint_cleanup", true))
     auto_res  = Bool(get_val("hydrodynamics", "auto_restart", true))
-
-    res_scale = Float64(get_val("grid", "resolution_scale", 1.0))
     v_mode_str = String(get_val("grid", "vertical_stretching_mode", "oceananigans"))
     # Two-segment shelf grid parameters. `vertical_stretching_mode = "two_segment"` splits `nz`
     # into a surface-refined upper segment above `vertical_break_depth` and a coarse lower segment,
@@ -365,6 +365,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         checkpoint_prefix = cp_pfx_raw,
         checkpoint_schedule = cp_sched,
         output_schedule_seconds = out_sched,
+        max_save_depth = max_save_d,
         checkpoint_dir = cp_dir,
         checkpoint_cleanup = cp_clean,
         auto_restart = auto_res,
@@ -374,9 +375,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         nz_above = nz_above_cfg,
         vertical_break_depth = vertical_break_depth,
         vertical_grid_file = v_file,
-    vertical_depths = v_depths,
-        resolution_scale = res_scale,
-    atmospheric_source = atmo_src,
+        vertical_depths = v_depths,
+        atmospheric_source = atmo_src,
     ocean_boundary_source = obc_src,
     embedding_lon = embedding_domain_ranges(config_dict).lon,
     embedding_lat = embedding_domain_ranges(config_dict).lat,
@@ -442,7 +442,6 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "nx" => opts.grid_size[1],
             "ny" => opts.grid_size[2],
             "nz" => opts.grid_size[3],
-            "resolution_scale" => opts.resolution_scale,
             "vertical_stretching_mode" => string(opts.vertical_stretching_mode),
             "nz_above" => opts.nz_above,
             "vertical_break_depth" => opts.vertical_break_depth,
@@ -596,7 +595,6 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :vertical_stretching_mode => opts.vertical_stretching_mode,
         :vertical_grid_file       => opts.vertical_grid_file,
         :vertical_depths          => opts.vertical_depths,
-        :resolution_scale         => opts.resolution_scale,
         :bathymetry_source        => Symbol(opts.bathy_source),
         :bathy_source              => opts.bathy_source,
         :coastline_source          => opts.coastline_source,
@@ -656,7 +654,7 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         d[:domain_lon], d[:domain_lat], d[:domain_z], d[:grid_size],
         Symbol(d[:vertical_stretching_mode]),         String(d[:vertical_grid_file]),
         Float64[Float64(x) for x in d[:vertical_depths]],
-        Float64(d[:resolution_scale]), Symbol(d[:bathymetry_source]),
+        Symbol(d[:bathymetry_source]),
         String(d[:bathy_source]), String(d[:coastline_source]), String(d[:wind_source]), String(d[:wind_time_iso]), Float64(d[:inshore_depth]),
         Float64(d[:shelf_slope]), Symbol(d[:atmospheric_source]),
         Symbol(d[:drag_formulation]), Bool(d[:bulk_heat_flux]),
@@ -680,75 +678,3 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
     )
 end
 
-"""
-    to_larval_config(opts::HydrodynamicOptions; kwargs...) -> LarvalDispersalConfig
-
-Extract and convert a `HydrodynamicOptions` instance into a pure `LarvalDispersalConfig`.
-"""
-function to_larval_config(opts::HydrodynamicOptions; kwargs...)::LarvalDispersalConfig
-    d = Dict{Symbol, Any}(
-        :n_particles              => opts.n_particles,
-        :track_duration_seconds   => opts.track_duration,
-        :track_dt_seconds         => opts.track_dt,
-        :diffusivity_h            => opts.diffusivity_h,
-        :diffusivity_v            => opts.diffusivity_v,
-        :min_seabed_depth         => opts.min_seabed_depth,
-        :buffer_km                => opts.buffer_km,
-        :release_depth_mode       => opts.release_depth_mode,
-        :bottom_release_offset    => opts.bottom_release_offset,
-        :enable_initial_ascent    => opts.enable_initial_ascent,
-        :ascent_speed             => opts.ascent_speed,
-        :ascent_target_depth      => opts.ascent_target_depth,
-        :enable_dvm               => opts.enable_dvm,
-        :megalopa_day_depth       => -120.0,
-        :megalopa_night_depth     => -60.0,
-        :zoea2_depth_factor       => 1.2,
-        :megalopa_swim_factor     => 1.5,
-        :enable_molting           => opts.enable_molting,
-        :t_base                   => -1.5,
-        :dd_zoea1_to_zoea2        => 65.0,
-        :dd_zoea2_to_megalopa     => 130.0,
-        :dd_megalopa_to_settle    => 200.0,
-        :mortality_base           => 0.02,
-        :mortality_thermal_thresh => 7.0,
-        :mortality_thermal_sens   => 0.35,
-        :mortality_cold_thresh    => -1.5,
-        :mortality_cold_sens      => 0.02,
-        :settlement_min_depth     => -250.0,
-        :settlement_max_depth     => -50.0,
-        :settlement_max_temp      => 6.0,
-        :settlement_stochastic    => opts.settlement_stochastic,
-        :cv_molt                  => opts.cv_molt,
-        :cv_mortality             => opts.cv_mortality,
-        :cv_settlement            => opts.cv_settlement,
-        :enable_zarr            => opts.enable_zarr,
-        :zarr_path              => opts.zarr_path,
-        :run_id                   => opts.run_id,
-        :seed                     => opts.seed
-    )
-    for (k, v) in kwargs
-        d[k] = v
-    end
-
-    return LarvalDispersalConfig(
-        Int(d[:n_particles]), Float64(d[:track_duration_seconds]),
-        Float64(d[:track_dt_seconds]), Float64(d[:diffusivity_h]),
-        Float64(d[:diffusivity_v]), Float64(d[:min_seabed_depth]),
-        Float64(d[:buffer_km]), Symbol(d[:release_depth_mode]),
-        (Float64(d[:bottom_release_offset][1]), Float64(d[:bottom_release_offset][2])),
-        Bool(d[:enable_initial_ascent]), Float64(d[:ascent_speed]),
-        Float64(d[:ascent_target_depth]), Bool(d[:enable_dvm]),
-        Float64(d[:megalopa_day_depth]), Float64(d[:megalopa_night_depth]),
-        Float64(d[:zoea2_depth_factor]), Float64(d[:megalopa_swim_factor]),
-        Bool(d[:enable_molting]), Float64(d[:t_base]),
-        Float64(d[:dd_zoea1_to_zoea2]), Float64(d[:dd_zoea2_to_megalopa]),
-        Float64(d[:dd_megalopa_to_settle]), Float64(d[:mortality_base]),
-        Float64(d[:mortality_thermal_thresh]), Float64(d[:mortality_thermal_sens]),
-        Float64(d[:mortality_cold_thresh]), Float64(d[:mortality_cold_sens]),
-        Float64(d[:settlement_min_depth]), Float64(d[:settlement_max_depth]),
-        Float64(d[:settlement_max_temp]), Bool(d[:settlement_stochastic]),
-         Float64(d[:cv_molt]), Float64(d[:cv_mortality]), Float64(d[:cv_settlement]),
-         Bool(d[:enable_checkpoint]), String(d[:output_path]),
-         String(d[:storage_backend]), Int(d[:seed])
-     )
-end

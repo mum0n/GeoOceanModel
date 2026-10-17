@@ -80,10 +80,14 @@ mutable struct GeodataOutputCallback
     interval::Float64
     # Spin-up interval in seconds. Time-slices prior to this are excluded from storage.
     spinup_seconds::Float64
+    # Optional maximum water depth (m) to archive. Depths deeper than this (e.g. > 400 m)
+    # are subsampled out to reduce vertical array volume by up to 50% for epipelagic larval drift.
+    max_save_depth::Float64
 end
 
 """
-    GeodataOutputCallback(output_dir, model; fields = ("u","v","w","T"), resume = false)
+    GeodataOutputCallback(output_dir, model; fields = ("u","v","w","T"), resume = false,
+                          spinup_seconds = 0.0, max_save_depth = Inf)
 
 Construct the output writer for one run. A fresh run clears the store and starts at slice 0.
 `resume = true` keeps the store and continues from however many slices it already holds, so an
@@ -92,7 +96,8 @@ overwriting the interval it already wrote.
 """
 function GeodataOutputCallback(output_dir::AbstractString, interval::Real,
                                model; fields::Tuple = ("u", "v", "w", "T"),
-                               resume::Bool = false, spinup_seconds::Real = 0.0)
+                               resume::Bool = false, spinup_seconds::Real = 0.0,
+                               max_save_depth::Real = Inf)
     isdir(output_dir) || mkpath(output_dir)
     store = output_zarr_path(output_dir)
     if !resume && ispath(store)
@@ -105,7 +110,8 @@ function GeodataOutputCallback(output_dir::AbstractString, interval::Real,
         start = GeoOceanModel.store_interval_count(store) + 1
     end
     return GeodataOutputCallback(store, output_dir, collect(String.(fields)), Ref(start),
-                                 nothing, nothing, Float64(interval), Float64(spinup_seconds))
+                                 nothing, nothing, Float64(interval), Float64(spinup_seconds),
+                                 Float64(max_save_depth))
 end
 
 """
@@ -152,9 +158,14 @@ function _build_store_dataset(store::AbstractString, ax, names::Vector{String}, 
     tim = axe(:time, Float64.(1:nt), "s", "time", GeoData.DIM_TEMPORAL)
 
     vars = Dict{String, GeoArray}()
+    # Align Zarr chunk sizes (nx, ny, nz, min(nt, 24)) to minimize metadata overhead and allow fast streaming chunks
+    chunk_t = min(nt, 24)
+    target_chunks = (nx, ny, nz, chunk_t)
     for name in names
         d = dims = (dl, dt, dz, tim)
-        vars[name] = GeoArray(zeros(Float64, nx, ny, nz, nt), d, crs, Dict{String, Any}())
+        # Store 4D simulation fields as Float32 to reduce disk volume by 50% without scientific precision loss
+        vars[name] = GeoArray(zeros(Float32, nx, ny, nz, nt), d, crs,
+                              Dict{String, Any}("chunks" => target_chunks))
     end
     coords = Dict{Symbol, GeoArray}(
         :lon => GeoArray(ax.x, (dl,), crs, Dict{String, Any}()),
@@ -246,7 +257,17 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
 
     # The interior cell centres, resolved from the model's own grid, so the store states where
     # its cells are on Earth rather than leaving a reader to guess from an index.
-    ax = _field_arrays(model)
+    raw_ax = _field_arrays(model)
+    # If max_save_depth is specified (e.g. 400m), filter depth axis to epipelagic/mesopelagic layers
+    # to save up to 50% array volume for larval drift studies. Note: depths in Oceananigans are negative (z <= 0)
+    # or positive down. We check abs.(z) <= cb.max_save_depth.
+    z_indices = if isfinite(cb.max_save_depth) && cb.max_save_depth > 0.0
+        findall(z -> abs(z) <= cb.max_save_depth, raw_ax.z)
+    else
+        1:length(raw_ax.z)
+    end
+    isempty(z_indices) && (z_indices = 1:length(raw_ax.z))
+    ax = (x = raw_ax.x, y = raw_ax.y, z = raw_ax.z[z_indices])
 
     fields = Dict{String, Any}()
     for name in cb.field_names
@@ -258,8 +279,9 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
         # are averaged onto cell centres here, in one `_to_centres` call, so the store holds
         # every field on the one grid its dimension records describe -- and a reader does not
         # have to know about staggering to read the store.
-        fields[name] = _to_centres(Array{Float64}(interior(f)),
-                                   (length(ax.x), length(ax.y), length(ax.z)))
+        centred = Float32.(_to_centres(Array{Float32}(interior(f)),
+                                       (length(raw_ax.x), length(raw_ax.y), length(raw_ax.z))))
+        fields[name] = length(z_indices) < length(raw_ax.z) ? centred[:, :, z_indices] : centred
     end
 
     ds = cb.store_ds
@@ -306,7 +328,7 @@ end
 
 """
     attach_output_callback!(sim, output_dir; fields = ("u","v","w","T"), schedule = nothing,
-                            resume = false)
+                            resume = false, spinup_seconds = 0.0, max_save_depth = Inf)
 
 Build the store and attach the writer to `sim`. Returns the store path, so the caller records
 it in the handover and the larval half is given a location rather than an object.
@@ -321,12 +343,14 @@ writers share one cadence by construction rather than by convention.
 function attach_output_callback!(sim, output_dir::AbstractString;
                                  fields::Tuple = ("u", "v", "w", "T"),
                                  schedule = nothing, resume::Bool = false,
-                                 spinup_seconds::Real = 0.0)
+                                 spinup_seconds::Real = 0.0,
+                                 max_save_depth::Real = Inf)
     if isnothing(schedule)
         schedule = Oceananigans.TimeInterval(6 * 3600.0)
     end
     cb = GeodataOutputCallback(output_dir, schedule.interval, sim.model; fields = fields,
-                               resume = resume, spinup_seconds = spinup_seconds)
+                               resume = resume, spinup_seconds = spinup_seconds,
+                               max_save_depth = max_save_depth)
     Oceananigans.add_callback!(sim, Oceananigans.Callback(cb, schedule))
     # The store itself does not exist yet: it is built at the first output, when the grid axes
     # and the field shapes are known. What is returned is where it *will* be, so the caller can

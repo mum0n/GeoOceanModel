@@ -49,11 +49,16 @@ machinery and therefore only needs the model object.
 - `bottom_drag_coefficient` is left at the library default (`0.003`) because `Default` is not
   part of Oceananigans' public API in this build; `cd_drag` is therefore only honoured by the
   manual builder. Set it explicitly via the library kwarg if a different value is needed.
-
-Surface heat/wind fluxes, tidal body forcing and the lateral sponge are *not* configured
-here: `ocean_simulation` exposes them through different hooks (surface boundary conditions
-and interior `forcing`) than this package's existing `Forcing`/BC construction, and they are
-supplied by the caller through `forcing`/`boundary_conditions` below.
+- `tidal_placement = :boundary` (default): under hydrostatic primitive equations, vertical velocity
+  is diagnostic:
+  ```math
+  w(x, y, z, t) = -\\int_{-H}^z \\left(\\frac{\\partial u}{\\partial x} + \\frac{\\partial v}{\\partial y}\\right) dz
+  ```
+  Relaxing interior horizontal velocities across steep shelf slopes (`∇H >> 0`) imposes severe
+  artificial volume flux divergence, driving vertical velocities exceeding 5-10 m/s and collapsing Δt.
+  `:boundary` restricts tidal relaxation to the open boundary sponge layer, enabling barotropic
+  tidal waves to enter and propagate hydrostatically across the continental shelf. Pass `:interior`
+  only when simulating closed unconstrained basins without lateral sponges.
 """
 function build_hydrodynamic_model(
     grid;
@@ -92,7 +97,8 @@ function build_hydrodynamic_model(
     boundary_tracers::Union{Nothing, NamedTuple} = nothing,
     boundary_velocities::Union{Nothing, NamedTuple} = nothing,
     mask_bay_of_fundy::Bool = false,
-    active_boundaries = (:east, :south, :west)
+    active_boundaries = (:east, :south, :west),
+    tidal_placement::Symbol = :boundary
 )
     active_tracers = (enable_o2 && !(:O2 in tracers)) ? (tracers..., :O2) : tracers
 
@@ -253,35 +259,41 @@ function build_hydrodynamic_model(
         u_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = u_target)
         v_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = v_target)
 
-        # Tidal forcing is a RELAXATION TOWARD the prescribed tidal velocity, not a body force.
+        # Tidal forcing is a relaxation toward prescribed tidal velocity.
         #
-        # `tidal_velocity_coefficients` reconstructs the true velocity in m/s from the M2/S2
-        # harmonic coefficients: u(t) = sum_k [Re_k cos(w_k t) + Im_k sin(w_k t)].
-        # A `ContinuousForcing` on `u`/`v` is an ACCELERATION in m/s^2; passing a velocity there
-        # injected `u_tide * dt` into the momentum equation every step, causing severe divergence.
-        # Conversely, passing an acceleration tendency into `Relaxation` damped interior
-        # velocities to zero.
+        # In a hydrostatic free-surface primitive equation model, vertical velocity is
+        # diagnosed diagnostically from horizontal volume flux divergence:
+        #     w(x, y, z, t) = -∫_{-H}^z ∇_h · u_h dz
+        # Relaxing horizontal velocities across the entire interior domain (:interior)
+        # toward depth-uniform barotropic tidal velocities over steep topography (∇H >> 0)
+        # generates huge artificial volume flux divergences, forcing w to reach 4-10 m/s
+        # at the continental shelf break, tripping the CFL limiter and collapsing Δt.
         #
-        # Relaxation toward the reconstructed velocity `(1/tau) * (u_tide - u)` provides the
-        # physically consistent formulation: the target is in m/s and converges on timescale `tidal_tau`.
-        #
-        # A relaxation is the correct expression of a prescribed oscillating velocity: it adds
-        # `(1/tau) * (u_tide(x, t) - u)`, so the target is a velocity and the model converges to
-        # the tide on the timescale `tidal_relaxation_timescale` rather than accumulating it. That timescale is
-        # a physics choice, not a numerical one -- small pins the flow to the tide and suppresses
-        # wind and buoyancy; large lets the tide contribute while the rest of the model evolves.
+        # Under :boundary (the physical default), the tidal relaxation is restricted to
+        # the open boundary sponge zone (tidal_eff_mask = sponge_mask), allowing the
+        # barotropic tidal wave to enter and propagate into the domain dynamically and
+        # hydrostatically according to the shallow-water wave equations.
+        tidal_eff_mask = if tidal_placement === :boundary
+            sponge_mask
+        elseif tidal_placement === :interior
+            tidal_mask
+        else
+            # :both or fallback
+            (x, y, z) -> max(sponge_mask(x, y, z), tidal_mask(x, y, z))
+        end
+
         if !isnothing(u_tide_val)
             u_tide_target = (x, y, z, t) -> Float64(u_tide_val(x, y, z, t))
             u_forcing = MultipleForcings(
                 u_forcing,
-                Relaxation(rate = tidal_relax_rate, mask = tidal_mask, target = u_tide_target)
+                Relaxation(rate = tidal_relax_rate, mask = tidal_eff_mask, target = u_tide_target)
             )
         end
         if !isnothing(v_tide_val)
             v_tide_target = (x, y, z, t) -> Float64(v_tide_val(x, y, z, t))
             v_forcing = MultipleForcings(
                 v_forcing,
-                Relaxation(rate = tidal_relax_rate, mask = tidal_mask, target = v_tide_target)
+                Relaxation(rate = tidal_relax_rate, mask = tidal_eff_mask, target = v_tide_target)
             )
         end
 
@@ -339,7 +351,7 @@ function build_hydrodynamic_model(
         # interpolation overhead in the tendency kernel.
         for (nm, itp) in pairs(boundary_tracers)
             target_field = CenterField(grid)
-            set!(target_field, (x, y, z) -> Float64(itp(x, y, -z)))
+            set!(target_field, (x, y, z) -> Float64(itp(x, y, z)))
             composed_forcing = merge(
                 composed_forcing,
                 (nm => Relaxation(rate = relax_rate, mask = sponge_mask,
