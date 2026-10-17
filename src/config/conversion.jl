@@ -44,16 +44,23 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     ny = Int(get_val("grid", "ny", 50))
     nz = Int(get_val("grid", "nz", 10))
 
+    grid_orientation = Symbol(lowercase(String(get_val("grid", "orientation", "standard"))))
+    rotation_azimuth = Float64(get_val("grid", "rotation_azimuth", 50.0))
+    center_lon = Float64(get_val("grid", "center_lon", -63.0))
+    center_lat = Float64(get_val("grid", "center_lat", 44.0))
+    along_shelf_extent_km = Float64(get_val("grid", "along_shelf_extent_km", 850.0))
+    cross_shelf_extent_km = Float64(get_val("grid", "cross_shelf_extent_km", 220.0))
+
     bathy_source = String(get_val("data", "bathy_source", "etopo2022"))
     coastline_source = String(get_val("data", "coastline_source", "natural_earth_10m"))
     wind_source = String(get_val("data", "wind_source", "open_meteo"))
     wind_time_iso = String(get_val("data", "wind_time_iso", "2020-06-01T00:00:00Z"))
 
     # Shelf geometry, from [bathymetry]. `inshore_depth` is the water depth at the landward
-    # edge of the domain; `shelf_slope` is the total rise across the shelf. Both are read
-    # from here rather than hardcoded, so a config can actually shape its own seabed.
-    inshore_depth = Float64(get_val("bathymetry", "inshore_depth", -20.0))
-    shelf_slope   = Float64(get_val("bathymetry", "shelf_slope", 500.0))
+    # edge of the domain (positive, m); `shelf_slope` is the total rise across the shelf (m).
+    # Both are read from here rather than hardcoded, so a config can actually shape its seabed.
+    inshore_depth = abs(Float64(get_val("bathymetry", "inshore_depth", 20.0)))
+    shelf_slope   = abs(Float64(get_val("bathymetry", "shelf_slope", 180.0)))
     mask_bay_of_fundy = Bool(get_val("bathymetry", "mask_bay_of_fundy", false))
 
     # Tidal body forcing. `constituents` is an empty list in a config that disables tides, so
@@ -101,7 +108,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     else
         Bool(get_val("hydrodynamics", "bulk_heat_flux", true))
     end
-    sst_damping = Float64(get_val("hydrodynamics", "sst_damping_coefficient", 0.0))
+    sst_damping = if haskey(config_dict, "atmosphere") &&
+                     haskey(config_dict["atmosphere"], "sst_damping_coefficient")
+        Float64(get_val("atmosphere", "sst_damping_coefficient", 0.0))
+    else
+        Float64(get_val("hydrodynamics", "sst_damping_coefficient", 0.0))
+    end
     sst_target_val = Float64(get_val("hydrodynamics", "sst_target", 12.0))
     spinup_hours_val = Float64(get_val("hydrodynamics", "spinup_hours", 720.0))
     div_vel_lim = Float64(get_val("hydrodynamics", "divergence_velocity_limit", 20.0))
@@ -209,7 +221,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     # which is the only way to resolve the 10-400 m active layer while still reaching the deep basin.
     # `nz_above = 0` means "derive it as 60% of nz".
     nz_above_cfg = Int(get_val("grid", "nz_above", 0))
-    vertical_break_depth = Float64(get_val("grid", "vertical_break_depth", -400.0))
+    vertical_break_depth = abs(Float64(get_val("grid", "vertical_break_depth", 400.0)))
     v_mode = Symbol(lowercase(v_mode_str))
     v_file = strip(String(get_val("grid", "vertical_grid_file", "")))
 
@@ -273,6 +285,16 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     sponge_tau_val   = Float64(get_val("boundaries", "sponge_timescale_seconds", 3600.0))
     u_inflow_val     = Float64(get_val("boundaries", "u_inflow", -0.15))
     v_inflow_val     = Float64(get_val("boundaries", "v_inflow", 0.05))
+    act_b_raw        = get_val("boundaries", "active_boundaries", ["east"])
+    act_b_tuple      = if act_b_raw isa AbstractVector
+        Tuple(Symbol(lowercase(string(b))) for b in act_b_raw)
+    elseif act_b_raw isa Tuple
+        Tuple(Symbol(lowercase(string(b))) for b in act_b_raw)
+    elseif act_b_raw isa Symbol || act_b_raw isa AbstractString
+        (Symbol(lowercase(string(act_b_raw))),)
+    else
+        (:east,)
+    end
 
     # Maximum allowable time step ceiling
     max_dt_val = Float64(get_val("hydrodynamics", "max_dt_seconds", sim_dt))
@@ -304,6 +326,12 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         domain_lat = (lat_min, lat_max),
         domain_z = (z_min, z_max),
         grid_size = (nx, ny, nz),
+        grid_orientation = grid_orientation,
+        rotation_azimuth = rotation_azimuth,
+        center_lon = center_lon,
+        center_lat = center_lat,
+        along_shelf_extent_km = along_shelf_extent_km,
+        cross_shelf_extent_km = cross_shelf_extent_km,
         bathy_source = bathy_source,
     coastline_source = coastline_source,
     wind_source = wind_source,
@@ -418,6 +446,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         cv_mortality = cv_mortality,
         cv_settlement = cv_settlement,
         mask_bay_of_fundy = mask_bay_of_fundy,
+        active_boundaries = act_b_tuple,
         overrides...
     )
 end
@@ -442,6 +471,12 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "nx" => opts.grid_size[1],
             "ny" => opts.grid_size[2],
             "nz" => opts.grid_size[3],
+            "orientation" => string(opts.grid_orientation),
+            "rotation_azimuth" => opts.rotation_azimuth,
+            "center_lon" => opts.center_lon,
+            "center_lat" => opts.center_lat,
+            "along_shelf_extent_km" => opts.along_shelf_extent_km,
+            "cross_shelf_extent_km" => opts.cross_shelf_extent_km,
             "vertical_stretching_mode" => string(opts.vertical_stretching_mode),
             "nz_above" => opts.nz_above,
             "vertical_break_depth" => opts.vertical_break_depth,
@@ -592,7 +627,15 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :domain_lat               => opts.domain_lat,
         :domain_z                 => opts.domain_z,
         :grid_size                => opts.grid_size,
+        :grid_orientation         => opts.grid_orientation,
+        :rotation_azimuth         => opts.rotation_azimuth,
+        :center_lon               => opts.center_lon,
+        :center_lat               => opts.center_lat,
+        :along_shelf_extent_km    => opts.along_shelf_extent_km,
+        :cross_shelf_extent_km    => opts.cross_shelf_extent_km,
         :vertical_stretching_mode => opts.vertical_stretching_mode,
+        :nz_above                 => opts.nz_above,
+        :vertical_break_depth     => opts.vertical_break_depth,
         :vertical_grid_file       => opts.vertical_grid_file,
         :vertical_depths          => opts.vertical_depths,
         :bathymetry_source        => Symbol(opts.bathy_source),
@@ -652,11 +695,22 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
 
     return HydrodynamicConfig(
         d[:domain_lon], d[:domain_lat], d[:domain_z], d[:grid_size],
-        Symbol(d[:vertical_stretching_mode]),         String(d[:vertical_grid_file]),
+        Symbol(d[:grid_orientation]), Float64(d[:rotation_azimuth]),
+        Float64(d[:center_lon]), Float64(d[:center_lat]),
+        Float64(d[:along_shelf_extent_km]), Float64(d[:cross_shelf_extent_km]),
+        Symbol(d[:vertical_stretching_mode]),
+        Int(d[:nz_above]),
+        abs(Float64(d[:vertical_break_depth])),
+        String(d[:vertical_grid_file]),
         Float64[Float64(x) for x in d[:vertical_depths]],
         Symbol(d[:bathymetry_source]),
-        String(d[:bathy_source]), String(d[:coastline_source]), String(d[:wind_source]), String(d[:wind_time_iso]), Float64(d[:inshore_depth]),
-        Float64(d[:shelf_slope]), Symbol(d[:atmospheric_source]),
+        String(d[:bathy_source]),
+        String(d[:coastline_source]),
+        String(d[:wind_source]),
+        String(d[:wind_time_iso]),
+        abs(Float64(d[:inshore_depth])),
+        abs(Float64(d[:shelf_slope])),
+        Symbol(d[:atmospheric_source]),
         Symbol(d[:drag_formulation]), Bool(d[:bulk_heat_flux]),
         Bool(d[:climatology]), Float64(d[:mhw_temp_anomaly]),
         Symbol(d[:ocean_boundary_source]), Symbol(d[:obc_type]),

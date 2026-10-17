@@ -22,6 +22,12 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `domain_lat::Tuple{Float64, Float64}`: Latitude bounding box (min_lat, max_lat) in °N.
 - `domain_z::Tuple{Float64, Float64}`: Vertical depth range (z_min, z_max) in meters.
 - `grid_size::Tuple{Int, Int, Int}`: Grid cell counts (Nx, Ny, Nz).
+- `grid_orientation::Symbol`: Grid orientation (:standard or :rotated).
+- `rotation_azimuth::Float64`: Bearing along shelf strike in degrees clockwise from North.
+- `center_lon::Float64`: Central longitude in °E for rotated grid coordinates.
+- `center_lat::Float64`: Central latitude in °N for rotated grid coordinates.
+- `along_shelf_extent_km::Float64`: Domain dimension along shelf strike in kilometers.
+- `cross_shelf_extent_km::Float64`: Domain dimension across shelf strike in kilometers.
 - `bathy_source::String`: Which bathymetry product to ingest, read verbatim from
   `[data] bathy_source` (for example `"etopo2022"`, `"synthetic"`). There is no separate
   real/synthetic switch: acquisition always reads the named product, and falls back to analytic
@@ -62,8 +68,10 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `config_file::String`: Source configuration file path.
 - `bathy_source::String`: Which bathymetry product to ingest; the run always reads the product
   named here rather than choosing between a real and a synthetic mode.
-- `inshore_depth::Float64`: Water depth at the landward edge of the domain (m, negative).
-- `shelf_slope::Float64`: Total seabed rise across the shelf (m).
+- `inshore_depth::Float64`: Water depth at the landward edge of the domain in meters
+  (positive depth, e.g. 20.0 m).
+- `shelf_slope::Float64`: Total seabed relief / rise across the shelf in meters
+  (positive depth scale, e.g. 180.0 m).
 - `output_schedule_seconds::Float64`: Field-output cadence. Independent of
   `checkpoint_schedule`, which is the state-checkpoint cadence; the two may legitimately differ.
 - `input_dir::String`: Directory for raw and processed bathymetry/wind files.
@@ -78,7 +86,10 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `checkpoint_cleanup::Bool`: Whether older intermediate checkpoints are automatically deleted.
 - `auto_restart::Bool`: Automatically detect and pick up from existing checkpoints if available.
 - `run_id::String`: Unique cohort identifier for Zarr persistence and figures.
-- `vertical_stretching_mode::Symbol`: Vertical grid stretching mode (:tanh, :uniform, or :csv).
+- `vertical_stretching_mode::Symbol`: Vertical grid stretching mode (:tanh, :uniform,
+  :two_segment, or :oceananigans).
+- `vertical_break_depth::Float64`: Shelf-slope break depth separating upper refined
+  stratum from deep basin in meters (positive depth, e.g. 200.0 or 400.0 m).
 - `vertical_grid_file::String`: Path to CSV file specifying vertical layer boundary faces.
 - `atmospheric_source::Symbol`: Atmospheric forcing provider (:era5, :synthetic, :climatology).
 - `ocean_boundary_source::Symbol`: Open boundary hydrographic data provider (:glorys12v1, :synthetic).
@@ -106,6 +117,12 @@ struct HydrodynamicOptions
     domain_lat               :: Tuple{Float64, Float64}
     domain_z                 :: Tuple{Float64, Float64}
     grid_size                :: Tuple{Int, Int, Int}
+    grid_orientation         :: Symbol
+    rotation_azimuth         :: Float64
+    center_lon               :: Float64
+    center_lat               :: Float64
+    along_shelf_extent_km    :: Float64
+    cross_shelf_extent_km    :: Float64
     bathy_source             :: String
     coastline_source         :: String
     wind_source              :: String
@@ -305,6 +322,7 @@ struct HydrodynamicOptions
     cv_mortality             :: Float64  # coefficient of variation for mortality (default 0.25)
     cv_settlement            :: Float64  # coefficient of variation for settlement HSI (default 0.25)
     mask_bay_of_fundy        :: Bool     # whether Bay of Fundy shallows are masked to land
+    active_boundaries        :: Tuple{Vararg{Symbol}} # active boundaries for relaxation
 end
 
 function HydrodynamicOptions(;
@@ -312,12 +330,18 @@ function HydrodynamicOptions(;
     domain_lat            :: Tuple{Real, Real} = (40.0, 48.5),
     domain_z              :: Tuple{Real, Real} = (-3500.0, 0.0),
     grid_size             :: Tuple{Int, Int, Int} = (50, 50, 10),
+    grid_orientation      :: Symbol = :standard,
+    rotation_azimuth      :: Real = 50.0,
+    center_lon            :: Real = -63.0,
+    center_lat            :: Real = 44.0,
+    along_shelf_extent_km :: Real = 850.0,
+    cross_shelf_extent_km :: Real = 220.0,
     bathy_source           :: AbstractString = "etopo2022",
     coastline_source       :: AbstractString = "natural_earth_10m",
     wind_source            :: AbstractString = "open_meteo",
     wind_time_iso          :: AbstractString = "2020-06-01T00:00:00Z",
-    inshore_depth          :: Real = -20.0,
-    shelf_slope            :: Real = 500.0,
+    inshore_depth          :: Real = 20.0,
+    shelf_slope            :: Real = 180.0,
     enable_tides          :: Bool = true,
     tides_source          :: AbstractString = "tpxo9",
     tidal_constituents    :: AbstractVector{Symbol} = [:M2, :S2],
@@ -382,7 +406,7 @@ function HydrodynamicOptions(;
     run_id                   :: AbstractString = "",
     vertical_stretching_mode :: Symbol = :oceananigans,
     nz_above :: Int = 0,
-    vertical_break_depth :: Real = -400.0,
+    vertical_break_depth :: Real = 400.0,
     vertical_grid_file       :: AbstractString = "",
     vertical_depths          :: AbstractVector{<:Real} = Float64[],
     atmospheric_source       :: Symbol = :era5,
@@ -426,7 +450,8 @@ function HydrodynamicOptions(;
     cv_molt                  :: Real = 0.25,
     cv_mortality             :: Real = 0.25,
     cv_settlement            :: Real = 0.25,
-    mask_bay_of_fundy        :: Bool = false
+    mask_bay_of_fundy        :: Bool = false,
+    active_boundaries                = (:east,)
 )
     resolved_cp_prefix = if !isempty(strip(checkpoint_prefix)) && checkpoint_prefix != "checkpoint"
         String(checkpoint_prefix)
@@ -446,12 +471,18 @@ function HydrodynamicOptions(;
         (Float64(domain_lat[1]), Float64(domain_lat[2])),
         (Float64(domain_z[1]), Float64(domain_z[2])),
         grid_size,
+        Symbol(lowercase(string(grid_orientation))),
+        Float64(rotation_azimuth),
+        Float64(center_lon),
+        Float64(center_lat),
+        Float64(along_shelf_extent_km),
+        Float64(cross_shelf_extent_km),
         bathy_source,
         coastline_source,
         wind_source,
         wind_time_iso,
-        Float64(inshore_depth),
-        Float64(shelf_slope),
+        abs(Float64(inshore_depth)),
+        abs(Float64(shelf_slope)),
         enable_tides,
         tides_source,
         tidal_constituents,
@@ -516,7 +547,7 @@ function HydrodynamicOptions(;
         String(run_id),
         vertical_stretching_mode,
         Int(nz_above),
-        Float64(vertical_break_depth),
+        abs(Float64(vertical_break_depth)),
         String(vertical_grid_file),
         Float64[Float64(d) for d in vertical_depths],
         atmospheric_source,
@@ -560,7 +591,8 @@ function HydrodynamicOptions(;
         Float64(cv_molt),
         Float64(cv_mortality),
         Float64(cv_settlement),
-        mask_bay_of_fundy
+        mask_bay_of_fundy,
+        Tuple(Symbol(lowercase(string(b))) for b in active_boundaries)
     )
 end
 
@@ -576,6 +608,12 @@ struct HydrodynamicConfig
     domain_lat               :: Tuple{Float64, Float64}
     domain_z                 :: Tuple{Float64, Float64}
     grid_size                :: Tuple{Int, Int, Int}
+    grid_orientation         :: Symbol
+    rotation_azimuth         :: Float64
+    center_lon               :: Float64
+    center_lat               :: Float64
+    along_shelf_extent_km    :: Float64
+    cross_shelf_extent_km    :: Float64
     vertical_stretching_mode :: Symbol
     nz_above :: Int
     vertical_break_depth :: Float64

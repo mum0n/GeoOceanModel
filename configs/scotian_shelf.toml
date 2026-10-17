@@ -13,29 +13,37 @@
 # Geographic bounding box in degrees (WGS84, EPSG:4326)
 lon_min = -68.0               # Western boundary longitude (°E)
 lon_max = -56.5               # Eastern boundary longitude (°E)
-lat_min = 41.2                # Southern boundary latitude (°N)
+lat_min = 43.0                # Southern boundary latitude (°N, aligned to shelf slope margin)
 lat_max = 47.5                # Northern boundary latitude (°N)
-z_min = -1500.0               # Maximum bathymetric water depth (m, negative down)
+z_min = -350.0                # Maximum shelf bathymetric depth (m, epipelagic & mesopelagic zone)
 z_max = 0.0                   # Free surface elevation (m)
 buffer_km = 50.0              # Boundary buffer margin in kilometres
 
 [grid]
-# High-resolution spatial discretization
-nx = 240                      # Zonal grid cell count
-ny = 180                      # Meridional grid cell count
-nz = 12                       # Vertical layer count
+# Grid orientation: "standard" (geographic box) or "rotated" (orthogonal curvilinear)
+# Oriented at 50° azimuth aligns with the shelf slope, covering Georges Bank to
+# Cabot Strait with roughly half the horizontal cells of a geographic bounding box.
+orientation = "rotated"
+rotation_azimuth = 50.0           # Grid azimuth along shelf strike (° clockwise from North)
+center_lon = -63.0                # Shelf central longitude (°E)
+center_lat = 44.0                 # Shelf central latitude (°N)
+along_shelf_extent_km = 850.0     # Domain extent along continental margin (km)
+cross_shelf_extent_km = 220.0     # Domain extent perpendicular to shelf slope (km)
+nx = 220                          # Along-shelf grid cell count (down from 240)
+ny = 65                           # Cross-shelf grid cell count (down from 150; 60% cell reduction)
+nz = 12                           # Vertical layer count
 vertical_stretching_mode = "oceananigans" # Coordinate stretching mode
-nz_above = 0                  # Layers allocated to upper shelf stratum
-vertical_break_depth = -400.0 # Shelf-slope break depth (m)
-vertical_grid_file = ""       # Optional CSV specifying vertical faces
-# Explicit vertical layer face depths starting at 0.0 down to domain bottom (1500 m)
-# Surface layer of 15-20m allows stable larger dt under wind stirring without violating vertical CFL
-depths = [0.0, 15.0, 35.0, 60.0, 90.0, 130.0, 180.0, 250.0, 350.0, 500.0, 800.0, 1100.0, 1500.0]
+nz_above = 0                      # Layers allocated to upper shelf stratum
+vertical_break_depth = 200.0      # Shelf-slope break depth (m, positive downward)
+vertical_grid_file = ""           # Optional CSV specifying vertical faces
+# Explicit vertical layer face depths starting at 0.0 down to shelf floor (350 m)
+# Surface layer of 15m allows stable larger dt under wind stirring without violating vertical CFL
+depths = [0.0, 15.0, 30.0, 48.0, 70.0, 95.0, 125.0, 160.0, 200.0, 240.0, 275.0, 310.0, 350.0]
 
 [bathymetry]
 # Real shelf topography and geometry controls
-inshore_depth = -20.0         # Water depth at inshore boundary (m)
-shelf_slope = 500.0           # Total rise across continental shelf (m)
+inshore_depth = 20.0              # Water depth at inshore boundary (m, positive downward)
+shelf_slope = 180.0               # Total shelf relief / rise across shelf (m; break - inshore = 180 m)
 mask_bay_of_fundy = true      # Damp excessive non-linear resonance in Bay of Fundy
 
 [data]
@@ -59,12 +67,13 @@ obc_type = "flather_chapman"  # Radiation boundary formulation
 ocean_boundary_source = "glorys12v1" # Target tracer and velocity state from GLORYS12V1
 sponge_layer_width = 0.45     # Increased from 0.25 to 0.45 (~50 km)
 sponge_timescale_seconds = 3600.0 # Robust 1-hour sponge relaxation timescale
+active_boundaries = ["east", "south"]
 u_inflow = -0.10              # Southwestward Labrador / Nova Scotia Current (m/s)
 v_inflow = 0.0                # Zero cross-isobath inflow into deep continental slope (m/s)
 
 [tides]
 # Astronomical tidal body and boundary forcing
-enable_tides = true           # Enable astronomical tidal forcing
+enable_tides = false          # Enable astronomical tidal forcing
 tides_source = "tpxo9_atlas"  # TPXO9.v5a global tidal solution
 tidal_constituents = ["M2", "S2"] # Semidiurnal tidal components
 tidal_u_amp = 0.25            # M2 zonal tidal amplitude (m/s)
@@ -82,11 +91,12 @@ projection_year = 2022        # Target simulation year
 sim_duration_hours = 720.0    # 30-day simulation duration (720 hours)
 sim_dt_seconds = 15.0         # Baseline time step in seconds
 min_dt_seconds = 1.0          # Minimum adaptive time step floor (seconds)
-max_dt_seconds = 20.0         # Maximum adaptive time step ceiling (C_wave <= 0.65 in 1500m depth)
+max_dt_seconds = 20.0         # Maximum adaptive time step ceiling (C_wave <= 0.65 in 450m depth)
 adaptive_cfl = true           # Modulate dt according to advective and wave CFL
-target_cfl = 0.15             # Target advective CFL limit
+target_cfl = 0.12             # Target advective CFL limit
 target_wave_cfl = 0.12        # Target barotropic gravity wave CFL limit
 surface_heat_flux = 50.0      # Baseline sensible heat flux (W/m^2)
+sst_damping_coefficient = 40.0 # Haney SST relaxation (W m-2 K-1)
 max_current_speed = 3.0       # Current velocity ceiling in m/s
 max_flow_snapshots = 400      # Snapshot memory retention limit
 spinup_hours = 24.0           # Spinup time before saving outputs (24 hours)

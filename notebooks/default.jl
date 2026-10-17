@@ -4,7 +4,7 @@
 using Markdown
 using InteractiveUtils
 
-# This Pluto notebook uses @bind for interactivity.
+# This Pluto notebook uses @bind for interactivity. When running this notebook outside of Pluto, the following 'mock version' of @bind gives bound variables a default value (instead of an error).
 macro bind(def, element)
     #! format: off
     return quote
@@ -23,6 +23,16 @@ begin
     using PlutoUI
     using Base64
 end
+
+# ╔═╡ c4e3f70a-95b2-4ca4-9b1d-6c5f4a3d9e48
+# ╠═╡
+# Activating the package directory from inside the notebook means Pluto's own environment never
+# needs this package, and `using GeoOceanModel` sees the working tree.
+Pkg.activate(@__DIR__)
+
+# ╔═╡ d5f4081b-0a63-4db5-9c2e-7d6f5b4e0f59
+# ╠═╡
+using GeoOceanModel
 
 # ╔═╡ 1e0b94f7-6c82-4d51-9b7a-3f8e2c0a6b15
 # ╠═╡
@@ -77,16 +87,6 @@ interval count move, without re-running the parts that have not changed.
 # Pin the working directory to the package root: otherwise the `../lakehouse/...` paths in the
 # configs resolve relative to wherever the notebook process started.
 cd(joinpath(@__DIR__, ".."))
-
-# ╔═╡ c4e3f70a-95b2-4ca4-9b1d-6c5f4a3d9e48
-# ╠═╡
-# Activating the package directory from inside the notebook means Pluto's own environment never
-# needs this package, and `using GeoOceanModel` sees the working tree.
-Pkg.activate(@__DIR__)
-
-# ╔═╡ d5f4081b-0a63-4db5-9c2e-7d6f5b4e0f59
-# ╠═╡
-using GeoOceanModel
 
 # ╔═╡ e60a192c-1b74-4ec6-9d3f-8e7f6c5f1a6b
 # ╠═╡
@@ -511,12 +511,6 @@ setupCbMap();
 # ╠═╡
 @bind selected_depth_idx PlutoUI.Slider(1:length(ds.depths), default = argmin(abs.(ds.depths)), show_value = false)
 
-# ╔═╡ d0000001-0001-0001-0001-000000000003
-# ╠═╡
-md"""
-**Depth layer control**: Slider index: `$(selected_depth_idx)` → Depth level: **`$(round(ds.depths[selected_depth_idx], digits = 1))` m**
-"""
-
 # ╔═╡ 82c8b9e4-93d0-4e7d-9abf-6e5f4b3d9a47
 # ╠═╡
 begin
@@ -548,6 +542,12 @@ begin
 
     fig_slice
 end
+
+# ╔═╡ d0000001-0001-0001-0001-000000000003
+# ╠═╡
+md"""
+**Depth layer control**: Slider index: `$(selected_depth_idx)` → Depth level: **`$(round(ds.depths[selected_depth_idx], digits = 1))` m**
+"""
 
 # ╔═╡ d0000001-0001-0001-0001-000000000004
 # ╠═╡
@@ -614,35 +614,35 @@ Knobs worth turning first, in the order they matter:
 """
 
 # ╔═╡ Cell order:
-# ╠═╡ d7f2c0a4-9e18-4b63-8f52-0a1c5e9b3d64 => 1
-# ╠═╡ 1e0b94f7-6c82-4d51-9b7a-3f8e2c0a6b15 => 2
-# ╠═╡ 2a1c05e8-7d39-4e72-9c8b-4a9f3d1b7c26 => 3
-# ╠═╡ b3d2e6f9-84a1-4b93-9a0c-5b4f3e2c8d37 => 4
-# ╠═╡ c4e3f70a-95b2-4ca4-9b1d-6c5f4a3d9e48 => 5
-# ╠═╡ d5f4081b-0a63-4db5-9c2e-7d6f5b4e0f59 => 6
-# ╠═╡ e60a192c-1b74-4ec6-9d3f-8e7f6c5f1a6b => 7
-# ╠═╡ f71b2a3d-2c8f-4fd7-9e4f-9f8f7d6e2b7c => 8
-# ╠═╡ 082c3b4e-3d90-4e18-9a5f-0a9f8e7f3c8d => 9
-# ╠═╡ 193d4c5f-4e01-4f29-9b60-1b0f9f8a4d9e => 10
-# ╠═╡ 2a4e5d60-5f12-4e3a-9b71-2c1f0a9b5e0f => 11
-# ╠═╡ 3b5f6e71-60a3-4e4b-9c82-3d2f1b0c6f1a => 12
-# ╠═╡ 4c607f82-71b4-4e5c-9d93-4e3a2c1d7a2b => 13
-# ╠═╡ 5d710893-82c5-4e6d-9a04-5f4b3d2e8b3c => 14
-# ╠═╡ 6e8219a4-93d6-4e7f-9b15-6a5c4e3f9c4d => 15
-# ╠═╡ 7f9320b5-0a47-4e8a-9c26-7b6d5f4a0d5e => 16
-# ╠═╡ 0a0431c6-1b58-4e9b-9d37-8c7e6f5b1e6f => 17
-# ╠═╡ d0000001-0001-0001-0001-000000000006
-# ╠═╡ 1b1542d7-2c69-4e0c-9e48-9d8f7a6c2f70 => 18
-# ╠═╡ 2c2653e8-3d7a-4e1d-9a59-0e9f8b7d3a81 => 19
-# ╠═╡ 3d3764f9-4e8b-4e2e-9b6a-1f0a9c8e4b92 => 20
-# ╠═╡ 4e4875a0-5f9c-4e3f-9c7b-2a1b0d9f5c03 => 21
-# ╠═╡ 5f5986b1-60ad-4e4a-9d8c-3b2c1e0a6d14 => 22
-# ╠═╡ 60a697c2-71be-4e5b-9e9d-4c3d2f1b7e25 => 23
-# ╠═╡ 71b7a8d3-82cf-4e6c-9eae-5d4e3a2c8f36 => 24
-# ╠═╡ d0000001-0001-0001-0001-000000000001 => 25
-# ╠═╡ d0000001-0001-0001-0001-000000000002 => 26
-# ╠═╡ d0000001-0001-0001-0001-000000000003 => 27
-# ╠═╡ 82c8b9e4-93d0-4e7d-9abf-6e5f4b3d9a47 => 28
-# ╠═╡ d0000001-0001-0001-0001-000000000004 => 29
-# ╠═╡ d0000001-0001-0001-0001-000000000005 => 30
-# ╠═╡ 93d9c0f5-0a41-4e8e-9bc0-7f6a5c4e0b58 => 31
+# ╠═d7f2c0a4-9e18-4b63-8f52-0a1c5e9b3d64
+# ╠═1e0b94f7-6c82-4d51-9b7a-3f8e2c0a6b15
+# ╠═2a1c05e8-7d39-4e72-9c8b-4a9f3d1b7c26
+# ╠═b3d2e6f9-84a1-4b93-9a0c-5b4f3e2c8d37
+# ╠═c4e3f70a-95b2-4ca4-9b1d-6c5f4a3d9e48
+# ╠═d5f4081b-0a63-4db5-9c2e-7d6f5b4e0f59
+# ╠═e60a192c-1b74-4ec6-9d3f-8e7f6c5f1a6b
+# ╠═f71b2a3d-2c8f-4fd7-9e4f-9f8f7d6e2b7c
+# ╠═082c3b4e-3d90-4e18-9a5f-0a9f8e7f3c8d
+# ╠═193d4c5f-4e01-4f29-9b60-1b0f9f8a4d9e
+# ╠═2a4e5d60-5f12-4e3a-9b71-2c1f0a9b5e0f
+# ╠═3b5f6e71-60a3-4e4b-9c82-3d2f1b0c6f1a
+# ╠═4c607f82-71b4-4e5c-9d93-4e3a2c1d7a2b
+# ╠═5d710893-82c5-4e6d-9a04-5f4b3d2e8b3c
+# ╠═6e8219a4-93d6-4e7f-9b15-6a5c4e3f9c4d
+# ╠═7f9320b5-0a47-4e8a-9c26-7b6d5f4a0d5e
+# ╠═0a0431c6-1b58-4e9b-9d37-8c7e6f5b1e6f
+# ╠═d0000001-0001-0001-0001-000000000006
+# ╠═1b1542d7-2c69-4e0c-9e48-9d8f7a6c2f70
+# ╠═2c2653e8-3d7a-4e1d-9a59-0e9f8b7d3a81
+# ╠═3d3764f9-4e8b-4e2e-9b6a-1f0a9c8e4b92
+# ╠═4e4875a0-5f9c-4e3f-9c7b-2a1b0d9f5c03
+# ╠═5f5986b1-60ad-4e4a-9d8c-3b2c1e0a6d14
+# ╠═60a697c2-71be-4e5b-9e9d-4c3d2f1b7e25
+# ╠═71b7a8d3-82cf-4e6c-9eae-5d4e3a2c8f36
+# ╠═d0000001-0001-0001-0001-000000000001
+# ╠═d0000001-0001-0001-0001-000000000002
+# ╠═d0000001-0001-0001-0001-000000000003
+# ╠═82c8b9e4-93d0-4e7d-9abf-6e5f4b3d9a47
+# ╠═d0000001-0001-0001-0001-000000000004
+# ╠═d0000001-0001-0001-0001-000000000005
+# ╠═93d9c0f5-0a41-4e8e-9bc0-7f6a5c4e0b58

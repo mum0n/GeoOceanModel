@@ -10,11 +10,14 @@ extraction, smoothing, buffering) are in GeoData.core.bathy.
 
 using Oceananigans
 using Oceananigans.Grids: Face, Center, znode
+using Oceananigans.OrthogonalSphericalShellGrids: RotatedLatitudeLongitudeGrid, OrthogonalSphericalShellGrid
 using Oceananigans.Architectures: architecture, on_architecture, CPU, GPU
 using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid, GridFittedBottom
 using GeoData
 using GeoDataSources
 using Random
+import Interpolations
+using Interpolations: interpolate, Gridded, Linear, extrapolate
 
 """
     build_shelf_grid(;
@@ -22,12 +25,41 @@ using Random
         lon_range=(-68.0, -57.0),
         lat_range=(42.0, 47.0),
         z_range=(-1000.0, 0.0),
+        z_faces = nothing,
         grid_size=(50, 50, 10),
+        halo = (7, 7, 5),
         topology=(Bounded, Bounded, Bounded),
-        fallback_to_cpu::Bool = false
+        fallback_to_cpu::Bool = false,
+        orientation::Symbol = :standard,
+        rotation_azimuth::Real = 50.0,
+        center_coords::Tuple{Real, Real} = (-63.0, 44.0),
+        along_shelf_extent_km::Real = 850.0,
+        cross_shelf_extent_km::Real = 220.0
     )
 
-Construct a `LatitudeLongitudeGrid` for regional shelf hydrodynamics with specified architecture.
+Construct a regional ocean model computational grid on the specified architecture.
+Supports both standard geographic spherical grids (`LatitudeLongitudeGrid`) and
+orthogonal rotated curvilinear grids (`RotatedLatitudeLongitudeGrid`) oriented along
+the continental margin.
+
+# Inputs
+- `architecture`: Target device backend (`:cpu` or `:gpu`).
+- `lon_range`: Zonal geographic bounds `(lon_min, lon_max)` in °E (used for `:standard`).
+- `lat_range`: Meridional geographic bounds `(lat_min, lat_max)` in °N (used for `:standard`).
+- `z_range`: Depth bounds `(z_min, z_max)` in meters.
+- `z_faces`: Optional custom vector of vertical face coordinates.
+- `grid_size`: Discretization tuple `(Nx, Ny, Nz)`.
+- `halo`: Boundary ghost cell halo tuple `(Hx, Hy, Hz)`.
+- `topology`: Spatial topology tuple (default `(Bounded, Bounded, Bounded)`).
+- `fallback_to_cpu`: Whether to fall back to CPU if GPU initialization fails.
+- `orientation`: `:standard` (geographic box) or `:rotated` (orthogonal along-shelf grid).
+- `rotation_azimuth`: Shelf strike azimuth in degrees clockwise from North (default 50.0°).
+- `center_coords`: Geographic center `(lon, lat)` for rotated grid (default `(-63.0, 44.0)`).
+- `along_shelf_extent_km`: Domain dimension along shelf strike in kilometers (default 850.0 km).
+- `cross_shelf_extent_km`: Domain dimension across shelf in kilometers (default 220.0 km).
+
+# Outputs
+- `Oceananigans.Grids.AbstractGrid`: Constructed base computational grid.
 """
 function build_shelf_grid(;
     architecture = :cpu,
@@ -38,13 +70,20 @@ function build_shelf_grid(;
     grid_size::Tuple{Int, Int, Int} = (50, 50, 10),
     halo::Tuple{Int, Int, Int} = (7, 7, 5),
     topology::Tuple = (Bounded, Bounded, Bounded),
-    fallback_to_cpu::Bool = false
+    fallback_to_cpu::Bool = false,
+    orientation::Symbol = :standard,
+    rotation_azimuth::Real = 50.0,
+    center_coords::Tuple{Real, Real} = (-63.0, 44.0),
+    along_shelf_extent_km::Real = 850.0,
+    cross_shelf_extent_km::Real = 220.0
 )
-    if lon_range[1] >= lon_range[2]
-        error("Invalid longitude range: $(lon_range). lon_min must be < lon_max.")
-    end
-    if lat_range[1] >= lat_range[2]
-        error("Invalid latitude range: $(lat_range). lat_min must be < lat_max.")
+    if orientation === :standard
+        if lon_range[1] >= lon_range[2]
+            error("Invalid longitude range: $(lon_range). lon_min must be < lon_max.")
+        end
+        if lat_range[1] >= lat_range[2]
+            error("Invalid latitude range: $(lat_range). lat_min must be < lat_max.")
+        end
     end
     if any(s <= 0 for s in grid_size)
         error("Grid size dimensions must all be positive integers: $(grid_size)")
@@ -68,17 +107,150 @@ function build_shelf_grid(;
     end
 
     arch = resolve_architecture(architecture; fallback_to_cpu = fallback_to_cpu)
-     
-    grid = LatitudeLongitudeGrid(
-           arch;
-           size = grid_size,
-           longitude = lon_range,
-           latitude = lat_range,
-           z = z_specification,
-           topology = topology,
-           halo = halo
-       )
-    return grid
+
+    if orientation === :rotated
+        rot = compute_rotated_pole(
+            center_coords[1], center_coords[2], rotation_azimuth;
+            along_shelf_extent_km = along_shelf_extent_km,
+            cross_shelf_extent_km = cross_shelf_extent_km
+        )
+        grid = RotatedLatitudeLongitudeGrid(
+            arch;
+            size = grid_size,
+            longitude = rot.lon_range,
+            latitude = rot.lat_range,
+            z = z_specification,
+            north_pole = rot.north_pole,
+            topology = topology,
+            halo = halo
+        )
+        return grid
+    else
+        grid = LatitudeLongitudeGrid(
+            arch;
+            size = grid_size,
+            longitude = lon_range,
+            latitude = lat_range,
+            z = z_specification,
+            topology = topology,
+            halo = halo
+        )
+        return grid
+    end
+end
+
+"""
+    compute_rotated_pole(
+        lon_center::Real,
+        lat_center::Real,
+        azimuth::Real;
+        along_shelf_extent_km::Real = 850.0,
+        cross_shelf_extent_km::Real = 220.0,
+        radius::Real = 6371000.0
+    ) -> NamedTuple
+
+Compute the Euler rotation pole `(lon_pole, lat_pole)` and the unrotated spherical
+coordinate bounds `(lon_range, lat_range)` for an orthogonal curvilinear grid
+oriented at bearing `azimuth` degrees clockwise from North at domain center
+`(lon_center, lat_center)`.
+
+# Mathematical Formulation
+Let ``(\\lambda_0, \\phi_0)`` be the domain center in radians and ``\\theta`` be
+the azimuth angle measured clockwise from true North. The local orthonormal
+tangent vectors are:
+```math
+\\hat{e} = [-\\sin\\lambda_0, \\cos\\lambda_0, 0]^T, \\quad
+\\hat{n} = [-\\sin\\phi_0 \\cos\\lambda_0, -\\sin\\phi_0 \\sin\\lambda_0, \\cos\\phi_0]^T
+```
+The along-shelf tangent vector is ``\\hat{t} = \\sin\\theta \\hat{e} + \\cos\\theta \\hat{n}``.
+The pole ``\\hat{n}_p`` of the great circle passing through ``(\\lambda_0, \\phi_0)``
+with tangent ``\\hat{t}`` is:
+```math
+\\hat{n}_p = \\hat{t} \\times \\hat{r}_0 = -\\cos\\theta \\hat{e} + \\sin\\theta \\hat{n}
+```
+In Oceananigans' `RotatedLatitudeLongitudeGrid`, the rotation aligns the rotated
+equator (``\\phi' = 0``) along this great circle when the grid pole is placed at
+``\\hat{n}_p``.
+
+# Inputs
+- `lon_center`: Central longitude in °E.
+- `lat_center`: Central latitude in °N.
+- `azimuth`: Shelf strike azimuth in degrees clockwise from North.
+- `along_shelf_extent_km`: Domain extent along continental margin (km).
+- `cross_shelf_extent_km`: Domain extent across continental margin (km).
+- `radius`: Mean spherical planet radius in meters (default 6,371,000.0 m).
+
+# Outputs
+- `NamedTuple`: `(north_pole = (lon_p, lat_p), lon_range = (λ'_min, λ'_max), lat_range = (φ'_min, φ'_max))`
+"""
+function compute_rotated_pole(
+    lon_center::Real,
+    lat_center::Real,
+    azimuth::Real;
+    along_shelf_extent_km::Real = 850.0,
+    cross_shelf_extent_km::Real = 220.0,
+    radius::Real = 6371000.0
+)
+    λ0_rad = deg2rad(Float64(lon_center))
+    φ0_rad = deg2rad(Float64(lat_center))
+    θ_rad  = deg2rad(Float64(azimuth))
+
+    e_hat = [-sin(λ0_rad), cos(λ0_rad), 0.0]
+    n_hat = [-sin(φ0_rad) * cos(λ0_rad), -sin(φ0_rad) * sin(λ0_rad), cos(φ0_rad)]
+    np = -cos(θ_rad) .* e_hat .+ sin(θ_rad) .* n_hat
+
+    if np[3] < 0.0
+        np = -np
+    end
+
+    lat_p = rad2deg(asin(np[3]))
+    lon_p = rad2deg(atan(np[2], np[1]))
+
+    dλ = deg2rad(lon_p)
+    dφ = π / 2.0 - deg2rad(lat_p)
+
+    Ry_inv = [ cos(dφ) 0.0 -sin(dφ); 0.0 1.0 0.0; sin(dφ) 0.0 cos(dφ)]
+    Rz_inv = [ cos(dλ) sin(dλ) 0.0; -sin(dλ) cos(dλ) 0.0; 0.0 0.0 1.0]
+
+    r_target = [cos(φ0_rad) * cos(λ0_rad), cos(φ0_rad) * sin(λ0_rad), sin(φ0_rad)]
+    r_prime = Ry_inv * Rz_inv * r_target
+
+    λ_prime_deg = rad2deg(atan(r_prime[2], r_prime[1]))
+
+    dλ_deg = (Float64(along_shelf_extent_km) * 1000.0 / Float64(radius)) * (180.0 / π)
+    dφ_deg = (Float64(cross_shelf_extent_km) * 1000.0 / Float64(radius)) * (180.0 / π)
+
+    lon_range = (λ_prime_deg - 0.5 * dλ_deg, λ_prime_deg + 0.5 * dλ_deg)
+    lat_range = (-0.5 * dφ_deg, 0.5 * dφ_deg)
+
+    return (
+        north_pole = (lon_p, lat_p),
+        lon_range = lon_range,
+        lat_range = lat_range
+    )
+end
+
+"""
+    grid_geographic_bounds(grid) -> (Tuple{Float64, Float64}, Tuple{Float64, Float64})
+
+Compute the geographic bounding box `((lon_min, lon_max), (lat_min, lat_max))` in
+degrees East and North enclosing `grid`'s interior domain.
+"""
+function grid_geographic_bounds(grid)
+    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    if base_g isa LatitudeLongitudeGrid
+        lon_range = (Float64(base_g.λᶠᵃᵃ[1]), Float64(base_g.λᶠᵃᵃ[base_g.Nx + 1]))
+        lat_range = (Float64(base_g.φᵃᶠᵃ[1]), Float64(base_g.φᵃᶠᵃ[base_g.Ny + 1]))
+        return lon_range, lat_range
+    else
+        cpu_g = architecture(base_g) isa GPU ? on_architecture(CPU(), base_g) : base_g
+        nx, ny = cpu_g.Nx, cpu_g.Ny
+        lons = [Float64(cpu_g.λᶜᶜᵃ[i, j]) for i in 1:nx, j in 1:ny]
+        lats = [Float64(cpu_g.φᶜᶜᵃ[i, j]) for i in 1:nx, j in 1:ny]
+        lon_min, lon_max = extrema(lons)
+        lat_min, lat_max = extrema(lats)
+        return (lon_min - 0.2, lon_max + 0.2), (lat_min - 0.2, lat_max + 0.2)
+    end
 end
 
 """
@@ -143,7 +315,7 @@ decided inside `GeoDataSources`, and a caller that passes a path is making that 
 itself.
 """
 function build_immersed_grid(
-    grid::LatitudeLongitudeGrid,
+    grid,
     bathymetry::Union{AbstractMatrix, GeoDataset};
     varname::AbstractString = "elevation"
 )
@@ -221,8 +393,63 @@ face extent rather than the centres and so lands half a cell off. Both read as p
 both were wrong, which is why this is now one function.
 """
 function _grid_interior_centres(grid)
-    return ([Float64(grid.λᶜᵃᵃ[i]) for i in 1:grid.Nx],
-            [Float64(grid.φᵃᶜᵃ[j]) for j in 1:grid.Ny])
+    base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
+    cpu_g = architecture(base_g) isa GPU ? on_architecture(CPU(), base_g) : base_g
+    if cpu_g isa LatitudeLongitudeGrid
+        return ([Float64(cpu_g.λᶜᵃᵃ[i]) for i in 1:cpu_g.Nx],
+                [Float64(cpu_g.φᵃᶜᵃ[j]) for j in 1:cpu_g.Ny])
+    else
+        nx, ny = cpu_g.Nx, cpu_g.Ny
+        lons = [Float64(cpu_g.λᶜᶜᵃ[i, j]) for i in 1:nx, j in 1:ny]
+        lats = [Float64(cpu_g.φᶜᶜᵃ[i, j]) for i in 1:nx, j in 1:ny]
+        return (lons, lats)
+    end
+end
+
+"""
+    _regrid_curvilinear_2d(
+        src_lon::AbstractVector,
+        src_lat::AbstractVector,
+        src_data::AbstractMatrix,
+        target_lons::AbstractMatrix,
+        target_lats::AbstractMatrix
+    ) -> Matrix{Float64}
+
+Bilinear interpolation of gridded bathymetric elevation onto a 2D curvilinear coordinate
+mesh `(target_lons, target_lats)`.
+"""
+function _regrid_curvilinear_2d(
+    src_lon::AbstractVector,
+    src_lat::AbstractVector,
+    src_data::AbstractMatrix,
+    target_lons::AbstractMatrix,
+    target_lats::AbstractMatrix
+)
+    lons = Float64.(collect(src_lon))
+    lats = Float64.(collect(src_lat))
+    field = Array{Float64}(src_data)
+    if size(field) == (length(lats), length(lons))
+        field = permutedims(field, (2, 1))
+    end
+    if !issorted(lons)
+        p = sortperm(lons)
+        lons = lons[p]
+        field = field[p, :]
+    end
+    if !issorted(lats)
+        p = sortperm(lats)
+        lats = lats[p]
+        field = field[:, p]
+    end
+    itp = interpolate((lons, lats), field, Gridded(Linear()))
+    itp_flat = extrapolate(itp, Interpolations.Flat())
+
+    nx, ny = size(target_lons)
+    out = Matrix{Float64}(undef, nx, ny)
+    for j in 1:ny, i in 1:nx
+        out[i, j] = itp_flat(Float64(target_lons[i, j]), Float64(target_lats[i, j]))
+    end
+    return out
 end
 
 """
@@ -265,15 +492,18 @@ function _fit_bathymetry_to_grid(
     nx, ny, _ = size(grid)
     target_lons, target_lats = _grid_interior_centres(grid)
 
-    # Regridding 2D bilinear onto the target coordinates. The source axes are handled by
-    # `GeoData.regrid_2d_field`, which sorts them internally so a latitude axis stored
-    # south-to-north is mirrored rather than misread.
-    regridded_topo = regrid_2d_field(lon, lat, elevation, target_lons, target_lats)
+    regridded_topo = if target_lons isa AbstractVector && target_lats isa AbstractVector
+        regrid_2d_field(lon, lat, elevation, target_lons, target_lats)
+    else
+        _regrid_curvilinear_2d(lon, lat, elevation, target_lons, target_lats)
+    end
 
     if mask_bay_of_fundy
         n_masked = 0
         for j in 1:ny, i in 1:nx
-            if is_in_bay_of_fundy(target_lons[i], target_lats[j])
+            cell_lon = target_lons isa AbstractMatrix ? target_lons[i, j] : target_lons[i]
+            cell_lat = target_lats isa AbstractMatrix ? target_lats[i, j] : target_lats[j]
+            if is_in_bay_of_fundy(cell_lon, cell_lat)
                 regridded_topo[i, j] = 0.0
                 n_masked += 1
             end
@@ -294,7 +524,9 @@ function _fit_bathymetry_to_grid(
 
     if mask_bay_of_fundy
         for j in 1:ny, i in 1:nx
-            if is_in_bay_of_fundy(target_lons[i], target_lats[j])
+            cell_lon = target_lons isa AbstractMatrix ? target_lons[i, j] : target_lons[i]
+            cell_lat = target_lats isa AbstractMatrix ? target_lats[i, j] : target_lats[j]
+            if is_in_bay_of_fundy(cell_lon, cell_lat)
                 conditioned_topo[i, j] = 0.0
             end
         end
@@ -339,7 +571,7 @@ grid = build_immersed_grid_from_real_data(
 ```
 """
 function build_immersed_grid_from_real_data(
-    grid::LatitudeLongitudeGrid;
+    grid;
     source = nothing,
     tier = nothing,
     varname::AbstractString = "elevation",
@@ -351,12 +583,7 @@ function build_immersed_grid_from_real_data(
     kwargs...
 )
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-
-    # The domain comes from the grid: interior faces 1 : Nx+1, which is exactly the extent
-    # `build_shelf_grid` was asked for. It is requested as a box rather than as the cell
-    # centres so the source covers the cells it is about to be sampled onto.
-    lon_range = (Float64(base_g.λᶠᵃᵃ[1]), Float64(base_g.λᶠᵃᵃ[base_g.Nx + 1]))
-    lat_range = (Float64(base_g.φᵃᶠᵃ[1]), Float64(base_g.φᵃᶠᵃ[base_g.Ny + 1]))
+    lon_range, lat_range = grid_geographic_bounds(base_g)
 
     bathy_elevation, bathy_lon, bathy_lat = if !force && !isnothing(output_path) && (isfile(output_path) || isdir(output_path))
         ds = GeoData.geoload(output_path)
@@ -404,15 +631,6 @@ function extract_grid_coordinates(grid)
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
     cpu_g = architecture(base_g) isa GPU ? on_architecture(CPU(), base_g) : base_g
     nx, ny, nz = cpu_g.Nx, cpu_g.Ny, cpu_g.Nz
-
-    if !(cpu_g isa LatitudeLongitudeGrid)
-        error(
-            "extract_grid_coordinates requires a LatitudeLongitudeGrid (or an " *
-            "ImmersedBoundaryGrid wrapping one) to report geographic coordinates in " *
-            "degrees; received $(nameof(typeof(cpu_g))). Metric-distance grids must be " *
-            "converted to geographic coordinates before extraction."
-        )
-    end
 
     # Geographic horizontal coordinates (degrees), halo region stripped (interior indices 1:nx,
     # 1:ny). Through `_grid_interior_centres`, so the fit and the output fields cannot disagree

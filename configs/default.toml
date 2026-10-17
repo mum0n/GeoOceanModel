@@ -24,15 +24,15 @@ ny = 38                       # Meridional grid cell count
 nz = 8                        # Vertical layer count
 vertical_stretching_mode = "tanh" # "tanh", "oceananigans", or "uniform"
 nz_above = 0                  # Layers allocated to upper stratum (0 = auto 60%)
-vertical_break_depth = -400.0 # Depth separating refined shelf from deep basin (m)
+vertical_break_depth = 400.0  # Depth separating refined shelf from deep basin (m, positive)
 vertical_grid_file = ""       # Optional side-car CSV specifying vertical faces
 # Explicit vertical layer face depths starting at 0.0 (surface) to domain bottom
 depths = [0.0, 20.0, 50.0, 100.0, 150.0, 300.0, 600.0, 1000.0, 1500.0]
 
 [bathymetry]
 # Analytical and geometric shelf controls
-inshore_depth = -20.0         # Water depth at landward edge (m, negative)
-shelf_slope = 500.0           # Total seabed rise across the continental shelf (m)
+inshore_depth = 20.0          # Water depth at landward edge (m, positive downward)
+shelf_slope = 180.0           # Total seabed rise / relief across continental shelf (m)
 mask_bay_of_fundy = false     # Damp resonance in the Bay of Fundy if in domain
 
 [data]

@@ -1,11 +1,10 @@
 ### A Pluto.jl notebook ###
-
 # v1.0.4
 
 using Markdown
 using InteractiveUtils
 
-# This Pluto notebook uses @bind for interactivity.
+# This Pluto notebook uses @bind for interactivity. When running this notebook outside of Pluto, the following 'mock version' of @bind gives bound variables a default value (instead of an error).
 macro bind(def, element)
     #! format: off
     return quote
@@ -25,6 +24,24 @@ begin
     using Base64
 end
 
+
+# ╔═╡ c4e8b2a1-9f3d-4c6b-8e15-7d0a2b9f5c18
+
+# ╠═╡
+
+# Activating the package directory from inside the notebook means Pluto's own environment never
+
+# needs this package, and `using GeoOceanModel` sees the working tree. A Pluto save of this file
+
+# stores the activate call, so re-opening it reproduces the same environment.
+
+Pkg.activate(@__DIR__)
+
+# ╔═╡ 5e2f7d09-4a16-4b83-9c1d-8b3e6f0a1d27
+
+# ╠═╡
+
+using GeoOceanModel
 
 # ╔═╡ 2f9a1e77-5c34-4b8d-9a71-1c2f8b3e5a10
 
@@ -125,24 +142,6 @@ interval count move, without re-running the parts that have not changed.
 # configs resolve relative to wherever the notebook process started.
 
 cd(joinpath(@__DIR__, ".."))
-
-# ╔═╡ c4e8b2a1-9f3d-4c6b-8e15-7d0a2b9f5c18
-
-# ╠═╡
-
-# Activating the package directory from inside the notebook means Pluto's own environment never
-
-# needs this package, and `using GeoOceanModel` sees the working tree. A Pluto save of this file
-
-# stores the activate call, so re-opening it reproduces the same environment.
-
-Pkg.activate(@__DIR__)
-
-# ╔═╡ 5e2f7d09-4a16-4b83-9c1d-8b3e6f0a1d27
-
-# ╠═╡
-
-using GeoOceanModel
 
 # ╔═╡ c2d8f4a1-7b36-4e05-9c8a-1f6b0d3e7a24
 
@@ -510,11 +509,11 @@ extra software.
 
   driver of fetch size and of grid construction cost here.
 
-- `inshore_depth = -20.0` — the depth the landward edge is pinned to, so the shoreline is a wet
+- `inshore_depth = 20.0` — the depth the landward edge is pinned to (positive downward), so the shoreline is a wet
 
   cell rather than a cliff.
 
-- `shelf_slope = 500.0` — the slope scale the vertical filter smooths against.
+- `shelf_slope = 180.0` — the total relief / rise across the continental shelf (m).
 
 - `mask_bay_of_fundy = true` — hypertidal shallows set to solid land. That is a deliberate
 
@@ -576,29 +575,24 @@ println("wet cells: ", wet, " / ", length(bathy.elevation), "  (", round(100 * w
 
 md"""
 
-## The grid: three vertical segments in one column
+## The grid: rotated orthogonal curvilinear shelf grid
 
-`build_shelf_grid` (reached through `run_segment_grid`) places the cells: `nx × ny` horizontally
+`build_shelf_grid` (dispatched through `run_segment_grid`) constructs either a standard geographic spherical grid (`LatitudeLongitudeGrid`) or an orthogonal curvilinear grid (`RotatedLatitudeLongitudeGrid`) rotated to align with the continental margin.
 
-over `[domain] lon_min..lon_max`, `lat_min..lat_max`, and `nz` layers down the vertical faces.
+### Curvilinear alignment along the continental margin
 
-The segment prints a summary of what it resolved; the cell below re-reads it from the returned
+- **Intuitive Motivation (Generalists)**: The Scotian Shelf runs diagonally from southwest to northeast (roughly $50^\circ$ clockwise from North). A standard north-south grid simulating this region must include huge areas of deep open ocean in the south and dry mainland in the north that are not relevant to shelf biology. Rotating the coordinate frame parallel to the coastline turns this diagonal strip into a compact rectangular grid, covering the entire habitat corridor from Georges Bank to Cabot Strait with roughly 60% fewer horizontal cells ($14,300$ vs $36,000$).
+- **Mathematical Formulation (Specialists)**: An orthogonal curvilinear `RotatedLatitudeLongitudeGrid` is constructed by defining an Euler rotation pole $(\lambda_p, \phi_p)$ via [`compute_rotated_pole`](file:///c:/home/jae/projects/GeoOceanModel/src/data/grid_bathymetry.jl#L142). The local tangent unit vector $\hat{e}_\xi = \sin\theta\,\hat{e}_E + \cos\theta\,\hat{e}_N$ at azimuth $\theta = 50.0^\circ$ and cross-shelf normal $\hat{e}_\eta = \cos\theta\,\hat{e}_E - \sin\theta\,\hat{e}_N$ define the right-handed pole vector $\mathbf{P} = \hat{e}_\xi \times \hat{e}_\eta$. Centered at $(-63.0^\circ\text{E}, 44.0^\circ\text{N})$, the grid spans $L_\xi = 850.0\,\text{km}$ along-shelf and $L_\eta = 220.0\,\text{km}$ cross-shelf across $Nx = 220 \times Ny = 65$ cells.
+- **Momentum Advection**: Curvilinear metric variations require `VectorInvariant()` momentum advection to compute vorticity $\boldsymbol{\omega} = \nabla \times \boldsymbol{u}$ on cell vertices without Christoffel symbol singularities, while preserving fifth-order `WENO()` for active temperature and salinity tracers.
 
-grids so you can see the same numbers from the outside.
+### Vertical discretization & standardized depths
 
-The interesting decision is vertical, and it is not obvious from the numbers:
-- `depths` lists **13 faces** for `nz = 12` cells: `[0.0, 15.0, 35.0, 60.0, 90.0, 130.0, 180.0, 250.0, 350.0, 500.0, 800.0, 1100.0, 1500.0]`. The shallowest layer is 15 m (rather than 10 m), which increases the permissible advective time step under wind-driven vertical shear ($\Delta t \le \Delta z / |w|$) without compromising mixed-layer stratification.
-- An explicit depth list **takes precedence over** `vertical_stretching_mode`.
-- The faces cluster in the 0–400 m active layer and extend to 1500 m to encompass the continental slope and abyssal buffer, while maintaining effective barotropic stability ($H_{\text{max}} = 1500\,\text{m}$, bounding shallow-water phase speed $c = \sqrt{g H} \le 121\,\text{m/s}$).
-
-### Optimal spatio-temporal resolution for larval movement
-- **Time step & output interval**: Fast barotropic modes are subcycled within the split-explicit free-surface solver. The 3D baroclinic equations advance adaptively at $\Delta t = 30 - 60\,\text{s}$ ($\text{CFL} \le 0.25$). Snapshot storage is set to 1 hour (`output_schedule_seconds = 3600`), resolving semidiurnal tides ($M_2 \approx 12.4\,\text{h}$) and inertial oscillations ($T_f \approx 17.1\,\text{h}$) for off-line larval tracking in `GeoLarvalTracking`.
-- **Spatial grid**: The horizontal resolution of ~2.5 km ($345 \times 245$ cells) resolves the regional baroclinic Rossby radius of deformation ($R_d \approx 4 - 8\,\text{km}$). High-resolution bathymetric steering and subgrid turbulent dispersion ($K_h \approx 10\,\text{m}^2/\text{s}$) are evaluated in `GeoLarvalTracking`.
+- **Intuitive Depth Standardization (Generalists)**: Observers and field biologists describe water depth as a positive distance below the surface ($20\,\text{m}$ inshore, $200\,\text{m}$ at the shelf break). Ocean numerical models measure vertical coordinate $z$ as an elevation with negative numbers below the surface ($z = -20\,\text{m}$, $z = -200\,\text{m}$). Standardizing all user options to positive depths ($D \ge 0$) eliminates human sign mistakes, while the driver automatically handles the negative elevations under the hood.
+- **Physical Face Clustering (Specialists)**: The photic mixed layer and thermocline experience rapid wind-driven mixing and air-sea heat fluxes, while deeper waters evolve more gradually. The explicit face list `depths` spans 13 faces down to the shelf floor ($350\,\text{m}$): `[0.0, 15.0, 30.0, 48.0, 70.0, 95.0, 125.0, 160.0, 200.0, 240.0, 275.0, 310.0, 350.0]`. Setting the surface layer to 15 m satisfies the vertical shear Courant condition ($\Delta t \le \Delta z_{\min} / |w|$) under strong wind forcing, enabling larger stable timesteps while resolving the pycnocline.
+- **Parameter Definitions**: `vertical_break_depth = 200.0` (m, shelf-slope break), `inshore_depth = 20.0` (m, minimum landward water column floor preventing dried cliffs), `shelf_slope = 180.0` (m, shelf relief scale), and `max_save_depth = 400.0` (m, maximum depth subsampled for output storage).
 
 The sampling points that matter downstream are the grid's **interior cell centres**, not the face
-
 extent. Getting that window wrong is what once put the sea floor half a cell off; the driver
-
 resolves them through `_grid_interior_centres` so the interpolation and the immersion agree.
 
 ### `[domain]` and `[runtype]`
@@ -912,7 +906,7 @@ println("T        : ", extrema(ds.temperature))
 
 maximum(abs, ds.u)
 
-# ╔═╡ 6c57ba46-735f-4e67-9a78-f04853161be
+# ╔═╡ 6c57ba46-735f-4e67-9a78-f04853161be0
 
 # ╠═╡
 
@@ -934,7 +928,7 @@ Print one profile rather than a volume: a single column is where stratification 
 
 """
 
-# ╔═╡ 7d68cb57-846f-4e78-9b89-15964272c1f
+# ╔═╡ 7d68cb57-846f-4e78-9b89-015964272c1f
 
 import GeoOceanModel: compute_hydrodynamic_diagnostics
 
@@ -954,7 +948,7 @@ for k in eachindex(ds.depths)
 
 end
 
-# ╔═╡ 8e79dc68-9579-4a01-9b90-26a75383c2f
+# ╔═╡ 8e79dc68-9579-4a01-9b90-026a75383c2f
 
 # ╠═╡
 
@@ -1054,14 +1048,7 @@ setupOceanMap();
 # ╠═╡
 @bind selected_depth_idx PlutoUI.Slider(1:length(ds.depths), default = argmin(abs.(ds.depths)), show_value = false)
 
-# ╔═╡ b0000001-0001-0001-0001-000000000003
-# ╠═╡
-md"""
-### Horizontal Circulation & Stratification at Selected Depth
-Viewing depth level: **$(round(ds.depths[selected_depth_idx], digits=1)) m** (Surface layer: ~0 m, Deep CIL/slope: < -150 m)
-"""
-
-# ╔═╡ 9f80ed79-0a29-4b12-9c01-37b86493093
+# ╔═╡ 9f80ed79-0a29-4b12-9c01-037b86493093
 # ╠═╡
 begin
     using CairoMakie
@@ -1086,6 +1073,13 @@ begin
     
     fig
 end
+
+# ╔═╡ b0000001-0001-0001-0001-000000000003
+# ╠═╡
+md"""
+### Horizontal Circulation & Stratification at Selected Depth
+Viewing depth level: **$(round(ds.depths[selected_depth_idx], digits=1)) m** (Surface layer: ~0 m, Deep CIL/slope: < -150 m)
+"""
 
 # ╔═╡ b0000001-0001-0001-0001-000000000004
 # ╠═╡
@@ -1126,7 +1120,7 @@ begin
 end
 
 
-# ╔═╡ a091fe8a-13ab-4c23-9d12-48c97541084
+# ╔═╡ a091fe8a-13ab-4c23-9d12-048c97541084
 
 # ╠═╡
 
@@ -1167,42 +1161,42 @@ Knobs worth turning first, in the order they matter:
 """
 
 # ╔═╡ Cell order:
-# ╠═╡ 3d1a0c52-7b21-4f6e-9c2b-6f6f4a0a5d01 => 1
-# ╠═╡ 2f9a1e77-5c34-4b8d-9a71-1c2f8b3e5a10 => 2
-# ╠═╡ 1b3c9d84-6a52-4c0e-8f4b-2a7d5e9c0f33 => 3
-# ╠═╡ a0c1f6b3-2d84-4e79-9b0c-3f5d7a1e6c44 => 4
-# ╠═╡ c4e8b2a1-9f3d-4c6b-8e15-7d0a2b9f5c18 => 5
-# ╠═╡ 5e2f7d09-4a16-4b83-9c1d-8b3e6f0a1d27 => 6
-# ╠═╡ c2d8f4a1-7b36-4e05-9c8a-1f6b0d3e7a24 => 7
-# ╠═╡ e3f91b52-8c47-4c16-9d0b-2a7c1e4f8b35 => 8
-# ╠═╡ f4a02c63-9d58-4c27-9e1c-3b8d2f5a9c46 => 9
-# ╠═╡ a5b13d74-0e69-4c38-9f2d-4e9c3a6b0d57 => 10
-# ╠═╡ b6c24e85-1f7a-4d49-9f3e-5f0d4b7c1e68 => 11
-# ╠═╡ c7d35f96-2a8b-4c5a-9f4f-0b1e5c8d2f79 => 12
-# ╠═╡ 6b8a3c47-1d29-4f0e-8a56-9c4d2e7b0f31 => 13
-# ╠═╡ 7c9d4e58-2b3f-4a01-9d67-0e5b3f8c1a42 => 14
-# ╠═╡ 8d5e6f09-3c40-4b12-8e78-1f6c4a9d2b53 => 15
-# ╠═╡ 9e7f0a19-4d51-4c23-9f89-2a7d5b0e3c64 => 16
-# ╠═╡ af081b2a-5e62-4d34-9a90-3b8e6c1d4e75 => 17
-# ╠═╡ b129c03b-6f73-4e45-9b01-4c9f7d2e5f86 => 18
-# ╠═╡ c23d104c-7f84-4e56-9c12-5d0f8e3a6b97 => 19
-# ╠═╡ d34e215d-8a95-4f67-9d23-6e1f9f4b7c08 => 20
-# ╠═╡ e45f326e-9ba6-4f78-9d34-7f2a0b5c8d19 => 21
-# ╠═╡ f560437f-0cb7-4e89-9e45-8a3b1c6d9e2a => 22
-# ╠═╡ 06715480-1dc9-4a01-9b12-9a4e2f7b0c58 => 23
-# ╠═╡ 17826591-2e0a-4b12-9c23-ab5f308c1d69 => 24
-# ╠═╡ b0000001-0001-0001-0001-000000000006
-# ╠═╡ 28937602-3f1b-4c23-9d34-bc60419d2e7a => 25
-# ╠═╡ 39348713-402c-4d34-9e45-cd71520e3f8b => 26
-# ╠═╡ 4a359824-513d-4e45-9f56-de82631f4a9c => 27
-# ╠═╡ 5b46a935-624e-4f56-9a67-ef93742050ad => 28
-# ╠═╡ 6c57ba46-735f-4e67-9a78-f04853161be => 29
-# ╠═╡ 7d68cb57-846f-4e78-9b89-15964272c1f => 30
-# ╠═╡ 8e79dc68-9579-4a01-9b90-26a75383c2f => 31
-# ╠═╡ b0000001-0001-0001-0001-000000000001 => 32
-# ╠═╡ b0000001-0001-0001-0001-000000000002 => 33
-# ╠═╡ b0000001-0001-0001-0001-000000000003 => 34
-# ╠═╡ 9f80ed79-0a29-4b12-9c01-37b86493093 => 35
-# ╠═╡ b0000001-0001-0001-0001-000000000004 => 36
-# ╠═╡ b0000001-0001-0001-0001-000000000005 => 37
-# ╠═╡ a091fe8a-13ab-4c23-9d12-48c97541084 => 38
+# ╠═3d1a0c52-7b21-4f6e-9c2b-6f6f4a0a5d01
+# ╠═2f9a1e77-5c34-4b8d-9a71-1c2f8b3e5a10
+# ╠═1b3c9d84-6a52-4c0e-8f4b-2a7d5e9c0f33
+# ╠═a0c1f6b3-2d84-4e79-9b0c-3f5d7a1e6c44
+# ╠═c4e8b2a1-9f3d-4c6b-8e15-7d0a2b9f5c18
+# ╠═5e2f7d09-4a16-4b83-9c1d-8b3e6f0a1d27
+# ╠═c2d8f4a1-7b36-4e05-9c8a-1f6b0d3e7a24
+# ╠═e3f91b52-8c47-4c16-9d0b-2a7c1e4f8b35
+# ╠═f4a02c63-9d58-4c27-9e1c-3b8d2f5a9c46
+# ╠═a5b13d74-0e69-4c38-9f2d-4e9c3a6b0d57
+# ╠═b6c24e85-1f7a-4d49-9f3e-5f0d4b7c1e68
+# ╠═c7d35f96-2a8b-4c5a-9f4f-0b1e5c8d2f79
+# ╠═6b8a3c47-1d29-4f0e-8a56-9c4d2e7b0f31
+# ╠═7c9d4e58-2b3f-4a01-9d67-0e5b3f8c1a42
+# ╠═8d5e6f09-3c40-4b12-8e78-1f6c4a9d2b53
+# ╠═9e7f0a19-4d51-4c23-9f89-2a7d5b0e3c64
+# ╠═af081b2a-5e62-4d34-9a90-3b8e6c1d4e75
+# ╠═b129c03b-6f73-4e45-9b01-4c9f7d2e5f86
+# ╠═c23d104c-7f84-4e56-9c12-5d0f8e3a6b97
+# ╠═d34e215d-8a95-4f67-9d23-6e1f9f4b7c08
+# ╠═e45f326e-9ba6-4f78-9d34-7f2a0b5c8d19
+# ╠═f560437f-0cb7-4e89-9e45-8a3b1c6d9e2a
+# ╠═06715480-1dc9-4a01-9b12-9a4e2f7b0c58
+# ╠═17826591-2e0a-4b12-9c23-ab5f308c1d69
+# ╠═b0000001-0001-0001-0001-000000000006
+# ╠═28937602-3f1b-4c23-9d34-bc60419d2e7a
+# ╠═39348713-402c-4d34-9e45-cd71520e3f8b
+# ╠═4a359824-513d-4e45-9f56-de82631f4a9c
+# ╠═5b46a935-624e-4f56-9a67-ef93742050ad
+# ╠═6c57ba46-735f-4e67-9a78-f04853161be0
+# ╠═7d68cb57-846f-4e78-9b89-015964272c1f
+# ╠═8e79dc68-9579-4a01-9b90-026a75383c2f
+# ╠═b0000001-0001-0001-0001-000000000001
+# ╠═b0000001-0001-0001-0001-000000000002
+# ╠═b0000001-0001-0001-0001-000000000003
+# ╠═9f80ed79-0a29-4b12-9c01-037b86493093
+# ╠═b0000001-0001-0001-0001-000000000004
+# ╠═b0000001-0001-0001-0001-000000000005
+# ╠═a091fe8a-13ab-4c23-9d12-048c97541084

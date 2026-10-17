@@ -1,0 +1,113 @@
+# =============================================================================
+# GeoOceanModel - Eastern Scotian Shelf (ESS) Production Hydrodynamic Configuration
+# =============================================================================
+# High-resolution hydrodynamic configuration for the Eastern Scotian Shelf,
+# covering CFA 23, CFA 24, Banquereau, Sable Island Bank, and Laurentian Channel.
+#
+#   julia --project=. GeoOceanModelRun.jl --config=configs/eastern_scotian_shelf.toml --all
+# =============================================================================
+
+[domain]
+lon_min = -63.5               # Western boundary longitude (°E, Halifax transect)
+lon_max = -56.5               # Eastern boundary longitude (°E, Laurentian Channel)
+lat_min = 43.0                # Southern boundary latitude (°N, shelf break)
+lat_max = 47.5                # Northern boundary latitude (°N, Cape Breton / Cabot Strait)
+z_min = -450.0                # Maximum bathymetric depth (m)
+z_max = 0.0                   # Free surface elevation (m)
+buffer_km = 40.0              # Boundary buffer margin in kilometres
+
+[grid]
+nx = 140                      # Zonal grid cell count (~5.5 km resolution)
+ny = 100                      # Meridional grid cell count (~5.0 km resolution)
+nz = 12                       # Vertical layer count
+vertical_stretching_mode = "oceananigans"
+nz_above = 0
+vertical_break_depth = 400.0
+vertical_grid_file = ""
+depths = [0.0, 15.0, 35.0, 60.0, 90.0, 130.0, 180.0, 230.0, 280.0, 330.0, 380.0, 420.0, 450.0]
+
+[bathymetry]
+inshore_depth = 20.0
+shelf_slope = 180.0
+mask_bay_of_fundy = false     # Bay of Fundy is west of this domain
+
+[data]
+bathy_source = "nwa_bathymetry"
+coastline_source = "natural_earth_10m"
+wind_source = "open_meteo"
+wind_time_iso = "2020-06-01T00:00:00Z"
+hydrography_source = "glorys12v1"
+hydrography_month = 0
+
+[atmosphere]
+source = "open_meteo"
+bulk_heat_flux = true
+
+[boundaries]
+method = "relaxation"
+obc_type = "flather_chapman"
+ocean_boundary_source = "glorys12v1"
+sponge_layer_width = 0.35
+sponge_timescale_seconds = 3600.0
+active_boundaries = ["east"]
+u_inflow = -0.12              # Southwestward Nova Scotia / Labrador Current
+v_inflow = 0.0
+
+[tides]
+enable_tides = false
+tides_source = "tpxo9_atlas"
+tidal_constituents = ["M2", "S2"]
+tidal_u_amp = 0.15
+tidal_v_amp = 0.08
+s2_u_amp = 0.06
+s2_v_amp = 0.03
+
+[climate]
+scenario = "climatology"
+projection_year = 2022
+
+[hydrodynamics]
+sim_duration_hours = 720.0    # 30-day simulation
+sim_dt_seconds = 15.0
+min_dt_seconds = 1.0
+max_dt_seconds = 25.0
+adaptive_cfl = true
+target_cfl = 0.12
+target_wave_cfl = 0.12
+surface_heat_flux = 50.0
+sst_damping_coefficient = 40.0
+max_current_speed = 3.0
+max_flow_snapshots = 400
+spinup_hours = 24.0
+allow_analytical_fallback = false
+hydro_model_file = ""
+reuse_hydro = false
+
+[storage]
+output_dir = "../lakehouse/GeoOceanModel/eastern_scotian_shelf"
+output_schedule_seconds = 21600.0
+max_save_depth = 400.0
+enable_zarr = true
+zarr_path = "outputs/ocean_hydrodynamics.zarr"
+storage_backend = "zarr"
+enable_checkpoint = true
+checkpoint_dir = "../lakehouse/GeoOceanModel/eastern_scotian_shelf/checkpoints"
+checkpoint_prefix = "ess_checkpoint"
+checkpoint_schedule_seconds = 3600.0
+checkpoint_cleanup = true
+run_id = ""
+
+[visualization]
+interactive_map = true
+animate_hydro = false
+anim_variable = "dashboard"
+anim_fps = 10
+anim_format = "mp4"
+anim_depth = -2.5
+anim_overlay_particles = false
+anim_output_path = ""
+
+[runtype]
+use_gpu = true
+fallback_to_cpu = false
+seed = 42

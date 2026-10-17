@@ -1,80 +1,138 @@
 # GeoOceanModel
 
-A regional ocean model that takes a configuration through to a realized hydrodynamic
-simulation, and writes that simulation into the GeoData layer as a Zarr store. Its output is a
-self-contained GeoData directory: another tool can read it without this package being loaded.
+A regional ocean hydrodynamic model that transforms geospatial environmental configurations into realized three-dimensional ocean circulation fields, persisting results directly into the GeoData layer as self-contained Zarr stores.
 
-## What it does
+## Architectural Overview
 
-`GeoOceanModelRun.jl` drives segments (`src/driver.jl`, library code so `Pkg.test` can reach
-it): **data → grid → model → climate → simulation**. Data, bathymetry, coastline, winds and
-hydrography are all obtained through the [`GeoDataSources`](../GeoDataSources/README.md)
-abstraction (see its [central store](../GeoDataSources/STORAGE.md)); the simulation itself is
-built on NumericalEarth and the realized output is written straight into the GeoData layer.
+`GeoOceanModelRun.jl` orchestrates modular execution segments implemented in [`src/driver.jl`](file:///c:/home/jae/projects/GeoOceanModel/src/driver.jl):
+
+- **Data Ingestion (`--data`)**: Assimilates high-resolution bathymetric soundings, coastline polygons, surface winds, and open-boundary hydrography via [`GeoDataSources`](file:///c:/home/jae/projects/GeoDataSources/README.md).
+- **Grid & Immersed Boundary (`--grid`)**: Constructs spherical latitude-longitude or rotated orthogonal curvilinear grids on CPU or GPU (CUDA), fitting real seafloor topography as immersed boundaries.
+- **Hydrodynamic Model (`--model`)**: Assembles hydrostatic free-surface primitive equation models with TEOS-10 equation of state, Coriolis accelerations, tidal body forcing, atmospheric fluxes, and open boundary sponge relaxation.
+- **Climate Perturbation (`--climate`)**: Optional thermal stratification adjustment representing projected marine heatwaves.
+- **Numerical Simulation (`--sim`)**: Advances baroclinic and barotropic modes adaptively, logging Courant numbers and streaming flow snapshots to Zarr.
 
 ## Running
 
-```
+```bash
 julia --project=. GeoOceanModelRun.jl --all                       # configs/default.toml
 julia --project=. GeoOceanModelRun.jl --all --config=scotian_shelf
+julia --project=. GeoOceanModelRun.jl --grid --config=scotian_shelf
 ```
 
-`--all` runs **data → simulation** without the climate perturbation, which runs only when
-`--climate` is named. `--data`, `--grid`, `--model`, `--climate`, `--sim` run a later segment
-after the ones it needs.
+Segment flags (`--data`, `--grid`, `--model`, `--climate`, `--sim`, `--all`) execute a designated stage and its prerequisites.
 
-## Configurations
+## Grid Architecture & Coordinate Systems
 
-Two, consolidated in `configs/` (the schema sections are the ocean's own):
+Computational grids are constructed via [`build_shelf_grid`](file:///c:/home/jae/projects/GeoOceanModel/src/data/grid_bathymetry.jl#L22), supporting two coordinate topologies:
 
-| config | purpose |
-|---|---|
-| `default.toml` | Cape Breton **demonstration**: small box, low resolution, 3 days, keyless data (etopo2022 bathymetry, woa23, open_meteo winds, synthetic edges). |
-| `scotian_shelf.toml` | Snow Crab **production** domain: nwa bathymetry, GLORYS12V1 boundary + hydrography (Copernicus Marine account), the higher-resolution grid. |
+- **Standard Geographic Grid (`orientation = "standard"`)**:
+  - *Conceptual Overview*: A conventional rectangular box aligned north-south and east-west along lines of latitude and longitude. Ideal for localized domains (e.g. Cape Breton demonstration) where the coast is relatively straight or aligned with cardinal directions.
+  - *Technical Formulation*: Regular spherical `LatitudeLongitudeGrid` bounded by `[domain]` limits `lon_min`, `lon_max`, `lat_min`, `lat_max`.
 
-- **`[runtype]`** (merged from the former `[hardware]` + `[paths]`) holds `use_gpu`,
-  `fallback_to_cpu`, `seed`, `auto_restart`, and the `buffer_km` seeding margin.
-- **`[storage] output_path`** is the run's **output directory**, written into the lakehouse
-  (`lakehouse_dir("GeoOceanModel", ...)`).
-- No `--config` ⇒ `configs/default.toml`.
+- **Rotated Orthogonal Curvilinear Grid (`orientation = "rotated"`)**:
+  - *Conceptual Overview*: The Atlantic Canadian continental margin runs diagonally from southwest to northeast (roughly $50^\circ$ clockwise from North). A standard north-south box simulating this region must include vast areas of deep abyssal ocean to the south and dry mainland Canada to the north, wasting substantial computing power. By rotating the computational coordinate frame parallel to the coastline and shelf edge, the simulation aligns with the natural geography, covering the entire habitat corridor from Georges Bank to Cabot Strait with roughly 60% fewer horizontal grid cells.
+  - *Technical Formulation*: Orthogonal curvilinear `RotatedLatitudeLongitudeGrid` constructed on an unrotated sphere whose North Pole has been repositioned so that the equator aligns with the target shelf strike azimuth $\theta = 50.0^\circ$. Centered at $(\lambda_0, \phi_0) = (-63.0^\circ\text{E}, 44.0^\circ\text{N})$ with along-shelf extent $L_\xi = 850.0\,\text{km}$ and cross-shelf extent $L_\eta = 220.0\,\text{km}$, discretized into $Nx = 220 \times Ny = 65 = 14,300$ horizontal cells (versus $240 \times 150 = 36,000$ cells for an unrotated bounding box).
+
+### Euler Pole Derivation (Specialist Details)
+
+For rotated grids, the geographic coordinates of the rotated North Pole $(\lambda_p, \phi_p)$ are derived in [`compute_rotated_pole`](file:///c:/home/jae/projects/GeoOceanModel/src/data/grid_bathymetry.jl#L142).
+
+Let $(\lambda_0, \phi_0)$ be the domain center in spherical coordinates and $\theta$ be the shelf strike azimuth measured clockwise from true North. The orthonormal local geographic tangent unit vectors are:
+
+$$\hat{e}_E = [-\sin\lambda_0, \cos\lambda_0, 0]^T, \quad \hat{e}_N = [-\sin\phi_0\cos\lambda_0, -\sin\phi_0\sin\lambda_0, \cos\phi_0]^T$$
+
+The along-shelf tangent vector directed toward azimuth $\theta$ is:
+
+$$\hat{e}_\xi = \sin\theta\,\hat{e}_E + \cos\theta\,\hat{e}_N$$
+
+The orthogonal cross-shelf normal vector directed into the open ocean is:
+
+$$\hat{e}_\eta = \cos\theta\,\hat{e}_E - \sin\theta\,\hat{e}_N$$
+
+The Euler rotation pole vector $\mathbf{P} = [P_x, P_y, P_z]^T$ defining the axis of the rotated sphere is the right-handed unit normal $\mathbf{P} = \hat{e}_\xi \times \hat{e}_\eta$, yielding:
+
+$$\lambda_p = \operatorname{atan2}(P_y, P_x), \quad \phi_p = \operatorname{asin}(P_z)$$
+
+Given mean Earth radius $R = 6,371\,\text{km}$, the unrotated angular coordinate half-widths $(\Delta \lambda', \Delta \phi')$ centered on the rotated equator ($\phi' = 0$) are:
+
+$$\Delta \lambda' = \frac{L_\xi}{2 R}, \quad \Delta \phi' = \frac{L_\eta}{2 R}$$
+
+### Advection Formulations
+
+- *Conceptual Overview*: When grid lines follow curved paths rather than straight meridians, fluid moving across the grid experiences geometric coordinate curvature. The numerical equations must account for this curvature so that ocean currents do not artificially gain or lose energy.
+- *Technical Formulation*: The Oceananigans hydrostatic free-surface solver requires `VectorInvariant()` momentum advection on curvilinear grids. This formulation discretizes the advection term as $\boldsymbol{u} \cdot \nabla \boldsymbol{u} = \boldsymbol{\omega} \times \boldsymbol{u} + \frac{1}{2}\nabla|\boldsymbol{u}|^2$, computing relative vorticity $\boldsymbol{\omega} = \nabla \times \boldsymbol{u}$ directly on cell vertices without Christoffel symbol singularities. The model automatically switches momentum advection to `VectorInvariant()` on `OrthogonalSphericalShellGrid` instances, while preserving fifth-order `WENO()` advection for active temperature and salinity tracers.
+
+## Vertical Discretization & Standardized Depth Conventions
+
+### Intuitive Overview (Generalists)
+
+In oceanography and coastal management, water depth is universally described as a positive distance below the surface (e.g. "a water depth of 20 meters", "a shelf break at 200 meters"). Conversely, physical ocean models use a vertical coordinate axis $z$ where $z = 0$ is the sea surface and underwater positions are negative elevations ($z = -20\,\text{m}$, $z = -200\,\text{m}$).
+
+Past configurations mixed positive and negative numbers (e.g. `inshore_depth = -20.0`, but `shelf_slope = 500.0` and `max_save_depth = 400.0`), creating human error and confusion. To eliminate this ambiguity:
+- All user-facing configuration options represent physical depths as positive quantities ($D \ge 0$).
+- The model converts these depths to negative vertical elevations ($z = -D$) internally.
+- Existing legacy configuration files with negative values are automatically and seamlessly converted via absolute value normalization, preventing crashes.
+
+### Technical Parameter Glossary (Specialists)
+
+- **`depths`**: Monotonically increasing vector of positive vertical face depths in meters starting at $0.0\,\text{m}$ (surface) to domain floor $z_{\min}$ (e.g. $[0.0, 15.0, 30.0, \dots, 350.0]\,\text{m}$). Explicit depths bypass analytical stretching functions. Face thicknesses $\Delta z$ are clustered in the photic mixed layer ($\Delta z = 15\,\text{m}$) and expand toward the seabed ($\Delta z = 40\,\text{m}$), satisfying both the vertical shear Courant condition $\Delta t \le \Delta z_{\min} / |w|$ and thermocline resolution.
+- **`vertical_break_depth`**: Positive depth in meters ($200.0\,\text{m}$ for Scotian Shelf, $400.0\,\text{m}$ default) identifying the physical shelf-slope break where the continental terrace terminates and plunges into the continental slope. In `two_segment` stretching, this splits the column into a refined upper stratum and coarse deep stratum.
+- **`inshore_depth`**: Positive water depth in meters ($20.0\,\text{m}$) pinning the landward boundary. Enforces a non-zero water column floor ($H \ge 20\,\text{m}$) to prevent dry cliff singularities and unphysical shoreline velocity shears.
+- **`shelf_slope`**: Total seabed relief scale across the continental shelf in meters ($D_{\text{break}} - D_{\text{inshore}} = 200.0 - 20.0 = 180.0\,\text{m}$).
+- **`max_save_depth`**: Maximum positive depth in meters ($400.0\,\text{m}$) subsampled for Zarr storage. Eliminates deep inactive abyssal layers from disk output while retaining complete epipelagic and mesopelagic larval habitat fields.
+
+### Defensive Backward Compatibility
+
+In [`src/config/conversion.jl`](file:///c:/home/jae/projects/GeoOceanModel/src/config/conversion.jl) and [`HydrodynamicOptions`](file:///c:/home/jae/projects/GeoOceanModel/src/config/options.jl#L110), depth inputs are normalized defensively via `abs(Float64(...))`. In [`src/driver.jl`](file:///c:/home/jae/projects/GeoOceanModel/src/driver.jl#L408), the vertical break elevation evaluates $z_{\text{break}} = -\operatorname{abs}(D_{\text{break}})$, ensuring consistent execution regardless of input sign convention.
+
+## Topography & Immersed Boundaries
+
+Seafloor topography is ingested from high-resolution bathymetric soundings and mapped to the computational grid via [`build_immersed_grid_from_real_data`](file:///c:/home/jae/projects/GeoOceanModel/src/data/grid_bathymetry.jl#L484):
+
+- **Curvilinear 2D Bilinear Regridding**: For rotated grids, cell centers $(\lambda_{i,j}, \phi_{i,j})$ form an unstructured non-Cartesian coordinate matrix. Topography is interpolated using optimized 2D bilinear interpolation (`_regrid_curvilinear_2d`) evaluated on CPU before GPU array transfer, eliminating host-device scalar indexing stalls.
+- **Topographic Smoothing & Floors**: Bathymetry is clamped by minimum water depth $H_{\min} = \text{inshore\_depth}$ ($20.0\,\text{m}$) and maximum depth $H_{\max}$ ($1,500\,\text{m}$ or domain depth). Bounding maximum depth constrains the maximum barotropic gravity wave speed $c = \sqrt{g H_{\max}} \le 121\,\text{m/s}$, ensuring stable split-explicit free-surface subcycling.
+- **Hypertidal Masking**: Optional masking of the upper Bay of Fundy (`mask_bay_of_fundy = true`) sets hypertidal shallows to solid land, dampening non-linear tidal resonance and spurious vertical velocity spikes ($> 1\,\text{m/s}$) outside snow crab habitat.
+
+## Configuration Profiles
+
+Configuration files are consolidated in [`configs/`](file:///c:/home/jae/projects/GeoOceanModel/configs):
+
+| Configuration | Grid Type | Resolution / Size | Primary Data Sources | Purpose |
+|---|---|---|---|---|
+| [`scotian_shelf.toml`](file:///c:/home/jae/projects/GeoOceanModel/configs/scotian_shelf.toml) | Rotated ($50^\circ$) | $220 \times 65 \times 12$ ($350\,\text{m}$ floor) | NWA soundings, GLORYS12V1, ERA5 | Snow Crab production run along the Scotian Shelf margin |
+| [`default.toml`](file:///c:/home/jae/projects/GeoOceanModel/configs/default.toml) | Standard | $50 \times 50 \times 8$ ($1500\,\text{m}$ floor) | ETOPO2022, WOA23, Open-Meteo | Lightweight keyless Cape Breton demonstration |
+| [`eastern_scotian_shelf.toml`](file:///c:/home/jae/projects/GeoOceanModel/configs/eastern_scotian_shelf.toml) | Standard | $140 \times 100 \times 12$ | NWA soundings, GLORYS12V1, ERA5 | High-resolution regional Eastern Scotian Shelf domain |
+| [`western_scotian_shelf.toml`](file:///c:/home/jae/projects/GeoOceanModel/configs/western_scotian_shelf.toml) | Standard | $100 \times 70 \times 9$ | NWA soundings, GLORYS12V1, ERA5 | Regional Western Scotian Shelf / Browns Bank domain |
 
 ### Shared Lakehouse Configuration
 
-`GeoOceanModel` reads assimilated central products from `lakehouse/GeoData/` and writes run
-archives into `lakehouse/GeoOceanModel/`. The central lakehouse root is determined by
-`GeoData.lakehouse_dir()` using the following precedence:
-* `ENV["GEOCEAN_STORE_ROOT"]` or `ENV["GEODATA_LAKEHOUSE"]`.
-* `LocalPreferences.toml` (`[GeoData] lakehouse_dir`).
-* `~/.geodata/storage.toml` (`[storage] store_root`).
-* Proximity fallback (`projects/lakehouse/GeoOceanModel`).
+`GeoOceanModel` reads central data products from `lakehouse/GeoData/` and archives simulation stores to `lakehouse/GeoOceanModel/`. The central root is resolved via `GeoData.lakehouse_dir()` in order of precedence:
+- Environment variables: `GEOCEAN_STORE_ROOT` or `GEODATA_LAKEHOUSE`.
+- Local project configuration: `LocalPreferences.toml` (`[GeoData] lakehouse_dir`).
+- User configuration: `~/.geodata/storage.toml` (`[storage] store_root`).
+- Proximity fallback: Relative path `../lakehouse/GeoOceanModel`.
 
-To configure the lakehouse persistently:
+Persistent lakehouse path configuration:
 ```julia
 using GeoData
 GeoData.set_lakehouse_dir!("/path/to/shared/lakehouse")
 ```
 
-## Output
+## Output & Data Handover
 
-The run writes a `hydrodynamics.zarr` store (fields `u,v,w,T` per output interval, with the
-grid's interior cell centres carried in the store's `.zattrs`/`time.json`), plus a JLD2 restart
-checkpoint that state can resume from. Resume/reuse decisions read the **store's** own
-`time.json`, not the checkpoint.
+Simulations produce a directory-based Zarr archive `hydrodynamics.zarr`:
+- **Variables**: Three-dimensional prognostic fields $u, v, w, T, S$ at each output cadence interval (`output_schedule_seconds`).
+- **Coordinate Attributes**: Stored in root metadata (`.zattrs`) and `time.json`, capturing 2D curvilinear cell centres $(\lambda_{i,j}, \phi_{i,j})$ or 1D coordinates, alongside vertical layer centres and timestamps.
+- **State Checkpoints**: Oceananigans JLD2 state checkpoints enable seamless auto-restart from intermediate timesteps.
 
-The store is the output identity: it is a directory with nothing beside it, so a consumer that
-has the path has the result. `notebooks/` shows how it is produced and read back.
+## Interactive Notebooks
 
-## Notebooks
+Pluto interactive documentation and inspection notebooks are located in [`notebooks/`](file:///c:/home/jae/projects/GeoOceanModel/notebooks):
+- [`notebooks/scotian_shelf.jl`](file:///c:/home/jae/projects/GeoOceanModel/notebooks/scotian_shelf.jl): Rotated curvilinear production domain, bathymetric filtering, and full hydrodynamics.
+- [`notebooks/default.jl`](file:///c:/home/jae/projects/GeoOceanModel/notebooks/default.jl): Keyless demonstration domain.
 
-- [`notebooks/scotian_shelf.jl`](notebooks/scotian_shelf.jl) — the production configuration.
-- [`notebooks/default.jl`](notebooks/default.jl) — the keyless demonstration.
-
-See [`notebooks/README.md`](notebooks/README.md) for how to run them.
-
-## Notes / known gaps
-
-- `SimulationResult` (`src/model/simulation_result.jl`, `write_simulation_result`) is
-  complete and tested but **not yet written by a run**; the live output is the store.
-- The larval tracking segments `run_segment_tracking`/`metrics`/`visualize` are stubs in
-  `run_production_pipeline` that name `GeoLarvalTracking` as their owner — the coupling is at
-  the call site, not in this package.
+Run notebooks via:
+```bash
+julia --project=. -e "using Pluto; Pluto.run()"
+```

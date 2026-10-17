@@ -41,6 +41,10 @@ const AVAILABLE_SEGMENTS = Dict{Symbol, @NamedTuple{file::String, desc::String}}
     :animation => (
         file = "test_animation.jl",
         desc = "Animation Diagnostics, Staggered Speed & Depth Invariants"
+    ),
+    :mosaic => (
+        file = "test_mosaic.jl",
+        desc = "Multi-Domain Stitching & Mosaic Blending"
     )
 )
 

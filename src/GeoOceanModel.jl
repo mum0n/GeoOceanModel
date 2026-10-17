@@ -35,6 +35,7 @@ using
     NumericalEarth,
     Distributions,
     GeoData,
+    GeoDataSources,
     OffsetArrays,
     Zarr
 
@@ -71,4 +72,7 @@ include("data/geodata/geodata_integration.jl")
 # bodies reach for is already defined; it adds the run driver the CLI dispatches to.
 include("driver.jl")
 include("assimilation.jl")
+
+export stitch_shelf_domains
+
 end # module

@@ -159,8 +159,8 @@ function get_default_configuration()::Dict{String, Any}
         "bathymetry" => Dict{String, Any}(
             "source" => "numerical_earth",
             "resolution_arcsec" => 15,
-            "inshore_depth" => -20.0,
-            "shelf_slope" => 500.0
+            "inshore_depth" => 20.0,
+            "shelf_slope" => 180.0
         ),
         "boundaries" => Dict{String, Any}(
             "method" => "relaxation",

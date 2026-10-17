@@ -413,3 +413,144 @@ function record_run_metadata!(ds::GeoDataset, model)
     ds.attrs["created_utc"] = string(Dates.now(Dates.UTC))
     return nothing
 end
+
+"""
+    stitch_shelf_domains(
+        tile_west_path::AbstractString,
+        tile_east_path::AbstractString;
+        output_path::AbstractString,
+        blend_lon_range::Tuple{Real, Real} = (-63.5, -63.0)
+    ) -> String
+
+Stitch two complementary regional hydrodynamic Zarr stores into a unified,
+spatially continuous domain mosaic covering the entire Scotian Shelf.
+
+# Mathematical Formulation
+Across the zonal transition zone ``\\lambda \\in [\\lambda_1, \\lambda_2]``,
+mosaic fields ``\\psi_{\\text{mosaic}}(\\lambda, \\varphi, z, t)`` are linearly
+blended using a partition of unity:
+```math
+w(\\lambda) = \\frac{\\lambda - \\lambda_1}{\\lambda_2 - \\lambda_1}
+```
+```math
+\\psi_{\\text{mosaic}}(\\lambda, \\varphi, z, t) = (1 - w(\\lambda)) \\psi_{\\text{west}}(\\lambda, \\varphi, z, t) + w(\\lambda) \\psi_{\\text{east}}(\\lambda, \\varphi, z, t)
+```
+For ``\\lambda < \\lambda_1``, ``\\psi = \\psi_{\\text{west}}``; for ``\\lambda > \\lambda_2``, ``\\psi = \\psi_{\\text{east}}``.
+This eliminates artificial shear discontinuities across sub-domain seams and
+preserves mass conservation across the shelf mosaic.
+
+# Inputs
+- `tile_west_path`: Absolute path to Western Scotian Shelf Zarr store.
+- `tile_east_path`: Absolute path to Eastern Scotian Shelf Zarr store.
+- `output_path`: Absolute destination path for the unified Zarr mosaic.
+- `blend_lon_range`: Longitudinal interval ``(\\lambda_1, \\lambda_2)`` in degrees East.
+
+# Outputs
+- `output_path`: Path to the generated mosaic Zarr store.
+"""
+function stitch_shelf_domains(
+    tile_west_path::AbstractString,
+    tile_east_path::AbstractString;
+    output_path::AbstractString,
+    blend_lon_range::Tuple{Real, Real} = (-63.5, -63.0)
+)
+    isdir(tile_west_path) || error("Western tile store not found: $(tile_west_path)")
+    isdir(tile_east_path) || error("Eastern tile store not found: $(tile_east_path)")
+
+    ds_w = GeoData.geoload(tile_west_path; backend = :zarr)
+    ds_e = GeoData.geoload(tile_east_path; backend = :zarr)
+
+    # Resolve coordinates
+    lon_w = Float64.(ds_w.coords[:lon].data)
+    lat_w = Float64.(ds_w.coords[:lat].data)
+    z_w   = Float64.(ds_w.coords[:depth].data)
+    t_w   = Float64.(ds_w.coords[:time].data)
+
+    lon_e = Float64.(ds_e.coords[:lon].data)
+    lat_e = Float64.(ds_e.coords[:lat].data)
+    z_e   = Float64.(ds_e.coords[:depth].data)
+    t_e   = Float64.(ds_e.coords[:time].data)
+
+    # Harmonise spatial coordinates
+    λ1, λ2 = Float64(blend_lon_range[1]), Float64(blend_lon_range[2])
+    lon_west_sub = filter(x -> x < λ1, lon_w)
+    lon_east_sub = filter(x -> x > λ2, lon_e)
+    lon_overlap = filter(x -> λ1 <= x <= λ2, lon_e)
+    lon_mosaic = sort(unique(vcat(lon_west_sub, lon_overlap, lon_east_sub)))
+
+    lat_mosaic = sort(unique(vcat(lat_w, lat_e)))
+    z_mosaic = sort(unique(vcat(z_w, z_e)))
+    t_common = intersect(t_w, t_e)
+    isempty(t_common) && (t_common = t_w)
+
+    field_names = collect(intersect(keys(ds_w.variables), keys(ds_e.variables)))
+    println("Stitching domains into mosaic: $(length(lon_mosaic))×$(length(lat_mosaic))×$(length(z_mosaic)) grid...")
+
+    ax = (x = lon_mosaic, y = lat_mosaic, z = z_mosaic)
+    nt = length(t_common)
+
+    rm(output_path, recursive = true, force = true)
+    mkpath(dirname(output_path))
+
+    ds_mosaic = _build_store_dataset(output_path, ax, field_names, nt, nothing)
+
+    g = Zarr.zopen(output_path, "w")
+    t_arr = g.arrays["time"]
+    for (m, t_val) in enumerate(t_common)
+        t_arr[m] = t_val
+    end
+
+    for var_name in field_names
+        vw = ds_w.variables[var_name].data
+        ve = ds_e.variables[var_name].data
+        out_var = ds_mosaic.variables[var_name].data
+
+        for (m, t_val) in enumerate(t_common)
+            idx_w = findfirst(==(t_val), t_w)
+            idx_e = findfirst(==(t_val), t_e)
+
+            slice_w = !isnothing(idx_w) ? vw[:, :, :, idx_w] : vw[:, :, :, 1]
+            slice_e = !isnothing(idx_e) ? ve[:, :, :, idx_e] : ve[:, :, :, 1]
+
+            for (i, lon) in enumerate(lon_mosaic)
+                w_blend = if lon <= λ1
+                    0.0
+                elseif lon >= λ2
+                    1.0
+                else
+                    (lon - λ1) / (λ2 - λ1)
+                end
+
+                iw = argmin(abs.(lon_w .- lon))
+                ie = argmin(abs.(lon_e .- lon))
+
+                for (j, lat) in enumerate(lat_mosaic)
+                    jw = argmin(abs.(lat_w .- lat))
+                    je = argmin(abs.(lat_e .- lat))
+
+                    for (k, z) in enumerate(z_mosaic)
+                        kw = argmin(abs.(z_w .- z))
+                        ke = argmin(abs.(z_e .- z))
+
+                        val_w = Float32(slice_w[iw, jw, kw])
+                        val_e = Float32(slice_e[ie, je, ke])
+
+                        out_var[i, j, k, m] = if isnan(val_w) && !isnan(val_e)
+                            val_e
+                        elseif isnan(val_e) && !isnan(val_w)
+                            val_w
+                        elseif isnan(val_w) && isnan(val_e)
+                            Float32(NaN)
+                        else
+                            Float32((1.0 - w_blend) * val_w + w_blend * val_e)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    println("Stitched shelf mosaic written successfully to $(output_path).")
+    return output_path
+end
+

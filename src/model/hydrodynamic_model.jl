@@ -7,6 +7,7 @@ in Oceananigans.jl for coastal shelf domains.
 
 using Oceananigans
 using Oceananigans.Units
+using Oceananigans.OrthogonalSphericalShellGrids: OrthogonalSphericalShellGrid
 # `ContinuousForcing` lives in `Oceananigans.Forcings`, which Oceananigans `using`s
 # internally but does not re-export at top level. `ZeroForcing` is defined locally below,
 # so it is deliberately not imported here.
@@ -79,8 +80,8 @@ function build_hydrodynamic_model(
     enable_o2::Bool = false,
     reference_density::Real = 1025.0,
     free_surface = nothing,
-    momentum_advection = nothing,
-    tracer_advection = nothing,
+    momentum_advection = WENO(),
+    tracer_advection = WENO(),
     boundary_conditions::NamedTuple = NamedTuple(),
     forcing::NamedTuple = NamedTuple(),
     open_boundary_conditions = nothing,
@@ -97,7 +98,7 @@ function build_hydrodynamic_model(
     boundary_tracers::Union{Nothing, NamedTuple} = nothing,
     boundary_velocities::Union{Nothing, NamedTuple} = nothing,
     mask_bay_of_fundy::Bool = false,
-    active_boundaries = (:east, :south, :west),
+    active_boundaries = (:east, :west),
     tidal_placement::Symbol = :boundary
 )
     active_tracers = (enable_o2 && !(:O2 in tracers)) ? (tracers..., :O2) : tracers
@@ -158,10 +159,7 @@ function build_hydrodynamic_model(
 
     # Extract grid bounds for sponge layer construction (needs to happen before sponge creation)
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
-    lon_min_grid = Float64(base_g.λᶠᵃᵃ[1])
-    lon_max_grid = Float64(base_g.λᶠᵃᵃ[base_g.Nx + 1])
-    lat_min_grid = Float64(base_g.φᵃᶠᵃ[1])
-    lat_max_grid = Float64(base_g.φᵃᶠᵃ[base_g.Ny + 1])
+    (lon_min_grid, lon_max_grid), (lat_min_grid, lat_max_grid) = grid_geographic_bounds(base_g)
 
     # Interior forcing: tides plus the lateral sponge, matching the manual builder's CPU path.
     # Construct proper bitstype forcing structs that Oceananigans can call in GPU kernels.
@@ -283,18 +281,28 @@ function build_hydrodynamic_model(
         end
 
         if !isnothing(u_tide_val)
-            u_tide_target = (x, y, z, t) -> Float64(u_tide_val(x, y, z, t))
-            u_forcing = MultipleForcings(
-                u_forcing,
-                Relaxation(rate = tidal_relax_rate, mask = tidal_eff_mask, target = u_tide_target)
-            )
+            if tidal_placement === :boundary
+                u_comb_target = (x, y, z, t) -> Float64(u_target(x, y, z, t) + u_tide_val(x, y, z, t))
+                u_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = u_comb_target)
+            else
+                u_tide_target = (x, y, z, t) -> Float64(u_tide_val(x, y, z, t))
+                u_forcing = MultipleForcings(
+                    u_forcing,
+                    Relaxation(rate = tidal_relax_rate, mask = tidal_eff_mask, target = u_tide_target)
+                )
+            end
         end
         if !isnothing(v_tide_val)
-            v_tide_target = (x, y, z, t) -> Float64(v_tide_val(x, y, z, t))
-            v_forcing = MultipleForcings(
-                v_forcing,
-                Relaxation(rate = tidal_relax_rate, mask = tidal_eff_mask, target = v_tide_target)
-            )
+            if tidal_placement === :boundary
+                v_comb_target = (x, y, z, t) -> Float64(v_target(x, y, z, t) + v_tide_val(x, y, z, t))
+                v_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = v_comb_target)
+            else
+                v_tide_target = (x, y, z, t) -> Float64(v_tide_val(x, y, z, t))
+                v_forcing = MultipleForcings(
+                    v_forcing,
+                    Relaxation(rate = tidal_relax_rate, mask = tidal_eff_mask, target = v_tide_target)
+                )
+            end
         end
 
         composed_forcing = (; u = u_forcing, v = v_forcing)
@@ -370,10 +378,22 @@ function build_hydrodynamic_model(
 
     eff_closure = closure !== nothing ? closure : closure_scheme
     vertical_closure = if eff_closure === nothing
-        VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = Float64(ν), κ = Float64(κ))
+        ConvectiveAdjustmentVerticalDiffusivity(
+            VerticallyImplicitTimeDiscretization();
+            convective_κz = 1.0,
+            convective_νz = 1.0,
+            background_κz = Float64(κ),
+            background_νz = Float64(ν)
+        )
     elseif eff_closure isa Symbol
         eff_closure in (:nemotke, :catke, :tke) ? CATKEVerticalDiffusivity() :
-            VerticalScalarDiffusivity(VerticallyImplicitTimeDiscretization(); ν = Float64(ν), κ = Float64(κ))
+            ConvectiveAdjustmentVerticalDiffusivity(
+                VerticallyImplicitTimeDiscretization();
+                convective_κz = 1.0,
+                convective_νz = 1.0,
+                background_κz = Float64(κ),
+                background_νz = Float64(ν)
+            )
     else
         eff_closure
     end
@@ -391,7 +411,12 @@ function build_hydrodynamic_model(
         :forcing => merged_forcing
     )
     isnothing(free_surface) || (kwargs[:free_surface] = free_surface)
-    isnothing(momentum_advection) || (kwargs[:momentum_advection] = momentum_advection)
+    eff_mom_adv = if (base_g isa OrthogonalSphericalShellGrid) && (momentum_advection isa WENO)
+        VectorInvariant()
+    else
+        momentum_advection
+    end
+    isnothing(eff_mom_adv) || (kwargs[:momentum_advection] = eff_mom_adv)
     isnothing(tracer_advection) || (kwargs[:tracer_advection] = tracer_advection)
 
     sim = ocean_simulation(grid; model = :hydrostatic, kwargs...)

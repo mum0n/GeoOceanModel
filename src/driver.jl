@@ -406,7 +406,8 @@ function run_segment_grid(; opts::HydrodynamicOptions = HydrodynamicOptions())
         nz_below = nz_tot - nz_above
         nz_below < 1 && error(
             "vertical grid split leaves nz_below = $nz_below; need nz_above < nz = $nz_tot.")
-        z_break = opts.vertical_break_depth < 0.0 ? opts.vertical_break_depth : -400.0
+        break_depth = abs(opts.vertical_break_depth)
+        z_break = break_depth > 0.0 ? -break_depth : -400.0
         println("Applying two-segment vertical coordinates (break=$(z_break)m, " *
                 "nz_above=$nz_above, nz_below=$nz_below, Lz=$(Lz)m)...")
         two_segment_z_faces(z_break = z_break, z_min = -Lz,
@@ -423,7 +424,12 @@ function run_segment_grid(; opts::HydrodynamicOptions = HydrodynamicOptions())
         z_range = opts.domain_z,
         z_faces = z_faces,
         grid_size = opts.grid_size,
-        fallback_to_cpu = opts.fallback_to_cpu
+        fallback_to_cpu = opts.fallback_to_cpu,
+        orientation = opts.grid_orientation,
+        rotation_azimuth = opts.rotation_azimuth,
+        center_coords = (opts.center_lon, opts.center_lat),
+        along_shelf_extent_km = opts.along_shelf_extent_km,
+        cross_shelf_extent_km = opts.cross_shelf_extent_km
     )
 
     println("Constructing immersed boundary by 2D bilinear regridding...")
@@ -437,8 +443,16 @@ function run_segment_grid(; opts::HydrodynamicOptions = HydrodynamicOptions())
     )
 
     println("Grid summary:")
-    println("  Longitude: $(opts.domain_lon[1])°E to $(opts.domain_lon[2])°E (Nx=$(opts.grid_size[1]))")
-    println("  Latitude:  $(opts.domain_lat[1])°N to $(opts.domain_lat[2])°N (Ny=$(opts.grid_size[2]))")
+    if opts.grid_orientation === :rotated
+        println("  Orientation: Rotated orthogonal grid at $(opts.rotation_azimuth)° azimuth")
+        println("  Center:      ($(opts.center_lon)°E, $(opts.center_lat)°N)")
+        println("  Extent:      $(opts.along_shelf_extent_km) km along-shelf × $(opts.cross_shelf_extent_km) km cross-shelf")
+        println("  Horizontal:  Nx=$(opts.grid_size[1]) × Ny=$(opts.grid_size[2]) ($(opts.grid_size[1]*opts.grid_size[2]) total cells)")
+    else
+        println("  Orientation: Standard geographic grid")
+        println("  Longitude:   $(opts.domain_lon[1])°E to $(opts.domain_lon[2])°E (Nx=$(opts.grid_size[1]))")
+        println("  Latitude:    $(opts.domain_lat[1])°N to $(opts.domain_lat[2])°N (Ny=$(opts.grid_size[2]))")
+    end
     println("  Depth:     $(opts.domain_z[1]) m to $(opts.domain_z[2]) m (Nz=$(opts.grid_size[3]))")
     if !isnothing(z_faces)
         src = isempty(opts.vertical_grid_file) ? "stretched" : basename(opts.vertical_grid_file)
@@ -706,8 +720,9 @@ end
         atmo_craft.heat_flux
     end
 
-    println("Building HydrostaticFreeSurfaceModel (Coriolis at $(coriolis_lat)°N, summer surface heat flux)...")
-    free_surf = ImplicitFreeSurface(maxiter = 2000, reltol = 1e-6)
+    # NumericalEarth.ocean_simulation defaults to SplitExplicitFreeSurface, which provides
+    # stable barotropic substepping over steep bathymetry without ill-conditioned PCG solves.
+    free_surf = nothing
     closure_choice = hasproperty(opts, :turbulence_closure) ?
         Symbol(lowercase(string(opts.turbulence_closure))) : :smagorinsky
     # Model assembly is delegated entirely to NumericalEarth.ocean_simulation, which builds
@@ -740,10 +755,12 @@ end
         κ = 1e-2,
         tracers = (:T, :S),
         free_surface = free_surf,
+        momentum_advection = WENO(),
+        tracer_advection = WENO(),
         lon_range = opts.domain_lon,
         lat_range = opts.domain_lat,
         mask_bay_of_fundy = opts.mask_bay_of_fundy,
-        active_boundaries = (:east, :south, :west),
+        active_boundaries = opts.active_boundaries,
         tidal_placement = :boundary
     )
 

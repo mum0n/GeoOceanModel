@@ -133,7 +133,10 @@ function compute_advective_cfl(
 
     # Estimate horizontal grid spacing (in meters)
     base_g = model.grid isa ImmersedBoundaryGrid ? model.grid.underlying_grid : model.grid
-    dx_approx = if hasproperty(base_g, :radius)
+    dx_approx = if hasproperty(base_g, :Δxᶜᶜᵃ)
+        dx_cpu = to_cpu_offset_array(base_g.Δxᶜᶜᵃ)
+        Float64(minimum(dx_cpu[1:base_g.Nx, 1:base_g.Ny]))
+    elseif hasproperty(base_g, :radius) && hasproperty(base_g, :λᶠᵃᵃ)
         # Spherical grid: compute minimum zonal spacing at highest absolute latitude
         r_earth = Float64(base_g.radius)
         dlon_deg = minimum(diff(collect(base_g.λᶠᵃᵃ[1:base_g.Nx + 1])))
@@ -144,7 +147,10 @@ function compute_advective_cfl(
     else
         1000.0
     end
-    dy_approx = if hasproperty(base_g, :radius)
+    dy_approx = if hasproperty(base_g, :Δyᶜᶜᵃ)
+        dy_cpu = to_cpu_offset_array(base_g.Δyᶜᶜᵃ)
+        Float64(minimum(dy_cpu[1:base_g.Nx, 1:base_g.Ny]))
+    elseif hasproperty(base_g, :radius) && hasproperty(base_g, :φᵃᶠᵃ)
         r_earth = Float64(base_g.radius)
         dlat_deg = minimum(diff(collect(base_g.φᵃᶠᵃ[1:base_g.Ny + 1])))
         r_earth * deg2rad(dlat_deg)
@@ -1203,8 +1209,7 @@ function write_grid_coordinates(model, output_path::AbstractString)
     base_g = model.grid isa ImmersedBoundaryGrid ? model.grid.underlying_grid : model.grid
     cpu_g = architecture(base_g) isa GPU ? on_architecture(CPU(), base_g) : base_g
 
-    lons = collect(Float64, cpu_g.λᶜᵃᵃ)[cpu_g.Hx+1 : cpu_g.Hx+cpu_g.Nx]
-    lats = collect(Float64, cpu_g.φᵃᶜᵃ)[cpu_g.Hy+1 : cpu_g.Hy+cpu_g.Ny]
+    lons, lats = _grid_interior_centres(cpu_g)
     depths = [Float64(Oceananigans.Grids.znode(k, cpu_g, Center())) for k in 1:cpu_g.Nz]
     halo = (Int(cpu_g.Hx), Int(cpu_g.Hy), Int(cpu_g.Hz))
     grid_size = (Int(cpu_g.Nx), Int(cpu_g.Ny), Int(cpu_g.Nz))
@@ -1408,10 +1413,27 @@ function setup_hydrodynamic_simulation(
         metrics = try
             base_g = s.model.grid isa ImmersedBoundaryGrid ? s.model.grid.underlying_grid : s.model.grid
             dz_min = min_vertical_spacing(base_g)
-            r_earth = Float64(base_g.radius)
-            dlon_deg = minimum(diff(collect(base_g.λᶠᵃᵃ[1:base_g.Nx + 1])))
-            dlat_deg = minimum(diff(collect(base_g.φᵃᶠᵃ[1:base_g.Ny + 1])))
-            lat_max_abs = max(abs(base_g.φᵃᶠᵃ[1]), abs(base_g.φᵃᶠᵃ[base_g.Ny + 1]))
+            dx_m = if hasproperty(base_g, :Δxᶜᶜᵃ)
+                dx_cpu = to_cpu_offset_array(base_g.Δxᶜᶜᵃ)
+                Float64(minimum(dx_cpu[1:base_g.Nx, 1:base_g.Ny]))
+            elseif hasproperty(base_g, :radius) && hasproperty(base_g, :λᶠᵃᵃ)
+                r_earth = Float64(base_g.radius)
+                dlon_deg = minimum(diff(collect(base_g.λᶠᵃᵃ[1:base_g.Nx + 1])))
+                lat_max_abs = max(abs(base_g.φᵃᶠᵃ[1]), abs(base_g.φᵃᶠᵃ[base_g.Ny + 1]))
+                r_earth * cosd(lat_max_abs) * deg2rad(dlon_deg)
+            else
+                1000.0
+            end
+            dy_m = if hasproperty(base_g, :Δyᶜᶜᵃ)
+                dy_cpu = to_cpu_offset_array(base_g.Δyᶜᶜᵃ)
+                Float64(minimum(dy_cpu[1:base_g.Nx, 1:base_g.Ny]))
+            elseif hasproperty(base_g, :radius) && hasproperty(base_g, :φᵃᶠᵃ)
+                r_earth = Float64(base_g.radius)
+                dlat_deg = minimum(diff(collect(base_g.φᵃᶠᵃ[1:base_g.Ny + 1])))
+                r_earth * deg2rad(dlat_deg)
+            else
+                1000.0
+            end
             cflz_val = 0.0
             if hasproperty(base_g, :z) && hasproperty(base_g.z, :Δᵃᵃᶜ)
                 dz_vec_p = to_cpu_offset_array(base_g.z.Δᵃᵃᶜ)
@@ -1424,11 +1446,11 @@ function setup_hydrodynamic_simulation(
             else
                 cflz_val = (w_max * s.Δt) / max(1.0, dz_min)
             end
-            (dx_m = r_earth * cosd(lat_max_abs) * deg2rad(dlon_deg),
-             dy_m = r_earth * deg2rad(dlat_deg),
+            (dx_m = dx_m,
+             dy_m = dy_m,
              dz_m = dz_min,
-             cflx = (u_max * s.Δt) / max(1.0, r_earth * cosd(lat_max_abs) * deg2rad(dlon_deg)),
-             cfly = (v_max * s.Δt) / max(1.0, r_earth * deg2rad(dlat_deg)),
+             cflx = (u_max * s.Δt) / max(1.0, dx_m),
+             cfly = (v_max * s.Δt) / max(1.0, dy_m),
              cflz = cflz_val)
         catch
             nothing

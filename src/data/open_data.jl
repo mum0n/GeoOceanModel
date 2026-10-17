@@ -53,7 +53,7 @@ function fetch_surface_winds(source::AbstractString; lon_range, lat_range, time_
                             output_path, verbose::Bool = true)
     s = replace(lowercase(strip(source)), "-" => "_")
     if s in ("open_meteo", "era5", "open", "openmeteo")
-        return fetch_open_meteo_winds(
+        return GeoDataSources.fetch_open_meteo_winds(
             lon_range = lon_range, lat_range = lat_range,
             time_iso = time_iso, output_path = output_path,
             verbose = verbose
@@ -416,7 +416,7 @@ function fetch_open_surface_winds(;
     output_path::AbstractString = joinpath("inputs", "surface_winds.zarr"),
     verbose::Bool = true
 )
-    return fetch_open_meteo_winds(;
+    return GeoDataSources.fetch_open_meteo_winds(;
         lon_range = lon_range,
         lat_range = lat_range,
         time_iso = time_iso,
