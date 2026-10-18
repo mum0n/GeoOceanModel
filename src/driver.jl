@@ -720,9 +720,10 @@ end
         atmo_craft.heat_flux
     end
 
-    # NumericalEarth.ocean_simulation defaults to SplitExplicitFreeSurface, which provides
-    # stable barotropic substepping over steep bathymetry without ill-conditioned PCG solves.
-    free_surf = nothing
+    # SplitExplicitFreeSurface with explicit substepping (substeps = 45).
+    # Provides an averaging filter for fast barotropic gravity waves over steep
+    # bathymetry, suppressing 2-delta numerical resonance near open boundaries.
+    free_surf = SplitExplicitFreeSurface(target_grid; substeps = 45)
     closure_choice = hasproperty(opts, :turbulence_closure) ?
         Symbol(lowercase(string(opts.turbulence_closure))) : :smagorinsky
     # Model assembly is delegated entirely to NumericalEarth.ocean_simulation, which builds

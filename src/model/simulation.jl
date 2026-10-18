@@ -99,10 +99,16 @@ function velocity_peak_location(sim_or_model, loc)
            hasproperty(sim_or_model, :grid) ? sim_or_model.grid : sim_or_model
     lons, lats, depths = extract_grid_coordinates(grid)
     t = Tuple(loc)
-    i = max(1, min(t[1], length(lons)))
-    j = max(1, min(t[2], length(lats)))
     k = max(1, min(t[3], length(depths)))
-    return (Float64(lons[i]), Float64(lats[j]), Float64(depths[k]))
+    if lons isa AbstractMatrix && lats isa AbstractMatrix
+        i = max(1, min(t[1], size(lons, 1)))
+        j = max(1, min(t[2], size(lats, 2)))
+        return (Float64(lons[i, j]), Float64(lats[i, j]), Float64(depths[k]))
+    else
+        i = max(1, min(t[1], length(lons)))
+        j = max(1, min(t[2], length(lats)))
+        return (Float64(lons[i]), Float64(lats[j]), Float64(depths[k]))
+    end
 end
 
 """

@@ -20,6 +20,273 @@ using Interpolations: interpolate, BSpline, Linear
 import NumericalEarth: ocean_simulation, GLORYSDaily, GLORYSMonthly, WOAMonthly, WOAAnnual, BoundingBox, Metadatum
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 
+import Adapt
+
+"""
+    rotate_to_curvilinear(x, y, cos_dλ, sin_dλ, cos_dφ, sin_dφ) -> (Float64, Float64)
+
+Convert geographic coordinates (longitude `x`, latitude `y` in degrees) to curvilinear
+rotated coordinates (λ', φ' in degrees) given precomputed Euler rotation
+coefficients for a rotated North Pole (λ_p, φ_p).
+"""
+@inline function rotate_to_curvilinear(x, y, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
+    λ_rad = deg2rad(Float64(x))
+    φ_rad = deg2rad(Float64(y))
+    cos_φ = cos(φ_rad)
+    sin_φ = sin(φ_rad)
+    cos_λ = cos(λ_rad)
+    sin_λ = sin(λ_rad)
+    cx = cos_φ * cos_λ
+    cy = cos_φ * sin_λ
+    cz = sin_φ
+
+    # Z-axis rotation by lon_pole (dλ)
+    x1 = cos_dλ * cx + sin_dλ * cy
+    y1 = -sin_dλ * cx + cos_dλ * cy
+    z1 = cz
+
+    # Y-axis rotation by (π/2 - lat_pole) (dφ)
+    xp = cos_dφ * x1 - sin_dφ * z1
+    yp = y1
+    zp = sin_dφ * x1 + cos_dφ * z1
+
+    λp = rad2deg(atan(yp, xp))
+    # Protect against machine-precision overshoot (|zp| - 1.0 > 0 at boundary points)
+    zp_bounded = if abs(zp) <= 1.0
+        zp
+    elseif abs(zp) <= 1.0 + 1e-12
+        sign(zp) * 1.0
+    else
+        throw(DomainError(zp, "Curvilinear rotation coordinate |zp| > 1: non-spherical coordinate projection"))
+    end
+    φp = rad2deg(asin(zp_bounded))
+    return (λp, φp)
+end
+
+"""
+    extract_rotated_grid_bounds(
+        base_g,
+        north_pole::Tuple{Real, Real}
+    ) -> (Tuple{Float64, Float64}, Tuple{Float64, Float64})
+
+Extract the curvilinear rotated coordinate bounding box
+`((rot_lon_min, rot_lon_max), (rot_lat_min, rot_lat_max))` in degrees from
+the boundary corners of a `RotatedLatitudeLongitudeGrid`.
+"""
+function extract_rotated_grid_bounds(base_g, north_pole::Tuple{Real, Real})
+    dλ = deg2rad(Float64(north_pole[1]))
+    dφ = π / 2.0 - deg2rad(Float64(north_pole[2]))
+    cos_dλ = cos(dλ)
+    sin_dλ = sin(dλ)
+    cos_dφ = cos(dφ)
+    sin_dφ = sin(dφ)
+
+    nx, ny = base_g.Nx, base_g.Ny
+    λ11 = Float64(Array(base_g.λᶠᶠᵃ[1:1, 1:1])[1, 1])
+    φ11 = Float64(Array(base_g.φᶠᶠᵃ[1:1, 1:1])[1, 1])
+    λ22 = Float64(Array(base_g.λᶠᶠᵃ[nx+1:nx+1, ny+1:ny+1])[1, 1])
+    φ22 = Float64(Array(base_g.φᶠᶠᵃ[nx+1:nx+1, ny+1:ny+1])[1, 1])
+
+    p1 = rotate_to_curvilinear(λ11, φ11, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
+    p2 = rotate_to_curvilinear(λ22, φ22, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
+
+    rot_lon_min = min(p1[1], p2[1])
+    rot_lon_max = max(p1[1], p2[1])
+    rot_lat_min = min(p1[2], p2[2])
+    rot_lat_max = max(p1[2], p2[2])
+    return (rot_lon_min, rot_lon_max), (rot_lat_min, rot_lat_max)
+end
+
+"""
+    CartesianSpongeMask <: Function
+
+`isbits` callable functor implementing Price & Aumont (2011) quadratic lateral sponge
+relaxation weights γ ∈ [0, 1] on unrotated Cartesian / geographic spherical grids.
+"""
+struct CartesianSpongeMask <: Function
+    lon_min::Float64
+    lon_max::Float64
+    lat_min::Float64
+    lat_max::Float64
+    sponge_width::Float64
+    active_east::Bool
+    active_west::Bool
+    active_north::Bool
+    active_south::Bool
+end
+Adapt.adapt_structure(to, s::CartesianSpongeMask) = s
+
+@inline function (s::CartesianSpongeMask)(x, y, z)
+    gamma_e = if !s.active_east || x <= (s.lon_max - s.sponge_width)
+        0.0
+    elseif x >= s.lon_max
+        1.0
+    else
+        ((x - (s.lon_max - s.sponge_width)) / s.sponge_width)^2
+    end
+
+    gamma_w = if !s.active_west || x >= (s.lon_min + s.sponge_width)
+        0.0
+    elseif x <= s.lon_min
+        1.0
+    else
+        (((s.lon_min + s.sponge_width) - x) / s.sponge_width)^2
+    end
+
+    gamma_n = if !s.active_north || y <= (s.lat_max - s.sponge_width)
+        0.0
+    elseif y >= s.lat_max
+        1.0
+    else
+        ((y - (s.lat_max - s.sponge_width)) / s.sponge_width)^2
+    end
+
+    gamma_s = if !s.active_south || y >= (s.lat_min + s.sponge_width)
+        0.0
+    elseif y <= s.lat_min
+        1.0
+    else
+        (((s.lat_min + s.sponge_width) - y) / s.sponge_width)^2
+    end
+
+    return max(gamma_e, gamma_w, gamma_n, gamma_s)
+end
+
+"""
+    RotatedSpongeMask <: Function
+
+`isbits` callable functor implementing boundary-aligned quadratic lateral sponge
+relaxation weights γ ∈ [0, 1] on rotated orthogonal spherical shell grids.
+
+# Mathematical Formulation
+Converts geographic coordinates (\$\\lambda, \\phi\$) to curvilinear rotated
+coordinates (\$\\lambda', \\phi'\$) via inverse 3D spherical Euler rotation:
+```math
+\\begin{aligned}
+x_1 &= \\cos(\\lambda_p) \\cos(\\phi) \\cos(\\lambda) + \\sin(\\lambda_p) \\cos(\\phi) \\sin(\\lambda) \\\\
+y_1 &= -\\sin(\\lambda_p) \\cos(\\phi) \\cos(\\lambda) + \\cos(\\lambda_p) \\cos(\\phi) \\sin(\\lambda) \\\\
+z_1 &= \\sin(\\phi) \\\\
+x' &= \\cos(\\phi_p^*) x_1 - \\sin(\\phi_p^*) z_1 \\\\
+y' &= y_1 \\\\
+z' &= \\sin(\\phi_p^*) x_1 + \\cos(\\phi_p^*) z_1 \\\\
+\\lambda' &= \\operatorname{atan2}(y', x') \\\\
+\\phi' &= \\arcsin(z')
+\\end{aligned}
+```
+where \$\\lambda_p\$ is the North Pole longitude and \$\\phi_p^* = \\frac{\\pi}{2} - \\phi_p\$.
+The quadratic sponge dampening is evaluated natively in (\$\\lambda', \\phi'\$), guaranteeing
+strictly boundary-aligned damping along the true curvilinear grid perimeter without
+diagonal truncation or artificial shear discontinuities.
+"""
+struct RotatedSpongeMask <: Function
+    cos_dλ::Float64
+    sin_dλ::Float64
+    cos_dφ::Float64
+    sin_dφ::Float64
+    lon_ref::Float64
+    rot_lon_min::Float64
+    rot_lon_max::Float64
+    rot_lat_min::Float64
+    rot_lat_max::Float64
+    sponge_width::Float64
+    active_east::Bool
+    active_west::Bool
+    active_north::Bool
+    active_south::Bool
+end
+Adapt.adapt_structure(to, s::RotatedSpongeMask) = s
+
+function RotatedSpongeMask(
+    lon_pole::Real, lat_pole::Real,
+    rot_lon_range::Tuple{Real, Real},
+    rot_lat_range::Tuple{Real, Real},
+    sponge_width::Real;
+    active_east::Bool = true,
+    active_west::Bool = false,
+    active_north::Bool = false,
+    active_south::Bool = true
+)
+    dλ = deg2rad(Float64(lon_pole))
+    dφ = π / 2.0 - deg2rad(Float64(lat_pole))
+    return RotatedSpongeMask(
+        cos(dλ), sin(dλ), cos(dφ), sin(dφ),
+        0.5 * (Float64(rot_lon_range[1]) + Float64(rot_lon_range[2])),
+        Float64(rot_lon_range[1]), Float64(rot_lon_range[2]),
+        Float64(rot_lat_range[1]), Float64(rot_lat_range[2]),
+        Float64(sponge_width),
+        active_east, active_west, active_north, active_south
+    )
+end
+
+@inline function (s::RotatedSpongeMask)(x, y, z)
+    λ_rad = deg2rad(Float64(x))
+    φ_rad = deg2rad(Float64(y))
+    cos_φ = cos(φ_rad)
+    sin_φ = sin(φ_rad)
+    cos_λ = cos(λ_rad)
+    sin_λ = sin(λ_rad)
+    cx = cos_φ * cos_λ
+    cy = cos_φ * sin_λ
+    cz = sin_φ
+
+    x1 = s.cos_dλ * cx + s.sin_dλ * cy
+    y1 = -s.sin_dλ * cx + s.cos_dλ * cy
+    z1 = cz
+
+    xp = s.cos_dφ * x1 - s.sin_dφ * z1
+    yp = y1
+    zp = s.sin_dφ * x1 + s.cos_dφ * z1
+
+    λp = rad2deg(atan(yp, xp))
+    if λp < 0.0 && s.lon_ref > 0.0
+        λp += 360.0
+    elseif λp > 180.0 && s.lon_ref < 0.0
+        λp -= 360.0
+    end
+    zp_bounded = if abs(zp) <= 1.0
+        zp
+    elseif abs(zp) <= 1.0 + 1e-12
+        sign(zp) * 1.0
+    else
+        throw(DomainError(zp, "Curvilinear rotation coordinate |zp| > 1: non-spherical coordinate projection"))
+    end
+    φp = rad2deg(asin(zp_bounded))
+
+    gamma_e = if !s.active_east || λp <= (s.rot_lon_max - s.sponge_width)
+        0.0
+    elseif λp >= s.rot_lon_max
+        1.0
+    else
+        ((λp - (s.rot_lon_max - s.sponge_width)) / s.sponge_width)^2
+    end
+
+    gamma_w = if !s.active_west || λp >= (s.rot_lon_min + s.sponge_width)
+        0.0
+    elseif λp <= s.rot_lon_min
+        1.0
+    else
+        (((s.rot_lon_min + s.sponge_width) - λp) / s.sponge_width)^2
+    end
+
+    gamma_n = if !s.active_north || φp <= (s.rot_lat_max - s.sponge_width)
+        0.0
+    elseif φp >= s.rot_lat_max
+        1.0
+    else
+        ((φp - (s.rot_lat_max - s.sponge_width)) / s.sponge_width)^2
+    end
+
+    gamma_s = if !s.active_south || φp >= (s.rot_lat_min + s.sponge_width)
+        0.0
+    elseif φp <= s.rot_lat_min
+        1.0
+    else
+        (((s.rot_lat_min + s.sponge_width) - φp) / s.sponge_width)^2
+    end
+
+    return max(gamma_e, gamma_w, gamma_n, gamma_s)
+end
+
 # Import domain constants
 
 """
@@ -218,10 +485,25 @@ function build_hydrodynamic_model(
         act_w = :west in act_b_syms
         act_n = :north in act_b_syms
         act_s = :south in act_b_syms
-        sponge_mask = (x, y, z) -> compute_sponge_gamma(
-            x, y, lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width,
-            act_e, act_w, act_n, act_s
-        )
+
+        is_rotated = hasproperty(base_g, :conformal_mapping) &&
+                     hasproperty(base_g.conformal_mapping, :north_pole) &&
+                     Tuple(Float64.(base_g.conformal_mapping.north_pole)) != (0.0, 90.0)
+
+        sponge_mask = if is_rotated
+            np = Tuple(Float64.(base_g.conformal_mapping.north_pole))
+            rot_lon_rng, rot_lat_rng = extract_rotated_grid_bounds(base_g, np)
+            RotatedSpongeMask(
+                np[1], np[2], rot_lon_rng, rot_lat_rng, sponge_width;
+                active_east = act_e, active_west = act_w,
+                active_north = act_n, active_south = act_s
+            )
+        else
+            CartesianSpongeMask(
+                lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width,
+                act_e, act_w, act_n, act_s
+            )
+        end
         # If real boundary velocities (e.g. from GLORYS) are supplied, use them directly as targets.
         # Otherwise, fall back to the analytical ExponentialInflow reference profile.
         u_target = if !isnothing(boundary_velocities) && haskey(boundary_velocities, :u)
@@ -236,7 +518,7 @@ function build_hydrodynamic_model(
                 ufld
             end
         else
-            (x, y, z, t) -> Float64(sponge_relaxation.u_ref(x, y, z, t))
+            sponge_relaxation.u_ref
         end
 
         v_target = if !isnothing(boundary_velocities) && haskey(boundary_velocities, :v)
@@ -251,11 +533,40 @@ function build_hydrodynamic_model(
                 vfld
             end
         else
-            (x, y, z, t) -> Float64(sponge_relaxation.v_ref(x, y, z, t))
+            sponge_relaxation.v_ref
         end
 
-        u_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = u_target)
-        v_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = v_target)
+        # Disentangle the upstream inflow momentum forcing from the lateral radiation sponge.
+        #
+        # Physical Dynamics:
+        # Inflow boundary (East): Nudges the incoming Labrador / Nova Scotia Current jet
+        # toward `u_inflow` (-0.10 m/s).
+        # Open Atlantic boundary (South): Radiation/damping boundary spanning steep shelf-break
+        # canyons. Relaxing horizontal velocity toward a non-zero along-shelf velocity across
+        # steep canyon walls (where z = -330 m) creates immense artificial volume flux divergence
+        # ∇_h · u_h and triggers diagnostic vertical velocity w blowup in hydrostatic models.
+        #
+        # For momentum, relax toward `u_target` exclusively where inflow is physically active
+        # (East boundary). Along radiation boundaries (South boundary), relax momentum toward
+        # (u, v) = (0, 0) to damp reflections without driving cross-isobath shear.
+        # For tracers, `sponge_mask` continues to relax across all active open boundaries (East + South).
+        inflow_sponge_mask = if is_rotated
+            np = Tuple(Float64.(base_g.conformal_mapping.north_pole))
+            rot_lon_rng, rot_lat_rng = extract_rotated_grid_bounds(base_g, np)
+            RotatedSpongeMask(
+                np[1], np[2], rot_lon_rng, rot_lat_rng, sponge_width;
+                active_east = act_e, active_west = act_w,
+                active_north = false, active_south = false
+            )
+        else
+            CartesianSpongeMask(
+                lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width,
+                act_e, act_w, false, false
+            )
+        end
+
+        u_forcing = Relaxation(rate = relax_rate, mask = inflow_sponge_mask, target = u_target)
+        v_forcing = Relaxation(rate = relax_rate, mask = inflow_sponge_mask, target = v_target)
 
         # Tidal forcing is a relaxation toward prescribed tidal velocity.
         #
@@ -1247,6 +1558,7 @@ struct ExponentialInflow{T <: AbstractFloat}
 end
 
 @inline (f::ExponentialInflow)(x, y, z, t) = f.amplitude * exp(z / f.decay)
+Adapt.adapt_structure(to, f::ExponentialInflow) = f
 
 """
     LateralBoundaryRelaxation(lon_domain, lat_domain; kwargs...)

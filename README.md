@@ -63,6 +63,82 @@ $$\Delta \lambda' = \frac{L_\xi}{2 R}, \quad \Delta \phi' = \frac{L_\eta}{2 R}$$
 - *Conceptual Overview*: When grid lines follow curved paths rather than straight meridians, fluid moving across the grid experiences geometric coordinate curvature. The numerical equations must account for this curvature so that ocean currents do not artificially gain or lose energy.
 - *Technical Formulation*: The Oceananigans hydrostatic free-surface solver requires `VectorInvariant()` momentum advection on curvilinear grids. This formulation discretizes the advection term as $\boldsymbol{u} \cdot \nabla \boldsymbol{u} = \boldsymbol{\omega} \times \boldsymbol{u} + \frac{1}{2}\nabla|\boldsymbol{u}|^2$, computing relative vorticity $\boldsymbol{\omega} = \nabla \times \boldsymbol{u}$ directly on cell vertices without Christoffel symbol singularities. The model automatically switches momentum advection to `VectorInvariant()` on `OrthogonalSphericalShellGrid` instances, while preserving fifth-order `WENO()` advection for active temperature and salinity tracers.
 
+## Lateral Boundary Relaxation & Curvilinear Sponge Architecture
+
+### Conceptual Overview (Generalists)
+
+Regional ocean models simulate a localized section of the ocean rather than the entire planet. At the open boundaries of the computational domain, two physical processes must occur simultaneously:
+- Outgoing waves, tides, and eddies must leave the domain smoothly without reflecting off artificial edges back into the interior.
+- Inflow currents and water masses (such as the cold, fresh Labrador Current entering from the east) must be introduced smoothly from broader regional observations or ocean reanalyses (e.g., Copernicus GLORYS12V1).
+
+To achieve this, the model applies a peripheral buffer zone known as a sponge layer (Price & Aumont 2011). Inside this sponge band, prognostic variables are nudged toward external boundary states with a damping weight $\gamma$ that increases quadratically from $\gamma = 0$ in the interior to $\gamma = 1$ at the boundary.
+
+On a standard geographic grid aligned with lines of latitude and longitude, a sponge layer is specified using simple bounding coordinates (`lat_min`, `lat_max`, `lon_min`, `lon_max`). However, when the computational domain is rotated by $50^\circ$ to follow the Scotian Shelf margin, lines of constant geographic latitude intersect the domain diagonally. Using geographic bounding boxes on a rotated domain truncates sponge damping across roughly 95% of the southern boundary, leaving the open shelf break exposed to wave reflection while concentrating damping into a narrow corner triangle. The resulting shear discontinuity causes numerical divergence within hours.
+
+[`RotatedSpongeMask`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl) resolves this issue by rotating geographic coordinates $(\lambda, \phi)$ back into curvilinear coordinates $(\lambda', \phi')$ before evaluating the quadratic damping function. This aligns the sponge layer with the true curvilinear perimeter of the grid, providing uniform, seamless boundary damping across all designated open boundaries.
+
+### Mathematical Formulation & Numerical Implementation (Specialists)
+
+#### Inverse Spherical Euler Rotation
+
+Let $(\lambda_p, \phi_p)$ denote the geographic coordinates of the rotated North Pole, and let $\phi_p^* = \frac{\pi}{2} - \phi_p$ be the co-latitude rotation angle. For an arbitrary grid face or center point with geographic longitude $\lambda$ and latitude $\phi$, the corresponding unit Cartesian vector in the Earth-centered inertial frame is:
+
+$$\mathbf{x} = \begin{bmatrix} \cos\phi \cos\lambda \\ \cos\phi \sin\lambda \\ \sin\phi \end{bmatrix}$$
+
+The transformation to rotated curvilinear coordinates $(\lambda', \phi')$ proceeds through two successive rotations:
+- A rotation by angle $\lambda_p$ about the $Z$-axis:
+  $$\mathbf{x}_1 = \begin{bmatrix} \cos\lambda_p & \sin\lambda_p & 0 \\ -\sin\lambda_p & \cos\lambda_p & 0 \\ 0 & 0 & 1 \end{bmatrix} \mathbf{x}$$
+- A rotation by angle $\phi_p^*$ about the $Y$-axis:
+  $$\mathbf{x}' = \begin{bmatrix} \cos\phi_p^* & 0 & -\sin\phi_p^* \\ 0 & 1 & 0 \\ \sin\phi_p^* & 0 & \cos\phi_p^* \end{bmatrix} \mathbf{x}_1$$
+
+The curvilinear coordinates $(\lambda', \phi')$ are then recovered via:
+
+$$\lambda' = \operatorname{atan2}(x'_y, x'_x), \quad \phi' = \arcsin(x'_z)$$
+
+#### Quadratic Sponge Damping
+
+The quadratic sponge weight $\gamma \in [0, 1]$ is computed natively in rotated coordinates $(\lambda', \phi')$. For an active southern boundary with lower coordinate limit $\phi'_{\min}$ and sponge layer width $L_s$:
+
+$$\gamma_s(\phi') = \begin{cases}
+1, & \phi' \le \phi'_{\min} \\
+\left(\frac{\phi'_{\min} + L_s - \phi'}{L_s}\right)^2, & \phi'_{\min} < \phi' < \phi'_{\min} + L_s \\
+0, & \phi' \ge \phi'_{\min} + L_s
+\end{cases}$$
+
+Similarly, for an active eastern boundary with upper coordinate limit $\lambda'_{\max}$:
+
+$$\gamma_e(\lambda') = \begin{cases}
+1, & \lambda' \ge \lambda'_{\max} \\
+\left(\frac{\lambda' - (\lambda'_{\max} - L_s)}{L_s}\right)^2, & \lambda'_{\max} - L_s < \lambda' < \lambda'_{\max} \\
+0, & \lambda' \le \lambda'_{\max} - L_s
+\end{cases}$$
+
+The composite lateral mask combines all active boundary contributions:
+
+$$\gamma(\lambda', \phi') = \max\left(\gamma_e(\lambda'), \gamma_w(\lambda'), \gamma_n(\phi'), \gamma_s(\phi')\right)$$
+
+In Oceananigans, lateral relaxation is introduced as a tendency term:
+
+$$\mathcal{F}_\psi = -\frac{\gamma(\lambda', \phi')}{\tau_{\text{relax}}} \left(\psi - \psi_{\text{target}}\right)$$
+
+where $\psi \in \{u, v, T, S\}$ and $\tau_{\text{relax}}$ is the relaxation timescale (default 3600 seconds).
+
+#### GPU Device Kernel Lowering
+
+Passing closures that capture heap-allocated objects or variables of abstract type prevents CUDA LLVM IR generation. Both [`CartesianSpongeMask`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl) and [`RotatedSpongeMask`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl) are declared as concrete, immutable `isbits` structs with precomputed trigonometric constants ($\cos\lambda_p, \sin\lambda_p, \cos\phi_p^*, \sin\phi_p^*$). With `Adapt.adapt_structure(to, s) = s`, the functors lower into device registers and execute inline without GPU scalar indexing or memory allocation.
+
+#### Barotropic Wave Stability & Substepping
+
+In shallow shelf and slope waters, barotropic external gravity waves propagate at phase speed:
+
+$$c = \sqrt{g H}$$
+
+At the shelf break floor depth $H = 350\,\text{m}$, $c \approx 58.6\,\text{m/s}$. Across a cross-shelf grid spacing $\Delta y \approx 3,380\,\text{m}$, the barotropic Courant number satisfies:
+
+$$\text{CFL}_{\text{wave}} = \frac{c \, \Delta t}{\Delta y} \approx 0.0173 \, \Delta t$$
+
+Oceananigans employs a split-explicit free-surface solver ([`SplitExplicitFreeSurface`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl)) where the 2D barotropic equations are integrated over $N_{\text{sub}}$ substeps per baroclinic time step $\Delta t$. When $\Delta t \ge 20.0\,\text{s}$ with $\text{cfl} = 0.7$, $N_{\text{sub}}$ drops to 1, disabling the barotropic substepping filter over steep topographic slopes. Restricting $\Delta t_{\max} \le 12.0\text{--}15.0\,\text{s}$ maintains active substepping averaging and keeps $\text{CFL}_{\text{wave}} \le 0.21\text{--}0.26$, preventing forward-backward acoustic-gravitational resonance.
+
 ## Vertical Discretization & Standardized Depth Conventions
 
 ### Intuitive Overview (Generalists)

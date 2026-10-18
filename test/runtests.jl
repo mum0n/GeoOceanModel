@@ -45,6 +45,10 @@ const AVAILABLE_SEGMENTS = Dict{Symbol, @NamedTuple{file::String, desc::String}}
     :mosaic => (
         file = "test_mosaic.jl",
         desc = "Multi-Domain Stitching & Mosaic Blending"
+    ),
+    :sponge => (
+        file = "test_sponge.jl",
+        desc = "Lateral Sponge Relaxation & Rotated Grid Boundary Dampening"
     )
 )
 

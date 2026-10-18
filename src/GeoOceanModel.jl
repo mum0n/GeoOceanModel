@@ -73,6 +73,10 @@ include("data/geodata/geodata_integration.jl")
 include("driver.jl")
 include("assimilation.jl")
 
-export stitch_shelf_domains
+export stitch_shelf_domains,
+    CartesianSpongeMask,
+    RotatedSpongeMask,
+    rotate_to_curvilinear,
+    extract_rotated_grid_bounds
 
 end # module
