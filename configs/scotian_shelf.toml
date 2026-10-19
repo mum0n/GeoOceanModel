@@ -142,7 +142,7 @@ run_id = ""                   # Unique identifier
 [visualization]
 # Diagnostics and interactive visualization
 interactive_map = true        # Export interactive HTML5 Leaflet map
-animate_hydro = false         # Generate hydrodynamic flow animation
+animate_hydro = true         # Generate hydrodynamic flow animation
 anim_variable = "dashboard"   # Variable to animate
 anim_fps = 10                 # Animation FPS
 anim_format = "mp4"           # Video format

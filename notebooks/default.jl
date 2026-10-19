@@ -392,8 +392,9 @@ A single column is where stratification is legible.
 # ╔═╡ 60a697c2-71be-4e5b-9e9d-4c3d2f1b7e25
 # ╠═╡
 import GeoOceanModel: compute_hydrodynamic_diagnostics
-using Statistics
+import GeoOceanModel: animate_hydrodynamic_field
 
+using Statistics
 diag = compute_hydrodynamic_diagnostics(ds.lons, ds.lats, ds.depths, ds.u, ds.v, ds.w, ds.temperature, ds.salinity)
 
 imap = argmin(abs.(ds.lons .- mean(ds.lons)))
@@ -646,3 +647,4 @@ Knobs worth turning first, in the order they matter:
 # ╠═d0000001-0001-0001-0001-000000000004
 # ╠═d0000001-0001-0001-0001-000000000005
 # ╠═93d9c0f5-0a41-4e8e-9bc0-7f6a5c4e0b58
+# ╠═b2c3d4e5-f6a7-8901-bcde-f23456789012

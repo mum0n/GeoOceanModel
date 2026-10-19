@@ -1,5 +1,5 @@
 ### A Pluto.jl notebook ###
-# v1.0.4
+# v1.0.3
 
 using Markdown
 using InteractiveUtils
@@ -931,6 +931,7 @@ Print one profile rather than a volume: a single column is where stratification 
 # ╔═╡ 7d68cb57-846f-4e78-9b89-015964272c1f
 
 import GeoOceanModel: compute_hydrodynamic_diagnostics
+import GeoOceanModel: animate_hydrodynamic_field
 
 using Statistics
 
@@ -1160,6 +1161,32 @@ Knobs worth turning first, in the order they matter:
 
 """
 
+# ╔═╡ a1b2c3d4-e5f6-7890-abcd-ef1234567890
+# ╠═╡
+begin
+    using CairoMakie
+    import CairoMakie: record
+    
+    # Animate surface current speed over time from the stored GeoData archive
+    anim_path = joinpath(OUTDIR, "outputs", "surface_speed_animation.mp4")
+    mkpath(dirname(anim_path))
+    
+    animate_hydrodynamic_field(
+        sim_res.output_path;
+        variable = :speed,
+        depth_level = 1,
+        n_frames = min(12, length(_times)),
+        framerate = 2,
+        output_path = anim_path,
+        title = "Scotian Shelf — Surface Current Speed",
+        domain_lon = opts.domain_lon,
+        domain_lat = opts.domain_lat,
+    )
+    
+    println("Animation saved to: ", anim_path)
+    anim_path
+end
+
 # ╔═╡ Cell order:
 # ╠═3d1a0c52-7b21-4f6e-9c2b-6f6f4a0a5d01
 # ╠═2f9a1e77-5c34-4b8d-9a71-1c2f8b3e5a10
@@ -1200,3 +1227,4 @@ Knobs worth turning first, in the order they matter:
 # ╠═b0000001-0001-0001-0001-000000000004
 # ╠═b0000001-0001-0001-0001-000000000005
 # ╠═a091fe8a-13ab-4c23-9d12-048c97541084
+# ╠═a1b2c3d4-e5f6-7890-abcd-ef1234567890
