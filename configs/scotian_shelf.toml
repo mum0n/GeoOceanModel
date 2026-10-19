@@ -107,12 +107,12 @@ projection_year = 2022        # Target simulation year
 
 [hydrodynamics]
 # Numerical solver controls and adaptive stepping
-sim_duration_hours = 72.0       # 3-day simulation duration for tidal test
+sim_duration_hours = 13140.0       # 1.5yr simulation duration for tidal test
 sim_dt_seconds = 12.0          # Baseline time step in seconds
 min_dt_seconds = 1.0          # Minimum adaptive time step floor (seconds)
-max_dt_seconds = 30.0          # Maximum adaptive time step ceiling (seconds)
+max_dt_seconds = 360.0          # Maximum adaptive time step ceiling (seconds)
 adaptive_cfl = true           # Modulate dt according to advective and wave CFL
-target_cfl = 0.2             # Target advective CFL limit (increased from 0.08 for stability)
+target_cfl = 0.4             # Target advective CFL limit (increased from 0.08 for stability)
 target_wave_cfl = 0.2        # Target barotropic gravity wave CFL limit (increased from 0.08 for stability)
 surface_heat_flux = 50.0      # Baseline sensible heat flux (W/m^2)
 sst_damping_coefficient = 40.0 # Haney SST relaxation (W m-2 K-1)
