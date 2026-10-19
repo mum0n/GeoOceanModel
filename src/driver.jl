@@ -572,8 +572,6 @@ function run_segment_model(;
         nothing
     end
 
-    coriolis_lat = 0.5 * (opts.domain_lat[1] + opts.domain_lat[2])
-
 """
     fetch_boundary_tracers(source::Symbol, opts) -> NamedTuple
 
@@ -720,6 +718,43 @@ end
         atmo_craft.heat_flux
     end
 
+    # ── Rotated-grid coherence: geographic → rotated stress components ───────────
+    # On a RotatedLatitudeLongitudeGrid, Oceananigans interprets FluxBoundaryCondition
+    # stress values as components along the rotated curvilinear axes (x′ along-shelf,
+    # y′ cross-shelf), not geographic east/north. Without rotation, wind stress is
+    # applied ~50° off the true direction, driving spurious cross-shelf flow.
+    #
+    # Rotation matrix (θ = azimuth clockwise from North):
+    #   τ_x′ = τ_east·sin(θ) + τ_north·cos(θ)
+    #   τ_y′ = -τ_east·cos(θ) + τ_north·sin(θ)
+    #
+    # We must NOT wrap callables in closures: closures are not Adapt-safe for GPU.
+    # Instead, rotate the `TimeSeriesSurfaceStress` `.values` tuple directly and
+    # rebuild bitstype objects that Adapt can copy to device.
+    θ_rot = deg2rad(Float64(opts.rotation_azimuth))
+    sin_θ, cos_θ = sin(θ_rot), cos(θ_rot)
+
+    if wind_x isa TimeSeriesSurfaceStress && wind_y isa TimeSeriesSurfaceStress
+        nx = length(wind_x.values)
+        x_vals = ntuple(i -> Float64(wind_x.values[i]) * sin_θ + Float64(wind_y.values[i]) * cos_θ, nx)
+        y_vals = ntuple(i -> -Float64(wind_x.values[i]) * cos_θ + Float64(wind_y.values[i]) * sin_θ, nx)
+        wind_x_rot = TimeSeriesSurfaceStress{length(x_vals)}(x_vals, wind_x.horizon, wind_x.tstep)
+        wind_y_rot = TimeSeriesSurfaceStress{length(y_vals)}(y_vals, wind_y.horizon, wind_y.tstep)
+    elseif wind_x isa Number && wind_y isa Number
+        wind_x_rot = wind_x * sin_θ + wind_y * cos_θ
+        wind_y_rot = -wind_x * cos_θ + wind_y * sin_θ
+    else
+        error("wind_x and wind_y must be both TimeSeriesSurfaceStress or both numbers")
+    end
+
+    # Same rotation for sponge target velocities (u_inflow/v_inflow are geographic)
+    u_inflow_rot, v_inflow_rot = if opts.u_inflow isa Number && opts.v_inflow isa Number
+        (opts.u_inflow * sin_θ + opts.v_inflow * cos_θ,
+         -opts.u_inflow * cos_θ + opts.v_inflow * sin_θ)
+    else
+        error("u_inflow and v_inflow must be numbers")
+    end
+
     # SplitExplicitFreeSurface with explicit substepping (substeps = 45).
     # Provides an averaging filter for fast barotropic gravity waves over steep
     # bathymetry, suppressing 2-delta numerical resonance near open boundaries.
@@ -734,9 +769,8 @@ end
     model = build_hydrodynamic_model(
         target_grid,
         Δt = opts.sim_dt,
-        coriolis_latitude = coriolis_lat,
-        surface_wind_stress_x = wind_x,
-        surface_wind_stress_y = wind_y,
+        surface_wind_stress_x = wind_x_rot,
+        surface_wind_stress_y = wind_y_rot,
         surface_heat_flux = surface_heat_flux_val,
         tidal_forcing = tidal_forcing,
         open_boundary_conditions = obc_craft,
@@ -748,8 +782,8 @@ end
     # `tidal_relaxation_timescale` (the umbrella driver's older `tidal_tau` spelling was
     # renamed in `src/model/hydrodynamic_model.jl`).
     tidal_relaxation_timescale = opts.tidal_relaxation_timescale,
-        u_inflow = opts.u_inflow,
-        v_inflow = opts.v_inflow,
+        u_inflow = u_inflow_rot,
+        v_inflow = v_inflow_rot,
         boundary_tracers = boundary_tracer_data,
         closure = closure_choice in (:nemotke, :catke) ? :catke : nothing,
         ν = 1e-2,
@@ -829,18 +863,7 @@ end
             end
 
             # Sanitize NaN/Inf in WOA23 boundary tracers before integration.
-            nan_count = 0
-            for tr in (:T, :S)
-                field = model.tracers[tr]
-                data = field.data
-                bad = findall(x -> !isfinite(x), data)
-                isempty(bad) && continue
-                ref = tr === :T ? 12.0 : 35.0
-                for idx in bad
-                    data[idx] = Float64(ref)
-                    nan_count += 1
-                end
-            end
+            nan_count = _sanitize_tracers!(model)
             nan_count > 0 && @warn "Replaced $nan_count non-finite WOA23 tracer values (T→12°C, S→35 PSU)."
         else
             error(
@@ -860,18 +883,7 @@ end
             # Real-world climatology files (WOA23, GLORYS12V1, Copernicus) commonly carry
             # NaN near land cells and at domain edges; if left in the tracer fields they
             # propagate through advection and eventually trigger the divergence watchdog.
-            nan_count = 0
-            for tr in (:T, :S)
-                field = model.tracers[tr]
-                data = field.data
-                bad = findall(x -> !isfinite(x), data)
-                isempty(bad) && continue
-                ref = tr === :T ? 12.0 : 35.0
-                for idx in bad
-                    data[idx] = Float64(ref)
-                    nan_count += 1
-                end
-            end
+            nan_count = _sanitize_tracers!(model)
             nan_count > 0 && @warn "Replaced $nan_count non-finite boundary tracer values (T→12°C, S→35 PSU)."
         else
             copernicus_file = joinpath(opts.input_dir, "copernicus_ts.nc")
@@ -897,18 +909,7 @@ end
                 set!(model, u = 0.0, v = 0.0)
 
                 # Sanitize NaN/Inf in Copernicus boundary tracers before integration.
-                nan_count = 0
-                for tr in (:T, :S)
-                    field = model.tracers[tr]
-                    data = field.data
-                    bad = findall(x -> !isfinite(x), data)
-                    isempty(bad) && continue
-                    ref = tr === :T ? 12.0 : 35.0
-                    for idx in bad
-                        data[idx] = Float64(ref)
-                        nan_count += 1
-                    end
-                end
+                nan_count = _sanitize_tracers!(model)
                 nan_count > 0 && @warn "Replaced $nan_count non-finite Copernicus tracer values (T→12°C, S→35 PSU)."
             catch err
                 error(
@@ -931,18 +932,7 @@ end
 
     # Final safety net: catch any non-finite tracer values that slipped through
     # the per-source NaN guards, before they corrupt the time integration.
-    nan_count = 0
-    for tr in (:T, :S)
-        field = model.tracers[tr]
-        data = field.data
-        bad = findall(x -> !isfinite(x), data)
-        isempty(bad) && continue
-        ref = tr === :T ? 12.0 : 35.0
-        for idx in bad
-            data[idx] = Float64(ref)
-            nan_count += 1
-        end
-    end
+    nan_count = _sanitize_tracers!(model)
     nan_count > 0 && @warn "Final NaN guard: replaced $nan_count non-finite tracer values (T→12°C, S→35 PSU)."
 
     # Calculate Simpson-Hunter tidal mixing front parameters
@@ -1432,3 +1422,37 @@ Owned by the LARVAL half (`GeoLarvalTracking`). See `run_segment_tracking`.
 run_segment_visualize(args...; kwargs...) = error(
     "`run_segment_visualize` is owned by GeoLarvalTracking, not by this package: run it " *
     "from `GeoLarvalTrackingRun.jl` against the store this one wrote.")
+
+"""
+    _sanitize_tracers!(model) -> Int
+
+GPU-safe NaN/Inf sanitizer for temperature and salinity tracer fields. Copies each field
+to CPU (GPU arrays disallow scalar indexing via `findall`), replaces non-finite values
+with reference values (T→12°C, S→35 PSU), copies back to device, and returns the count
+of replaced values.
+"""
+function _sanitize_tracers!(model)
+    nan_count = 0
+    for tr in (:T, :S)
+        hasproperty(model.tracers, tr) || continue
+        field = model.tracers[tr]
+        data = field.data
+        # GPU arrays are OffsetArray-wrapping-CuArray; unwrap parent first so
+        # on_architecture(CPU(), …) produces a plain CPU Array we can scan safely.
+        if data isa OffsetArrays.OffsetArray
+            data_cpu = OffsetArrays.OffsetArray(
+                on_architecture(CPU(), parent(data)), axes(data))
+        else
+            data_cpu = on_architecture(CPU(), data)
+        end
+        bad = findall(x -> !isfinite(x), data_cpu)
+        isempty(bad) && continue
+        ref = tr === :T ? 12.0 : 35.0
+        for idx in bad
+            data_cpu[idx] = Float64(ref)
+            nan_count += 1
+        end
+        copyto!(field.data, data_cpu)
+    end
+    return nan_count
+end

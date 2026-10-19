@@ -331,7 +331,6 @@ stepping, checkpointing and JLD2 output machinery and therefore only needs the m
 function build_hydrodynamic_model(
     grid;
     Δt::Real = 120.0,
-    coriolis_latitude::Real = 45.0,
     surface_wind_stress_x = 0.0001,
     surface_wind_stress_y = 0.0,
     surface_heat_flux = 0.0,

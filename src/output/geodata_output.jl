@@ -215,6 +215,20 @@ function _to_centres(arr::AbstractArray{T, 3}, grid_shape::Tuple{Int, Int, Int})
 end
 
 """
+    _grid_shape_for_centres(raw_ax) -> (nx, ny, nz)
+
+Return the interior grid shape from the coordinate axes extracted by `_field_arrays`.
+For standard `LatitudeLongitudeGrid`, `raw_ax.x`/`raw_ax.y` are 1D vectors of length Nx/Ny.
+For rotated `OrthogonalSphericalShellGrid`, they are 2D matrices of size (Nx, Ny).
+"""
+function _grid_shape_for_centres(raw_ax)
+    nx = ndims(raw_ax.x) == 2 ? size(raw_ax.x, 1) : length(raw_ax.x)
+    ny = ndims(raw_ax.x) == 2 ? size(raw_ax.x, 2) : length(raw_ax.y)
+    nz = length(raw_ax.z)
+    return (nx, ny, nz)
+end
+
+"""
     _field_arrays(model) -> (; x, y, z)
 
 The grid's **interior** cell centres as geographic `(lon, lat, depth)`.
@@ -234,6 +248,14 @@ function _field_arrays(model)
     if base isa Oceananigans.Grids.LatitudeLongitudeGrid
         c = extract_grid_coordinates(base)
         return (x = Float64.(c.lons), y = Float64.(c.lats), z = Float64.(c.depths))
+    elseif base isa Oceananigans.Grids.OrthogonalSphericalShellGrid
+        c = extract_grid_coordinates(base)
+        # c.lons/c.lats are 2D matrices (Nx×Ny) for rotated curvilinear grids.
+        # Collapse to 1D coordinate axes by averaging along each dimension,
+        # so the store has 1D coordinate axes matching the field dimensions.
+        lons_1d = [mean(c.lons[i, :]) for i in 1:size(c.lons, 1)]
+        lats_1d = [mean(c.lats[:, j]) for j in 1:size(c.lats, 2)]
+        return (x = Float64.(lons_1d), y = Float64.(lats_1d), z = Float64.(c.depths))
     end
     # Metric/rectilinear grid (the unit tests): Cartesian horizontal centres in metres, halo
     # stripped, with the vertical centre from `znode` as above. `_host_copy` rather than a
@@ -280,7 +302,7 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
         # every field on the one grid its dimension records describe -- and a reader does not
         # have to know about staggering to read the store.
         centred = Float32.(_to_centres(Array{Float32}(interior(f)),
-                                       (length(raw_ax.x), length(raw_ax.y), length(raw_ax.z))))
+                                       _grid_shape_for_centres(raw_ax)))
         fields[name] = length(z_indices) < length(raw_ax.z) ? centred[:, :, z_indices] : centred
     end
 

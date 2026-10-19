@@ -244,17 +244,20 @@ end
     Ce = 1.5e-3
 
     # Vapor pressure and saturation formulas (August-Roche-Magnus approximation)
+    # Ta arrives in Kelvin (ERA5). T_surf arrives in °C (model tracer). Convert
+    # T_surf to Kelvin so all thermodynamic formulas are dimensionally consistent.
+    T_surf_K = T_surf + 273.15
     esat_Ta = 611.2 * exp(17.67 * (Ta - 273.15) / (Ta - 29.65))
     e_a = r_h * esat_Ta
-    esat_Ts = 611.2 * exp(17.67 * (T_surf - 273.15) / (T_surf - 29.65))
+    esat_Ts = 611.2 * exp(17.67 * (T_surf_K - 273.15) / (T_surf_K - 29.65))
     qsat_Ts = 0.622 * esat_Ts / (p_s - 0.378 * esat_Ts)
     q_a = 0.622 * e_a / (p_s - 0.378 * e_a)
 
     U = _wind_speed_from_stress_inline(tau)
     sw_net = (1.0 - s.albedo) * (1.0 - 0.65 * c_f * c_f) * sw_d
     lw_factor = (0.34 - 0.14 * e_a / 1000.0) * (1.0 - 0.8 * c_f)
-    lw_net = sigma * (T_surf^4 - Ta^4) * lw_factor
-    sens = rho_a * cp_a * Cd * U * (T_surf - Ta)
+    lw_net = sigma * (T_surf_K^4 - Ta^4) * lw_factor
+    sens = rho_a * cp_a * Cd * U * (T_surf_K - Ta)
     lat = rho_a * Lv * Ce * U * (qsat_Ts - q_a)
 
     return sw_net - lw_net - sens - lat
@@ -336,9 +339,17 @@ function build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
             # Wind stress files carry dynamic stress in Pa (kg m^-1 s^-2).
             # Oceananigans FluxBoundaryCondition expects kinematic stress (m^2 s^-2),
             # so divide by reference water density before assigning.
+            # Filter NaN/Inf values to prevent them from propagating into the model
+            # and causing numerical divergence at later time steps.
             rho_water = 1025.0
-            tx_tuple = ntuple(k -> Float64(tx[1, 1, k]) / rho_water, nt)
-            ty_tuple = ntuple(k -> Float64(ty[1, 1, k]) / rho_water, nt)
+            tx_tuple = ntuple(k -> begin
+                v = Float64(tx[1, 1, k]) / rho_water
+                isfinite(v) ? v : 0.0
+            end, nt)
+            ty_tuple = ntuple(k -> begin
+                v = Float64(ty[1, 1, k]) / rho_water
+                isfinite(v) ? v : 0.0
+            end, nt)
             ta_tuple = ntuple(k -> Float64(ta[1, 1, k]), nt)
             ps_tuple = ntuple(k -> Float64(ps[1, 1, k]), nt)
             rh_tuple = ntuple(k -> Float64(rh[1, 1, k]), nt)
@@ -373,11 +384,13 @@ function build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
         rho_water = 1025.0
         tx_tuple = ntuple(k -> begin
             v = filter(!isnan, tx_arr[:, :, k])
-            isempty(v) ? 0.0 : Float64(Statistics.mean(v)) / rho_water
+            val = isempty(v) ? 0.0 : Float64(Statistics.mean(v)) / rho_water
+            isfinite(val) ? val : 0.0
         end, nt)
         ty_tuple = ntuple(k -> begin
             v = filter(!isnan, ty_arr[:, :, k])
-            isempty(v) ? 0.0 : Float64(Statistics.mean(v)) / rho_water
+            val = isempty(v) ? 0.0 : Float64(Statistics.mean(v)) / rho_water
+            isfinite(val) ? val : 0.0
         end, nt)
 
         stress_x = TimeSeriesSurfaceStress{nt}(tx_tuple, horizon, tstep)
