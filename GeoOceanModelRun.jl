@@ -66,7 +66,7 @@ end
 using GeoOceanModel
 using GeoOceanModel: configuration_to_options,
     options_to_configuration, save_configuration, resolve_config_name, load_configuration,
-    run_segment_data, run_segment_grid, run_segment_model, run_segment_climate,
+    run_segment_data, run_segment_grid, run_segment_model,
     run_segment_simulation, HydrodynamicOptions
 using TOML
 
@@ -86,13 +86,10 @@ function display_help(io::IO = stdout)
       --data      Fetch the coastline, the bathymetry and the surface winds the config names.
       --grid      Build the spherical grid and the immersed-boundary wrapper.
       --model     Configure the hydrostatic free-surface model on that grid.
-      --climate   Apply the scenario's warming and freshening to the stratification.
-                  A perturbation, not a prerequisite: it runs only when named.
       --sim       Integrate the primitive equations and write the flow solution.
 
     End to end:
-      --all        data through --sim, without the climate perturbation: produce the flow
-                   solution, then stop. Use --climate to run the scenario as well.
+      --all        data through --sim: produce the flow solution, then stop.
 
     Configuration:
       --config=FILE      A path, or a name resolved against configs/.
@@ -124,7 +121,7 @@ function parse_args(args::Vector{String})
         "segments" => String[], "config" => "", "save_config" => nothing,
         "output_dir" => "", "all" => false, "overwrite" => false, "help" => false)
     for a in args
-        if a in ("--data", "--grid", "--model", "--climate", "--sim")
+        if a in ("--data", "--grid", "--model", "--sim")
             push!(out["segments"], replace(a, "--" => ""))
         elseif a == "--all"
             out["all"] = true
@@ -204,7 +201,7 @@ The ocean segments in dependency order, as `run_production_pipeline` composes th
 segment needs the ones before it, so requesting one runs its prerequisites rather than
 erroring on a missing grid or model.
 """
-const SEG_CHAIN = ["data", "grid", "model", "climate", "sim"]
+const SEG_CHAIN = ["data", "grid", "model", "sim"]
 
 """
     run_segments(opts::HydrodynamicOptions, requested::Vector{String}) -> NamedTuple
@@ -231,11 +228,9 @@ function run_segments(opts::HydrodynamicOptions, requested::Vector{String})
     # so it runs only when named: `--all` and `--sim` alone both produce the flow solution
     # from the unperturbed model, which is what the larval half tracks through.
     target_idx = isempty(order) ? 3 : maximum(i -> findfirst(==(i), SEG_CHAIN), order)
-    plan = filter(1:target_idx) do i
-        SEG_CHAIN[i] != "climate" || "climate" in order
-    end
+    plan = collect(1:target_idx)
 
-    data_res = grid_res = model_res = climate_res = sim_res = nothing
+    data_res = grid_res = model_res = sim_res = nothing
     for i in plan
         seg = SEG_CHAIN[i]
         if seg == "data"
@@ -247,14 +242,12 @@ function run_segments(opts::HydrodynamicOptions, requested::Vector{String})
             model_res = run_segment_model(; opts = opts,
                                           immersed_grid = grid_res.immersed_grid,
                                           tau_x = tau_x, tau_y = tau_y)
-        elseif seg == "climate"
-            climate_res = run_segment_climate(; opts = opts, model = model_res.model)
         elseif seg == "sim"
             sim_res = run_segment_simulation(; opts = opts, model = model_res.model)
         end
     end
     return (data = data_res, grid = grid_res, model = model_res,
-            climate = climate_res, sim = sim_res)
+            climate = nothing, sim = sim_res)
 end
 
 function main(args::Vector{String})
@@ -290,7 +283,7 @@ function main(args::Vector{String})
     # perturbation (see `run_segments`: `climate` is named or it does not run). The segment
     # functions are the package's own `src/driver.jl`, imported above; this script only
     # decides how far down the chain to go and then dispatches.
-    requested = flags["all"] ? filter(!=("climate"), SEG_CHAIN) : flags["segments"]
+    requested = flags["all"] ? SEG_CHAIN : flags["segments"]
     isempty(requested) && return display_help()
 
     results = run_segments(opts, requested)

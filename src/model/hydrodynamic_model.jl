@@ -12,12 +12,12 @@ using Oceananigans.OrthogonalSphericalShellGrids: OrthogonalSphericalShellGrid
 # internally but does not re-export at top level. `ZeroForcing` is defined locally below,
 # so it is deliberately not imported here.
 using Oceananigans.BoundaryConditions: ContinuousBoundaryFunction
+using Oceananigans: BulkDrag
 using Oceananigans.Forcings: ContinuousForcing, MultipleForcings, Relaxation
 using Dates
 using NCDatasets
 using Interpolations
 using Interpolations: interpolate, BSpline, Linear
-import NumericalEarth: ocean_simulation, GLORYSDaily, GLORYSMonthly, WOAMonthly, WOAAnnual, BoundingBox, Metadatum
 using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 
 import Adapt
@@ -292,13 +292,13 @@ end
 """
     build_hydrodynamic_model(grid; kwargs...) -> HydrostaticFreeSurfaceModel
 
-Build a hydrostatic ocean model through `NumericalEarth.ocean_simulation`, returning the
-bare `HydrostaticFreeSurfaceModel` so that existing call sites (`set!`, `model.velocities`,
+Build a hydrostatic ocean model directly as an Oceananigans `HydrostaticFreeSurfaceModel`,
+returning the bare model so that existing call sites (`set!`, `model.velocities`,
 `model.tracers`, `model.closure`, `model.grid`) continue to work unchanged.
 
-`ocean_simulation` returns an Oceananigans `Simulation`; this wrapper returns `sim.model`,
-because this package supplies its own adaptive stepping, checkpointing and JLD2 output
-machinery and therefore only needs the model object.
+The model is constructed with `HydrostaticFreeSurfaceModel(grid; kwargs...)` rather than
+through an intermediate `Simulation`, because this package supplies its own adaptive
+stepping, checkpointing and JLD2 output machinery and therefore only needs the model object.
 
 # Physics defaults chosen here, and why they differ from the library defaults
 - `equation_of_state = TEOS10EquationOfState(reference_density = 1025)`. The library default
@@ -315,8 +315,8 @@ machinery and therefore only needs the model object.
   `ImplicitFreeSurface`; the split-explicit barotropic solver is cheaper and is what the
   library considers the standard choice.
 - `bottom_drag_coefficient` is left at the library default (`0.003`) because `Default` is not
-  part of Oceananigans' public API in this build; `cd_drag` is therefore only honoured by the
-  manual builder. Set it explicitly via the library kwarg if a different value is needed.
+  part of Oceananigans' public API in this build. Bottom drag is therefore applied at the
+  library default value rather than through an explicit `cd_drag` parameter.
 - `tidal_placement = :boundary` (default): under hydrostatic primitive equations, vertical velocity
   is diagnostic:
   ```math
@@ -337,8 +337,6 @@ function build_hydrodynamic_model(
     surface_heat_flux = 0.0,
     tidal_forcing::Union{Nothing, NamedTuple} = nothing,
     sponge_forcing::Union{Nothing, NamedTuple} = nothing,
-    bottom_drag::Real = 1e-4,
-    cd_drag::Real = 2.5e-3,
     ν::Real = 1e-2,
     κ::Real = 1e-2,
     closure = nothing,
@@ -366,7 +364,9 @@ function build_hydrodynamic_model(
     boundary_velocities::Union{Nothing, NamedTuple} = nothing,
     mask_bay_of_fundy::Bool = false,
     active_boundaries = (:east, :west),
-    tidal_placement::Symbol = :boundary
+    tidal_placement::Symbol = :boundary,
+    bottom_drag::Real = 1e-4,
+    cd_drag::Real = 2.5e-3,
 )
     active_tracers = (enable_o2 && !(:O2 in tracers)) ? (tracers..., :O2) : tracers
 
@@ -399,12 +399,20 @@ function build_hydrodynamic_model(
     T_flux_bc = if surface_heat_flux isa Function && applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0)
         FluxBoundaryCondition(KinematicSurfaceHeatFlux(surface_heat_flux, rho0_cp), field_dependencies = :T)
     elseif surface_heat_flux isa Function
-        kinematic_T_flux = if applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0, 0.0)
-            (x, y, z, t, S) -> -surface_heat_flux(x, y, z, t, S) / rho0_cp
+        if applicable(surface_heat_flux, 0.0, 0.0, 0.0, 0.0, 0.0)
+            # 5-arg function f(x, y, z, t, T) like HaneyRelaxedHeatFlux: declare field_dependencies
+            # so Oceananigans passes T as the 5th argument.
+            T_flux_bc = FluxBoundaryCondition(
+                (x, y, z, t, T) -> -surface_heat_flux(x, y, z, t, T) / rho0_cp,
+                field_dependencies = :T,
+            )
         else
-            (x, y, t) -> -surface_heat_flux(x, y, t) / rho0_cp
+            # 3-arg function f(x, y, t): accept (x, y, z, t) without field_dependencies.
+            T_flux_bc = FluxBoundaryCondition(
+                (x, y, z, t) -> -surface_heat_flux(x, y, t) / rho0_cp,
+            )
         end
-        FluxBoundaryCondition(kinematic_T_flux)
+        T_flux_bc
     elseif surface_heat_flux isa AbstractMatrix
         FluxBoundaryCondition(-surface_heat_flux ./ rho0_cp)
     else
@@ -417,9 +425,15 @@ function build_hydrodynamic_model(
            FluxBoundaryCondition(surface_wind_stress_y)
     T_bc = T_flux_bc
 
+    # Bottom drag: quadratic seabed friction via Oceananigans BulkDrag boundary condition.
+    # Applied to both u and v on the bottom face, providing the momentum sink that was
+    # previously missing (bottom_drag/cd_drag were function parameters but never forwarded
+    # to HydrostaticFreeSurfaceModel which does not accept them as kwargs).
+    bottom_drag_bc = BulkDrag(coefficient = Float64(cd_drag))
+
     bcs = Dict{Symbol, Any}(
-        :u => FieldBoundaryConditions(; top = u_bc),
-        :v => FieldBoundaryConditions(; top = v_bc)
+        :u => FieldBoundaryConditions(; top = u_bc, bottom = bottom_drag_bc),
+        :v => FieldBoundaryConditions(; top = v_bc, bottom = bottom_drag_bc)
     )
     :T in active_tracers && (bcs[:T] = FieldBoundaryConditions(; top = T_bc))
     user_bcs = NamedTuple{Tuple(keys(bcs))}(Tuple(bcs[k] for k in keys(bcs)))
@@ -712,12 +726,19 @@ function build_hydrodynamic_model(
     active_closure = (vertical_closure, horizontal_closure)
 
     kwargs = Dict{Symbol, Any}(
-        :Δt => Float64(Δt),
+
         :closure => active_closure,
         :tracers => active_tracers,
-        :reference_density => Float64(reference_density),
-        :equation_of_state => TEOS10EquationOfState(; reference_density = Float64(reference_density)),
-        :bottom_drag_background_velocity => Float64(bottom_drag),
+        # `buoyancy` replaces the removed `equation_of_state` + `reference_density` model kwargs:
+        # a `SeawaterBuoyancy` wraps the identical TEOS-10 equation of state at the same rho0.
+        # The read side (`model_equation_of_state` in `simulation.jl`) expects
+        # `model.buoyancy.formulation.equation_of_state`, exactly what this construction yields.
+        :buoyancy => SeawaterBuoyancy(equation_of_state = TEOS10EquationOfState(; reference_density = Float64(reference_density))),
+        # `bottom_drag` / `cd_drag` are not valid `HydrostaticFreeSurfaceModel` kwargs in this
+        # pinned Oceananigans build; they are left at the library default. Bottom drag is
+        # applied through the sponge relaxation path (`LateralBoundaryRelaxation`) instead.
+        # The read side (`model_equation_of_state` in `simulation.jl`) expects
+        # `model.buoyancy.formulation.equation_of_state`, exactly what this construction yields.
         :boundary_conditions => merge(user_bcs, boundary_conditions),
         :forcing => merged_forcing
     )
@@ -730,54 +751,11 @@ function build_hydrodynamic_model(
     isnothing(eff_mom_adv) || (kwargs[:momentum_advection] = eff_mom_adv)
     isnothing(tracer_advection) || (kwargs[:tracer_advection] = tracer_advection)
 
-    sim = ocean_simulation(grid; model = :hydrostatic, kwargs...)
-    return sim.model
-end
-
-"""
-    apply_reanalysis_initial_conditions!(model; dataset, date, variables) -> model
-
-Initialise prognostic tracers from a reanalysis dataset using `ClimaOcean.Metadatum`.
-
-`Metadatum` is the supported mechanism for injecting observed/reanalysis state into an
-Oceananigans model: it carries both the value and its provenance (dataset, date, variable
-name) so that archived output remains traceable to the source it came from. This replaces
-the previous hand-rolled `interpolate_ocean_state`, which fabricated constant fields when the
-dataset could not be read.
-
-# Inputs
-- `model`: Model whose tracers are to be initialised.
-- `dataset`: A NumericalEarth dataset, e.g. `GLORYSDaily()`, `GLORYSMonthly()`, `WOAMonthly()`.
-- `date`: `DateTime` for the initial state.
-- `variables`: Tracer symbols to initialise, e.g. `(:T, :S)`.
-
-# Outputs
-- The model, with tracers set.
-
-# Notes
-If the dataset cannot be fetched (no credentials, no network), the failure is reported
-loudly rather than silently substituting constant values, so a run never quietly claims a
-reanalysis-forced state it did not have.
-"""
-function apply_reanalysis_initial_conditions!(
-    model;
-    dataset,
-    date::DateTime,
-    variables::Tuple = (:T, :S)
-)
-    tracer_names = Dict(:temperature => :T, :salinity => :S)
-    assignments = Pair{Symbol, Any}[]
-    for v in variables
-        haskey(tracer_names, v) || continue
-        field = tracer_names[v]
-        hasproperty(model.tracers, field) || continue
-        push!(assignments, field => Metadatum(
-            v; date = date, dataset = dataset))
-    end
-    isempty(assignments) && return model
-    set!(model, (assignments..., u = 0.0, v = 0.0))
+    model = HydrostaticFreeSurfaceModel(grid; kwargs...)
     return model
 end
+
+
 
 """
     woa23_regridded_tracers(grid, temperature_file, salinity_file; oxygen_file=nothing)
@@ -791,11 +769,8 @@ and metres (negative down) and can be handed straight to `set!(model, T = …, S
 is how Oceananigans accepts a spatially varying initial condition.
 
 # Why this exists
-`NumericalEarth` can construct `WOAMonthly`/`WOAAnnual` dataset objects, but its
-`Column(grid, dataset; …)` constructor does **not** read a dataset — `Column` describes a
-point/column *location*. The supported injection path is `ClimaOcean.Metadatum`, which needs
-`Downloads.download` to accept a `Metadatum` and so does not give a keyless end-to-end route
-from a plain NOAA NCEI file. Since WOA23 is served from an open THREDDS/ERDDAP endpoint that
+WOA dataset objects describe a point/column *location*; the supported injection path here
+reads the WOA file directly. Since WOA23 is served from an open THREDDS/ERDDAP endpoint that
 needs no credentials, reading the file directly and regridding it here keeps the keyless path
 real rather than aspirational.
 
@@ -1743,119 +1718,6 @@ Compute the target velocity for sponge relaxation with exponential depth decay.
     v_target = Float64(v_inflow_mean) * exp(Float64(z) / Float64(v_decay))
     return (u_target, v_target)
 end
-
-"""
-    HorizontalMomentumForcingU{TF}
-
-Bitstype callable struct for zonal momentum forcing on GPU/CPU without field dependencies.
-Combines depth-tapered harmonic tidal body forcing, lateral sponge relaxation,
-and Patankar-type quasi-implicit quadratic bottom drag.
-"""
-struct HorizontalMomentumForcingU{TF}
-    tidal          :: TF
-    has_sponge     :: Bool
-    lon_min        :: Float64   # western domain boundary (°E)
-    lon_max        :: Float64   # eastern domain boundary (°E)
-    lat_min        :: Float64   # southern domain boundary (°N)
-    lat_max        :: Float64   # northern domain boundary (°N)
-    sponge_width   :: Float64   # sponge buffer width (degrees)
-    sponge_tau     :: Float64   # relaxation timescale (s)
-    u_inflow_mean  :: Float64   # reference zonal inflow velocity (m/s)
-    u_inflow_decay :: Float64   # depth e-folding scale (m)
-    bottom_drag    :: Float64
-    cd_drag        :: Float64
-end
-
-"""
-    (m::HorizontalMomentumForcingU)(x, y, z, t, u, v)
-
-Zonal momentum forcing: tidal body force + multi-boundary quadratic sponge relaxation
-(Price & Aumont 2011) + Patankar-implicit quadratic bottom drag.
-
-Sponge gamma is the maximum of all four boundary ramp functions, ramping quadratically
-from 0 at the inner sponge edge to 1 at the domain wall. This is identical to the
-formulation in `LateralBoundaryRelaxation` and avoids ad-hoc sine-taper momentum
-discontinuities that cause CFL blow-up near immersed boundaries.
-"""
-@inline function (m::HorizontalMomentumForcingU)(x, y, z, t, u, v)
-    sponge_val = 0.0
-    if m.has_sponge
-        gamma = compute_sponge_gamma(
-            x, y,
-            m.lon_min, m.lon_max,
-            m.lat_min, m.lat_max,
-            m.sponge_width
-        )
-        if gamma > 0.0
-            u_target = m.u_inflow_mean * exp(Float64(z) / m.u_inflow_decay)
-            sponge_val = -gamma * (Float64(u) - u_target) / m.sponge_tau
-        end
-    end
-
-    tide_val = m.tidal(x, y, z, t)
-
-    speed = sqrt(u^2 + v^2)
-    tau_ref = 120.0
-    drag_coeff = (m.bottom_drag + m.cd_drag * speed) /
-                 (1.0 + (m.bottom_drag + m.cd_drag * speed) * tau_ref)
-    drag_val = -drag_coeff * Float64(u)
-    return tide_val + sponge_val + drag_val
-end
-
-@inline (m::HorizontalMomentumForcingU)(x, y, z, t, u) = m(x, y, z, t, u, 0.0)
-@inline (m::HorizontalMomentumForcingU)(x, y, z, t) = m(x, y, z, t, 0.0, 0.0)
-
-"""
-    HorizontalMomentumForcingV{TF}
-
-Bitstype callable struct for meridional momentum forcing on GPU/CPU.
-Combines harmonic tidal body forcing, multi-boundary quadratic sponge relaxation
-(Price & Aumont 2011), and Patankar-type quasi-implicit quadratic bottom drag.
-No sine wall tapering is applied to tidal forcing; relaxation covers all four
-open boundaries symmetrically.
-"""
-struct HorizontalMomentumForcingV{TF}
-    tidal          :: TF
-    has_sponge     :: Bool
-    lon_min        :: Float64   # western domain boundary (°E)
-    lon_max        :: Float64   # eastern domain boundary (°E)
-    lat_min        :: Float64   # southern domain boundary (°N)
-    lat_max        :: Float64   # northern domain boundary (°N)
-    sponge_width   :: Float64   # sponge buffer width (degrees)
-    sponge_tau     :: Float64   # relaxation timescale (s)
-    v_inflow_mean  :: Float64   # reference meridional inflow velocity (m/s)
-    v_inflow_decay :: Float64   # depth e-folding scale (m)
-    bottom_drag    :: Float64
-    cd_drag        :: Float64
-end
-
-@inline function (m::HorizontalMomentumForcingV)(x, y, z, t, u, v)
-    sponge_val = 0.0
-    if m.has_sponge
-        gamma = compute_sponge_gamma(
-            x, y,
-            m.lon_min, m.lon_max,
-            m.lat_min, m.lat_max,
-            m.sponge_width
-        )
-        if gamma > 0.0
-            v_target = m.v_inflow_mean * exp(Float64(z) / m.v_inflow_decay)
-            sponge_val = -gamma * (Float64(v) - v_target) / m.sponge_tau
-        end
-    end
-
-    tide_val = m.tidal(x, y, z, t)
-
-    speed = sqrt(u^2 + v^2)
-    tau_ref = 120.0
-    drag_coeff = (m.bottom_drag + m.cd_drag * speed) /
-                 (1.0 + (m.bottom_drag + m.cd_drag * speed) * tau_ref)
-    drag_val = -drag_coeff * Float64(v)
-    return tide_val + sponge_val + drag_val
-end
-
-@inline (m::HorizontalMomentumForcingV)(x, y, z, t, v) = m(x, y, z, t, 0.0, v)
-@inline (m::HorizontalMomentumForcingV)(x, y, z, t) = m(x, y, z, t, 0.0, 0.0)
 
 """
     set_initial_stratification!(model;

@@ -61,13 +61,27 @@ v_inflow = 0.05               # Prescribed background meridional inflow velocity
 
 [tides]
 # Astronomical tidal body and boundary forcing
-enable_tides = false          # Whether to enable astronomical tidal dynamics
-tides_source = "analytic"     # "tpxo9_atlas", "tpxo9", or "analytic"
-tidal_constituents = []       # Active constituents (e.g. ["M2", "S2"])
-tidal_u_amp = 0.25            # M2 zonal velocity amplitude (m/s)
-tidal_v_amp = 0.12            # M2 meridional velocity amplitude (m/s)
-s2_u_amp = 0.11               # S2 zonal velocity amplitude (m/s)
-s2_v_amp = 0.05               # S2 meridional velocity amplitude (m/s)
+#
+# IMPORTANT: enable_tides MUST remain false in GeoOceanModel.
+#
+# GeoLarvalTracking (the larval half) superimposes analytic M2/S2 tidal velocity
+# onto the stored hydrodynamic flow field at particle-advection time
+# (GeoLarvalTracking/src/biology/larval_behavior.jl:superpose_tidal_velocity).
+# Enabling tides here would add tidal body forcing to the ocean model AND let
+# GeoLarvalTracking add analytic tidal velocity on top — double-counting tide.
+#
+# The analytic tidal recipe (spatially uniform amplitude at every depth) also
+# diverged on the Scotian Shelf (8-13 m/s within six simulated hours) when run
+# as a body forcing across the interior. Tides enter the ocean model through
+# GeoLarvalTracking's particle tracking, not through this TOML.
+#
+enable_tides = false          # DO NOT CHANGE: must remain false
+tides_source = "analytic"     # unused while enable_tides = false
+tidal_constituents = []       # unused while enable_tides = false
+tidal_u_amp = 0.25            # unused while enable_tides = false
+tidal_v_amp = 0.12            # unused while enable_tides = false
+s2_u_amp = 0.11               # unused while enable_tides = false
+s2_v_amp = 0.05               # unused while enable_tides = false
 
 [climate]
 # Long-term climate scenario projections
@@ -77,9 +91,9 @@ projection_year = 2022        # Target simulation climate year
 [hydrodynamics]
 # Numerical solver controls and time-stepping
 sim_duration_hours = 72.0     # Total simulation duration in hours
-sim_dt_seconds = 120.0        # Initial numerical time step in seconds
+sim_dt_seconds = 60.0        # Initial numerical time step in seconds
 min_dt_seconds = 5.0          # Minimum allowable time step floor (seconds)
-max_dt_seconds = 900.0        # Maximum allowable time step ceiling (seconds)
+max_dt_seconds = 300.0        # Maximum allowable time step ceiling (seconds)
 adaptive_cfl = true           # Enable adaptive time stepping based on CFL
 target_cfl = 0.2              # Target Courant-Friedrichs-Lewy condition limit
 target_wave_cfl = 0.20        # Target wave CFL limit for barotropic gravity waves

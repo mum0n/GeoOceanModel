@@ -170,6 +170,14 @@ Seafloor topography is ingested from high-resolution bathymetric soundings and m
 - **Topographic Smoothing & Floors**: Bathymetry is clamped by minimum water depth $H_{\min} = \text{inshore\_depth}$ ($20.0\,\text{m}$) and maximum depth $H_{\max}$ ($1,500\,\text{m}$ or domain depth). Bounding maximum depth constrains the maximum barotropic gravity wave speed $c = \sqrt{g H_{\max}} \le 121\,\text{m/s}$, ensuring stable split-explicit free-surface subcycling.
 - **Hypertidal Masking**: Optional masking of the upper Bay of Fundy (`mask_bay_of_fundy = true`) sets hypertidal shallows to solid land, dampening non-linear tidal resonance and spurious vertical velocity spikes ($> 1\,\text{m/s}$) outside snow crab habitat.
 
+### Tide Handling: GeoOceanModel vs GeoLarvalTracking
+
+Tides are **not** applied as body forcing in GeoOceanModel. The `[tides]` section in every GeoOceanModel TOML config has `enable_tides = false`, and this **must not be changed**.
+
+The reason is architectural: GeoLarvalTracking (the larval half) superimposes analytic M2/S2 tidal velocity onto the stored hydrodynamic flow field at particle-advection time (`GeoLarvalTracking/src/biology/larval_behavior.jl:superpose_tidal_velocity`). Enabling tides in GeoOceanModel would add tidal body forcing to the ocean model *and* let GeoLarvalTracking add analytic tidal velocity on top — double-counting tide.
+
+The analytic tidal recipe (spatially uniform amplitude at every depth) also diverged on the Scotian Shelf (8–13 m/s within six simulated hours) when run as a body forcing across the interior. Tides therefore enter the system through GeoLarvalTracking's particle tracking, not through GeoOceanModel's `[tides]` TOML section.
+
 ## Configuration Profiles
 
 Configuration files are consolidated in [`configs/`](file:///c:/home/jae/projects/GeoOceanModel/configs):

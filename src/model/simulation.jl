@@ -27,8 +27,8 @@ Safely transfer an array (including GPU `OffsetArray` / `CuArray`) to host memor
 standard CPU array while preserving index axes and avoiding disallowed GPU scalar indexing.
 """
 to_cpu_offset_array(x::OffsetArrays.OffsetArray) =
-    OffsetArrays.OffsetArray(Array(parent(x)), axes(x))
-to_cpu_offset_array(x::AbstractArray) = Array(x)
+    OffsetArrays.OffsetArray(on_architecture(CPU(), parent(x)), axes(x))
+to_cpu_offset_array(x::AbstractArray) = on_architecture(CPU(), x)
 to_cpu_offset_array(x) = x
 
 # Import domain constants for fallback coordinate generation
@@ -556,136 +556,6 @@ function is_model_velocity_stable(model; divergence_velocity_limit::Real = 20.0)
     end
 end
 
-"""
-    guarded_write_checkpoint!(c::Checkpointer, simulation)
-
-Guarded checkpoint serializer for Oceananigans simulations. Intercepts the write step
-to evaluate physical interior velocity stability before serializing prognostic state to
-disk. If interior velocities exceed `divergence_velocity_limit`, checkpoint creation is
-aborted, preventing numerical divergence from overwriting known valid restart states.
-"""
-function guarded_write_checkpoint!(c::Checkpointer, simulation)
-    iter = iteration(simulation)
-    
-    # Pre-checkpoint verification gate: check velocity magnitude before writing
-    stable, max_spd = is_model_velocity_stable(simulation.model)
-    if !stable
-        @warn "Rejecting checkpoint at iteration $(iter) (time $(prettytime(simulation))): " *
-              "interior velocity magnitude ($(round(max_spd, digits=2)) m/s) diverges."
-        return nothing
-    end
-
-    filepath = Oceananigans.OutputWriters.checkpoint_path(iter, c)
-    t1 = time_ns()
-    state = Oceananigans.OutputWriters.prognostic_state(simulation)
-
-    # Write state to temporary file first to ensure atomic commit
-    tmp_filepath = filepath * ".tmp"
-    try
-        jldopen(tmp_filepath, "w") do file
-            Oceananigans.OutputWriters.serializeproperty!(file, "simulation", state)
-        end
-        mv(tmp_filepath, filepath; force = true)
-    catch err
-        isfile(tmp_filepath) && rm(tmp_filepath; force = true)
-        @error "Failed to write checkpoint at iteration $(iter): $(err)"
-        return nothing
-    end
-
-    t2 = time_ns()
-    sz = isfile(filepath) ? filesize(filepath) : 0
-    if c.verbose
-        @info "Checkpointing done: time=$(prettytime((t2 - t1) * 1e-9)), size=$(Oceananigans.Utils.pretty_filesize(sz))"
-    end
-
-    c.cleanup && Oceananigans.OutputWriters.cleanup_checkpoints(c)
-
-    return nothing
-end
-
-"""
-    guarded_cleanup_checkpoints(checkpointer::Checkpointer)
-
-Prune older intermediate checkpoint files generated during time integration,
-retaining the 3 most recently written valid snapshots.
-"""
-function guarded_cleanup_checkpoints(checkpointer::Checkpointer)
-    prefix = Oceananigans.OutputWriters.checkpoint_superprefix(checkpointer.prefix)
-    filepaths = Oceananigans.OutputWriters.glob(prefix * "*.jld2", checkpointer.dir)
-    
-    # Retain the most recent 3 valid checkpoints rather than strictly 1
-    if length(filepaths) <= 3
-        return nothing
-    end
-
-    # Extract iteration numbers from filepaths if available, or sort by mtime
-    sort!(filepaths, by = fp -> try
-        m = match(r"iteration(\d+)", fp)
-        m !== nothing ? parse(Int, m.captures[1]) : Int(mtime(fp))
-    catch
-        Int(mtime(fp))
-    end)
-
-    # Retain the three latest checkpoints for robust rollback
-    retained = Set(filepaths[max(1, end - 2):end])
-
-    for filepath in filepaths
-        if !(filepath in retained)
-            try
-                rm(filepath; force = true)
-            catch err
-                if err isa IOError
-                    GC.gc()
-                    try
-                        rm(filepath; force = true)
-                    catch retry_err
-                        @warn "Unable to prune intermediate checkpoint $(filepath) (resource locked): $(retry_err)"
-                    end
-                else
-                    rethrow(err)
-                end
-            end
-        end
-    end
-    return nothing
-end
-
-"""
-    install_checkpoint_hooks!()
-
-Dynamically install guarded checkpoint writing and retention hooks into Oceananigans
-at runtime. This avoids precompilation method-overwrite errors in Julia while ensuring
-all checkpoint operations respect the velocity stability gate and 3-checkpoint retention.
-"""
-function install_checkpoint_hooks!()
-    try
-        m_write = first(methods(Oceananigans.write_output!, (Checkpointer, Any)))
-        Base.delete_method(m_write)
-        @eval Oceananigans function write_output!(
-            c::Oceananigans.OutputWriters.Checkpointer,
-            simulation
-        )
-            ParticleTracking.guarded_write_checkpoint!(c, simulation)
-        end
-    catch err
-        @warn "Unable to hook Oceananigans.write_output!: $(err)"
-    end
-
-    try
-        m_clean = first(methods(Oceananigans.OutputWriters.cleanup_checkpoints, (Checkpointer,)))
-        Base.delete_method(m_clean)
-        @eval Oceananigans.OutputWriters function cleanup_checkpoints(
-            checkpointer::Oceananigans.OutputWriters.Checkpointer
-        )
-            ParticleTracking.guarded_cleanup_checkpoints(checkpointer)
-        end
-    catch err
-        @warn "Unable to hook Oceananigans.OutputWriters.cleanup_checkpoints: $(err)"
-    end
-
-    return nothing
-end
-
 
 """
     inspect_hydrodynamic_file(
@@ -825,7 +695,7 @@ function closure_diffusivity_constants(model)
 
     κ, ν = nothing, nothing
     # `model.closure` is a Tuple when several closures are supplied, but a single closure
-    # object when the model normalises one (which is what `ocean_simulation` produces).
+    # object when the model normalises one (which is what `HydrostaticFreeSurfaceModel` produces).
     closures = model.closure isa Tuple ? model.closure : (model.closure,)
     for c in closures
         (c isa Tuple || c isa NamedTuple) && continue
@@ -998,8 +868,7 @@ Fill `ρ_field` with the in-situ seawater density (kg m⁻³) implied by the mod
 tracers and its equation of state, evaluated on `ρ_field`'s own grid.
 
 The polynomial is `SeawaterPolynomials.ρ(Θ, Sᴬ, Z, eos)` — the real implementation behind
-NumericalEarth's `total_density` alias, which is declared without methods in this build and
-therefore cannot be called. Note the argument order: conservative temperature `Θ` first, absolute
+the seawater-density polynomial. Note the argument order: conservative temperature `Θ` first, absolute
 salinity `Sᴬ` second. Swapping them yields a plausible-looking but physically wrong density
 (≈ 1004 kg m⁻³ for shelf conditions that should read ≈ 1027 kg m⁻³), so the order is fixed here
 rather than inferred at each call site. Depth `Z` is taken from the grid's own vertical coordinate
@@ -1403,7 +1272,7 @@ function setup_hydrodynamic_simulation(
         # which direction was actually limiting the step -- and a CFL of 6 against a 0.20
         # target is a scheme running far outside its stability limit, so knowing which
         # direction is responsible is the whole diagnosis.
-        w_int = Array(interior(s.model.velocities.w))
+        w_int = on_architecture(CPU(), interior(s.model.velocities.w))
         w_max, loc_w = findmax(abs, w_int)
         w_loc_txt = try
             lon_w, lat_w, dep_w = velocity_peak_location(s, loc_w)
@@ -1522,6 +1391,41 @@ function setup_hydrodynamic_simulation(
                 # still removes a CFL of 6 in about three iterations.
                 s.Δt = clamp(s.Δt * (target_cfl / cfl), 0.5 * s.Δt, 2.0 * s.Δt)
                 s.Δt = clamp(s.Δt, Float64(min_Δt), Float64(max_Δt))
+
+                # Barotropic wave CFL guard: split-explicit free surface subcycles the
+                # barotropic mode at Δt / substeps, but a guard prevents the controller
+                # from growing Δt into a regime where external gravity waves go unstable.
+                # c = sqrt(g * H_max); barotropic_dt = Δt / substeps.
+                try
+                    base_g = s.model.grid isa ImmersedBoundaryGrid ?
+                             s.model.grid.underlying_grid : s.model.grid
+                    g = 9.80665
+                    # Deepest water column (positive depth below surface).
+                    z_faces = if hasproperty(base_g, :z) && hasproperty(base_g.z, :cᵃᵃᶠ)
+                        zc = collect(Float64, parent(base_g.z.cᵃᵃᶠ))
+                        maximum(abs, zc)
+                    else
+                        abs(Float64(base_g.Lz))
+                    end
+                    c_wave = sqrt(g * z_faces)
+                    # Minimum horizontal spacing.
+                    dx_min = if hasproperty(base_g, :Δxᶜᶜᵃ)
+                        dx_cpu = to_cpu_offset_array(base_g.Δxᶜᶜᵃ)
+                        Float64(minimum(dx_cpu[1:base_g.Nx, 1:base_g.Ny]))
+                    elseif hasproperty(base_g, :Lx)
+                        Float64(base_g.Lx) / base_g.Nx
+                    else
+                        1000.0
+                    end
+                    substeps = 45  # matches SplitExplicitFreeSurface in driver.jl
+                    cfl_wave = c_wave * (s.Δt / substeps) / max(1.0, dx_min)
+                    if cfl_wave > 0.5
+                        s.Δt = min(s.Δt, 0.5 * substeps * max(1.0, dx_min) / c_wave)
+                        s.Δt = clamp(s.Δt, Float64(min_Δt), Float64(max_Δt))
+                    end
+                catch
+                    # Guard is best-effort: if grid metrics are unavailable, rely on advective CFL.
+                end
             end
             return nothing
         end

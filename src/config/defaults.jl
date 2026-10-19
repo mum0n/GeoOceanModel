@@ -157,7 +157,7 @@ function get_default_configuration()::Dict{String, Any}
             "wind_time_iso" => "2023-06-01T00:00:00Z"
         ),
         "bathymetry" => Dict{String, Any}(
-            "source" => "numerical_earth",
+            "source" => "etopo2022",
             "resolution_arcsec" => 15,
             "inshore_depth" => 20.0,
             "shelf_slope" => 180.0

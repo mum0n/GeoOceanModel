@@ -371,7 +371,7 @@ and nowhere else, with an error that never mentions the seabed. Copying the stor
 re-wrapping it in the original axes is one bulk device-to-host transfer, and the caller's
 indices then mean exactly what they meant before.
 """
-_host_copy(a) = OffsetArray(Array{eltype(a)}(parent(a)), axes(a)...)
+_host_copy(a) = OffsetArray(on_architecture(CPU(), parent(a)), axes(a)...)
 
 """
     seabed_from_model(model) -> Union{Matrix{Float64}, Nothing}

@@ -32,7 +32,6 @@ using
     JLD2,
     TaylorSeries,
     Interpolations,
-    NumericalEarth,
     Distributions,
     GeoData,
     GeoDataSources,
@@ -62,7 +61,6 @@ include("data/grid_bathymetry.jl")
 include("data/vertical_grid.jl")
 include("model/hydrodynamic_model.jl")
 include("model/tidal_forcing.jl")
-include("model/climate_scenarios.jl")
 include("model/simulation.jl")
 include("model/simulation_result.jl")
 include("output/geodata_output.jl")

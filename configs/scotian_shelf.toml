@@ -73,13 +73,27 @@ v_inflow = 0.0                # Zero cross-isobath inflow (m/s)
 
 [tides]
 # Astronomical tidal body and boundary forcing
-enable_tides = false          # Enable astronomical tidal forcing
-tides_source = "tpxo9_atlas"  # TPXO9.v5a global tidal solution
-tidal_constituents = ["M2", "S2"] # Semidiurnal tidal components
-tidal_u_amp = 0.25            # M2 zonal tidal amplitude (m/s)
-tidal_v_amp = 0.12            # M2 meridional tidal amplitude (m/s)
-s2_u_amp = 0.11               # S2 zonal tidal amplitude (m/s)
-s2_v_amp = 0.05               # S2 meridional tidal amplitude (m/s)
+#
+# IMPORTANT: enable_tides MUST remain false in GeoOceanModel.
+#
+# GeoLarvalTracking (the larval half) superimposes analytic M2/S2 tidal velocity
+# onto the stored hydrodynamic flow field at particle-advection time
+# (GeoLarvalTracking/src/biology/larval_behavior.jl:superpose_tidal_velocity).
+# Enabling tides here would add tidal body forcing to the ocean model AND let
+# GeoLarvalTracking add analytic tidal velocity on top — double-counting tide.
+#
+# The analytic tidal recipe (spatially uniform amplitude at every depth) also
+# diverged on the Scotian Shelf (8-13 m/s within six simulated hours) when run
+# as a body forcing across the interior. Tides enter the ocean model through
+# GeoLarvalTracking's particle tracking, not through this TOML.
+#
+enable_tides = false          # DO NOT CHANGE: must remain false
+tides_source = "tpxo9_atlas"  # unused while enable_tides = false
+tidal_constituents = ["M2", "S2"] # unused while enable_tides = false
+tidal_u_amp = 0.25            # unused while enable_tides = false
+tidal_v_amp = 0.12            # unused while enable_tides = false
+s2_u_amp = 0.11               # unused while enable_tides = false
+s2_v_amp = 0.05               # unused while enable_tides = false
 
 [climate]
 # Climate scenario configuration
@@ -89,15 +103,15 @@ projection_year = 2022        # Target simulation year
 [hydrodynamics]
 # Numerical solver controls and adaptive stepping
 sim_duration_hours = 720.0    # 30-day simulation duration (720 hours)
-sim_dt_seconds = 8.0          # Baseline time step in seconds
+sim_dt_seconds = 12.0          # Baseline time step in seconds
 min_dt_seconds = 1.0          # Minimum adaptive time step floor (seconds)
-max_dt_seconds = 8.0          # Maximum adaptive time step ceiling (C_wave <= 0.14 in 350m depth)
+max_dt_seconds = 360.0          # Maximum adaptive time step ceiling (reduced for stability)
 adaptive_cfl = true           # Modulate dt according to advective and wave CFL
-target_cfl = 0.12             # Target advective CFL limit
-target_wave_cfl = 0.12        # Target barotropic gravity wave CFL limit
+target_cfl = 0.2             # Target advective CFL limit (increased from 0.08 for stability)
+target_wave_cfl = 0.2        # Target barotropic gravity wave CFL limit (increased from 0.08 for stability)
 surface_heat_flux = 50.0      # Baseline sensible heat flux (W/m^2)
 sst_damping_coefficient = 40.0 # Haney SST relaxation (W m-2 K-1)
-max_current_speed = 3.0       # Current velocity ceiling in m/s
+max_current_speed = 2.0       # Current velocity ceiling in m/s (reduced from 3.0 for stability)
 max_flow_snapshots = 400      # Snapshot memory retention limit
 spinup_hours = 24.0           # Spinup time before saving outputs (24 hours)
 allow_analytical_fallback = false # Fail loudly if real inputs unavailable

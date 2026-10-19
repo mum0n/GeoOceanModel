@@ -160,10 +160,14 @@ function read_wind_stress(filepath::AbstractString)
             tau_max = isempty(tau_clean) ? 0.0 : Float64(maximum(tau_clean))
             cd_rho = 1.225 * 1.3e-3
             speed10_rms = isempty(tau_clean) ? 0.0 : sqrt(Float64(Statistics.mean(tau_clean)) / cd_rho)
+            # Wind stress files carry dynamic stress in Pa (kg m^-1 s^-2). Oceananigans'
+            # FluxBoundaryCondition expects kinematic stress (m^2 s^-2), so divide by
+            # reference water density before returning.
+            rho_water = 1025.0
             return (
-                tau_x = tau_x,
-                tau_y = tau_y,
-                tau_max = tau_max,
+                tau_x = tau_x / rho_water,
+                tau_y = tau_y / rho_water,
+                tau_max = tau_max / rho_water,
                 speed10_rms = speed10_rms
             )
         end
@@ -329,8 +333,12 @@ function build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
             tstep = nt > 1 ? (tvec[end] - tvec[1]) / (nt - 1) : 3600.0
             horizon = nt > 1 ? tvec[end] - tvec[1] : 3600.0
 
-            tx_tuple = ntuple(k -> Float64(tx[1, 1, k]), nt)
-            ty_tuple = ntuple(k -> Float64(ty[1, 1, k]), nt)
+            # Wind stress files carry dynamic stress in Pa (kg m^-1 s^-2).
+            # Oceananigans FluxBoundaryCondition expects kinematic stress (m^2 s^-2),
+            # so divide by reference water density before assigning.
+            rho_water = 1025.0
+            tx_tuple = ntuple(k -> Float64(tx[1, 1, k]) / rho_water, nt)
+            ty_tuple = ntuple(k -> Float64(ty[1, 1, k]) / rho_water, nt)
             ta_tuple = ntuple(k -> Float64(ta[1, 1, k]), nt)
             ps_tuple = ntuple(k -> Float64(ps[1, 1, k]), nt)
             rh_tuple = ntuple(k -> Float64(rh[1, 1, k]), nt)
@@ -362,13 +370,14 @@ function build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
         horizon = nt * tstep
 
         # Spatial average for each time slice
+        rho_water = 1025.0
         tx_tuple = ntuple(k -> begin
             v = filter(!isnan, tx_arr[:, :, k])
-            isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            isempty(v) ? 0.0 : Float64(Statistics.mean(v)) / rho_water
         end, nt)
         ty_tuple = ntuple(k -> begin
             v = filter(!isnan, ty_arr[:, :, k])
-            isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            isempty(v) ? 0.0 : Float64(Statistics.mean(v)) / rho_water
         end, nt)
 
         stress_x = TimeSeriesSurfaceStress{nt}(tx_tuple, horizon, tstep)

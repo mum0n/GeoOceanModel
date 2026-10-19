@@ -726,10 +726,10 @@ end
     free_surf = SplitExplicitFreeSurface(target_grid; substeps = 45)
     closure_choice = hasproperty(opts, :turbulence_closure) ?
         Symbol(lowercase(string(opts.turbulence_closure))) : :smagorinsky
-    # Model assembly is delegated entirely to NumericalEarth.ocean_simulation, which builds
-    # a `HydrostaticFreeSurfaceModel` with a spherical Coriolis (retaining the beta term),
-    # a full TEOS-10 equation of state, and the split-explicit free-surface solver.
-    println("Assembling model via NumericalEarth.ocean_simulation " *
+    # Model assembly builds a `HydrostaticFreeSurfaceModel` directly with Oceananigans:
+    # spherical Coriolis (retaining the beta term), a full TEOS-10 equation of state,
+    # and the split-explicit free-surface solver.
+    println("Assembling model via Oceananigans.HydrostaticFreeSurfaceModel " *
             "(spherical Coriolis, TEOS-10 EOS, split-explicit free surface)...")
     model = build_hydrodynamic_model(
         target_grid,
@@ -827,6 +827,21 @@ end
             if haskey(woa, :O_2) && hasproperty(model.tracers, :O_2)
                 set!(model, O_2 = woa.O_2)
             end
+
+            # Sanitize NaN/Inf in WOA23 boundary tracers before integration.
+            nan_count = 0
+            for tr in (:T, :S)
+                field = model.tracers[tr]
+                data = field.data
+                bad = findall(x -> !isfinite(x), data)
+                isempty(bad) && continue
+                ref = tr === :T ? 12.0 : 35.0
+                for idx in bad
+                    data[idx] = Float64(ref)
+                    nan_count += 1
+                end
+            end
+            nan_count > 0 && @warn "Replaced $nan_count non-finite WOA23 tracer values (T→12°C, S→35 PSU)."
         else
             error(
                 "hydrography_source = \"woa23\" but WOA23 files are missing from " *
@@ -840,6 +855,24 @@ end
             println("Initializing hydrography from GeoData boundary tracer field ($hydro_src)...")
             set!(model, T = boundary_tracer_data.T, S = boundary_tracer_data.S)
             set!(model, u = 0.0, v = 0.0)
+
+            # Sanitize NaN/Inf in boundary tracers before they corrupt the integration.
+            # Real-world climatology files (WOA23, GLORYS12V1, Copernicus) commonly carry
+            # NaN near land cells and at domain edges; if left in the tracer fields they
+            # propagate through advection and eventually trigger the divergence watchdog.
+            nan_count = 0
+            for tr in (:T, :S)
+                field = model.tracers[tr]
+                data = field.data
+                bad = findall(x -> !isfinite(x), data)
+                isempty(bad) && continue
+                ref = tr === :T ? 12.0 : 35.0
+                for idx in bad
+                    data[idx] = Float64(ref)
+                    nan_count += 1
+                end
+            end
+            nan_count > 0 && @warn "Replaced $nan_count non-finite boundary tracer values (T→12°C, S→35 PSU)."
         else
             copernicus_file = joinpath(opts.input_dir, "copernicus_ts.nc")
             start_yr = hasproperty(opts, :start_year) ? opts.start_year : opts.projection_year
@@ -862,6 +895,21 @@ end
                 cop = copernicus_regridded_tracers(model.grid, copernicus_file; month = hydro_month)
                 set!(model, T = cop.T, S = cop.S)
                 set!(model, u = 0.0, v = 0.0)
+
+                # Sanitize NaN/Inf in Copernicus boundary tracers before integration.
+                nan_count = 0
+                for tr in (:T, :S)
+                    field = model.tracers[tr]
+                    data = field.data
+                    bad = findall(x -> !isfinite(x), data)
+                    isempty(bad) && continue
+                    ref = tr === :T ? 12.0 : 35.0
+                    for idx in bad
+                        data[idx] = Float64(ref)
+                        nan_count += 1
+                    end
+                end
+                nan_count > 0 && @warn "Replaced $nan_count non-finite Copernicus tracer values (T→12°C, S→35 PSU)."
             catch err
                 error(
                     "hydrography_source = \"$(hydro_src)\" requires Copernicus Marine download " *
@@ -881,6 +929,22 @@ end
         )
     end
 
+    # Final safety net: catch any non-finite tracer values that slipped through
+    # the per-source NaN guards, before they corrupt the time integration.
+    nan_count = 0
+    for tr in (:T, :S)
+        field = model.tracers[tr]
+        data = field.data
+        bad = findall(x -> !isfinite(x), data)
+        isempty(bad) && continue
+        ref = tr === :T ? 12.0 : 35.0
+        for idx in bad
+            data[idx] = Float64(ref)
+            nan_count += 1
+        end
+    end
+    nan_count > 0 && @warn "Final NaN guard: replaced $nan_count non-finite tracer values (T→12°C, S→35 PSU)."
+
     # Calculate Simpson-Hunter tidal mixing front parameters
     chi_bank  = simpson_hunter_parameter(40.0, 1.1)  # Shallow bank (mixed)
     chi_shelf = simpson_hunter_parameter(150.0, 0.2) # Deep shelf (stratified)
@@ -894,52 +958,6 @@ end
         simpson_hunter_bank = chi_bank,
         simpson_hunter_shelf = chi_shelf
     )
-end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Segment 4: Climate Forcing Scenarios & Larval Thermal Ecology
-# ─────────────────────────────────────────────────────────────────────────────
-
-"""
-    run_segment_climate(; opts::HydrodynamicOptions, model=nothing) -> NamedTuple
-
-Inspect CMIP6 climate scenario deltas, apply warming and freshening anomalies to
-the model stratification, and evaluate temperature-dependent PLD and mortality.
-
-# Inputs
-- `opts::HydrodynamicOptions`: Workflow options.
-- `model`: Optional `HydrostaticFreeSurfaceModel` to update in-place.
-
-# Outputs
-- `NamedTuple`: `(deltas,)` -- the scenario anomaly deltas. Pelagic larval duration and
-  thermal mortality are larval biology and are computed by `GeoLarvalTracking`, not here.
-"""
-function run_segment_climate(;
-    opts::HydrodynamicOptions = HydrodynamicOptions(),
-    model = nothing
-)
-    println("\n=================================================================")
-    println(" [Segment 4/8] Climate Scenario Integration & Thermal Ecology")
-    println("=================================================================")
-
-    deltas = get_climate_scenario_deltas(opts.scenario, year = opts.projection_year)
-    println("Climate Scenario: $(deltas.description) [Year $(opts.projection_year)]")
-    println("  Surface Temperature Anomaly: +$(round(deltas.ΔT_surface, digits=2)) °C")
-    println("  CIL Temperature Anomaly:     +$(round(deltas.ΔT_cil, digits=2)) °C")
-    println("  Deep Temperature Anomaly:    +$(round(deltas.ΔT_deep, digits=2)) °C")
-    println("  Surface Salinity Anomaly:    $(round(deltas.ΔS_surface, digits=2)) PSU")
-    println("  Atmospheric Wind Factor:     x$(round(deltas.Δwind_factor, digits=2))")
-
-    if !isnothing(model) && opts.scenario ∉ (:baseline, :historical, :climatology) &&
-       opts.ocean_boundary_source ∉ (:glorys12v1, :glorys_climatology)
-        println("Applying climate anomalies to model stratification...")
-        apply_climate_scenario!(model, scenario = opts.scenario, year = opts.projection_year)
-    end
-
-    # Pelagic larval duration and thermal mortality are NOT computed here: they are larval
-    # biology, owned by the larval half (GeoLarvalTracking). This segment ends at the ocean
-    # effect of a scenario -- the warming/freshening anomaly applied to the stratification.
-    return (deltas = deltas,)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1010,7 +1028,6 @@ function run_segment_simulation(;
 
     target_model = if isnothing(model)
         model_res = run_segment_model(opts = opts)
-        run_segment_climate(opts = opts, model = model_res.model)
         model_res.model
     else
         model
@@ -1287,7 +1304,6 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
 
     # Decoupled hydrodynamics: skip model and simulation if --track-only is active
     model_res = nothing
-    climate_res = nothing
     sim_res = nothing
 
     if !opts.track_only
@@ -1299,8 +1315,6 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
             tau_y = data_res.tau_y
         )
 
-        # Step 4: Climate Scenarios
-        climate_res = run_segment_climate(opts = opts, model = model_res.model)
 
         # Step 5: Hydrodynamic Simulation
         sim_res = run_segment_simulation(opts = opts, model = model_res.model)
@@ -1335,7 +1349,7 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
             data = data_res,
             grid = grid_res,
             model = model_res,
-            climate = climate_res,
+            climate = nothing,
             simulation = sim_res,
             tracking = nothing,
             metrics = nothing,
@@ -1366,7 +1380,7 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
         data = data_res,
         grid = grid_res,
         model = model_res,
-        climate = climate_res,
+        climate = nothing,
         simulation = sim_res,
         tracking = track_res,
         metrics = metrics_res,
@@ -1380,8 +1394,7 @@ end
 #  Boundary stubs
 #
 #  Names the larval half and the old storage/analytics API own. Two ocean functions
-#  reach them: `run_production_pipeline` past the handover, and `run_segment_climate`'s
-#  thermal-ecology lines and `run_segment_simulation`'s legacy archive block. Each is a
+#  reach them: `run_production_pipeline` past the handover, and `run_segment_simulation`'s legacy archive block. Each is a
 #  stub that errors naming where it lives, so the coupling is at the call site and a run
 #  that crosses the split fails with that message rather than a `MethodError` later, or
 #  worse, a silent substitution.
