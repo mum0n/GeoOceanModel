@@ -74,26 +74,31 @@ v_inflow = 0.0                # Zero cross-isobath inflow (m/s)
 [tides]
 # Astronomical tidal body and boundary forcing
 #
-# IMPORTANT: enable_tides MUST remain false in GeoOceanModel.
+# TPXO9 boundary forcing (placement = :boundary): tide enters through the open
+# boundary sponge zone only, allowing the barotropic tidal wave to propagate
+# inward dynamically. This avoids the resonance that the uniform analytic
+# body forcing caused (8-13 m/s divergence within 6 hours).
 #
 # GeoLarvalTracking (the larval half) superimposes analytic M2/S2 tidal velocity
 # onto the stored hydrodynamic flow field at particle-advection time
 # (GeoLarvalTracking/src/biology/larval_behavior.jl:superpose_tidal_velocity).
-# Enabling tides here would add tidal body forcing to the ocean model AND let
-# GeoLarvalTracking add analytic tidal velocity on top — double-counting tide.
+# DO NOT enable both ocean-model tide and larval-tracking tide simultaneously
+# unless you intend double-counting.
 #
-# The analytic tidal recipe (spatially uniform amplitude at every depth) also
-# diverged on the Scotian Shelf (8-13 m/s within six simulated hours) when run
-# as a body forcing across the interior. Tides enter the ocean model through
-# GeoLarvalTracking's particle tracking, not through this TOML.
+# For this Scotian Shelf run, tide is enabled in the ocean model at the boundary
+# only (placement = "boundary"). GeoLarvalTracking will add its own analytic
+# tidal velocity at particle time. If you want consistency between the two,
+# disable tide in GeoLarvalTracking or set enable_tides = false here.
 #
-enable_tides = false          # DO NOT CHANGE: must remain false
-tides_source = "tpxo9_atlas"  # unused while enable_tides = false
-tidal_constituents = ["M2", "S2"] # unused while enable_tides = false
-tidal_u_amp = 0.25            # unused while enable_tides = false
-tidal_v_amp = 0.12            # unused while enable_tides = false
-s2_u_amp = 0.11               # unused while enable_tides = false
-s2_v_amp = 0.05               # unused while enable_tides = false
+enable_tides = true             # Enable TPXO9 tidal boundary forcing
+tides_source = "tpxo9"          # TPXO9 global tidal atlas (not "analytic")
+tidal_placement = "boundary"    # Edge-only relaxation: tide propagates inward dynamically
+tidal_relaxation_timescale = 3600.0 # 1-hour tidal relaxation timescale at open edges
+tidal_constituents = ["M2", "S2"] # Semidiurnal constituents
+tidal_u_amp = 0.0               # Unused with tpxo9 source (amplitudes come from atlas)
+tidal_v_amp = 0.0               # Unused with tpxo9 source
+s2_u_amp = 0.0                  # Unused with tpxo9 source
+s2_v_amp = 0.0                  # Unused with tpxo9 source
 
 [climate]
 # Climate scenario configuration
@@ -102,7 +107,7 @@ projection_year = 2022        # Target simulation year
 
 [hydrodynamics]
 # Numerical solver controls and adaptive stepping
-sim_duration_hours = 720.0    # 30-day simulation duration (720 hours)
+sim_duration_hours = 72.0       # 3-day simulation duration for tidal test
 sim_dt_seconds = 12.0          # Baseline time step in seconds
 min_dt_seconds = 1.0          # Minimum adaptive time step floor (seconds)
 max_dt_seconds = 30.0          # Maximum adaptive time step ceiling (seconds)

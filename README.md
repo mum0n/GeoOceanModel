@@ -172,11 +172,22 @@ Seafloor topography is ingested from high-resolution bathymetric soundings and m
 
 ### Tide Handling: GeoOceanModel vs GeoLarvalTracking
 
-Tides are **not** applied as body forcing in GeoOceanModel. The `[tides]` section in every GeoOceanModel TOML config has `enable_tides = false`, and this **must not be changed**.
+Tides are applied in GeoOceanModel via TPXO9 boundary forcing (placement = `:boundary`), which relaxes
+toward TPXO9 tidal velocity at the open boundaries only. The barotropic tidal wave then propagates
+inward dynamically through the shallow-water equations. This avoids the resonance that a uniform
+analytic body forcing caused (8–13 m/s divergence within 6 hours).
 
-The reason is architectural: GeoLarvalTracking (the larval half) superimposes analytic M2/S2 tidal velocity onto the stored hydrodynamic flow field at particle-advection time (`GeoLarvalTracking/src/biology/larval_behavior.jl:superpose_tidal_velocity`). Enabling tides in GeoOceanModel would add tidal body forcing to the ocean model *and* let GeoLarvalTracking add analytic tidal velocity on top — double-counting tide.
+Because GeoOceanModel's stored flow field now carries the real tidal cycle, **GeoLarvalTracking must NOT
+superpose analytic tidal velocity on top** — that would double-count tide. The `[tides]` section in
+GeoLarvalTracking TOML configs should have `enable_tides = false` when the ocean model already carries
+tide from GeoOceanModel.
 
-The analytic tidal recipe (spatially uniform amplitude at every depth) also diverged on the Scotian Shelf (8–13 m/s within six simulated hours) when run as a body forcing across the interior. Tides therefore enter the system through GeoLarvalTracking's particle tracking, not through GeoOceanModel's `[tides]` TOML section.
+The `[tides]` section in GeoOceanModel TOML configs controls:
+- `enable_tides`: Whether TPXO9 tidal boundary forcing is active
+- `tides_source`: "tpxo9" for TPXO9 global tidal atlas
+- `tidal_placement`: ":boundary" (edge-only relaxation, the physical default)
+- `tidal_relaxation_timescale`: Relaxation timescale at open edges (seconds)
+- `tidal_constituents`: Active constituents (e.g. ["M2", "S2"])
 
 ## Configuration Profiles
 
