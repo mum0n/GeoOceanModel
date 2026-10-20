@@ -30,15 +30,15 @@ center_lat = 44.0                 # Shelf central latitude (°N)
 along_shelf_extent_km = 850.0     # Domain extent along continental margin (km)
 cross_shelf_extent_km = 220.0     # Domain extent perpendicular to shelf slope (km)
 nx = 220                          # Along-shelf grid cell count (down from 240)
-ny = 65                           # Cross-shelf grid cell count (down from 150; 60% cell reduction)
-nz = 12                           # Vertical layer count
+ny = 65                           # Cross-shelf grid cell count (down from 200; 60% cell reduction)
+nz = 13                           # Vertical layer count
 vertical_stretching_mode = "oceananigans" # Coordinate stretching mode
 nz_above = 0                      # Layers allocated to upper shelf stratum
-vertical_break_depth = 200.0      # Shelf-slope break depth (m, positive downward)
+vertical_break_depth = 250.0      # Shelf-slope break depth (m, positive downward)
 vertical_grid_file = ""           # Optional CSV specifying vertical faces
 # Explicit vertical layer face depths starting at 0.0 down to shelf floor (350 m)
-# Surface layer of 15m allows stable larger dt under wind stirring without violating vertical CFL
-depths = [0.0, 15.0, 30.0, 48.0, 70.0, 95.0, 125.0, 160.0, 200.0, 240.0, 275.0, 310.0, 350.0]
+# Surface layer of 20m allows stable larger dt under wind stirring without violating vertical CFL
+depths = [0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0, 200.0, 250.0, 300.0, 350.0]
 
 [bathymetry]
 # Real shelf topography and geometry controls
@@ -112,7 +112,7 @@ sim_dt_seconds = 12.0          # Baseline time step in seconds
 min_dt_seconds = 1.0          # Minimum adaptive time step floor (seconds)
 max_dt_seconds = 360.0          # Maximum adaptive time step ceiling (seconds)
 adaptive_cfl = true           # Modulate dt according to advective and wave CFL
-target_cfl = 0.4             # Target advective CFL limit (increased from 0.08 for stability)
+target_cfl = 0.2             # Target advective CFL limit (increased from 0.08 for stability)
 target_wave_cfl = 0.2        # Target barotropic gravity wave CFL limit (increased from 0.08 for stability)
 surface_heat_flux = 50.0      # Baseline sensible heat flux (W/m^2)
 sst_damping_coefficient = 40.0 # Haney SST relaxation (W m-2 K-1)
