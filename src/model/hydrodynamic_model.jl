@@ -7,9 +7,9 @@ in Oceananigans.jl for coastal shelf domains.
 
 using Oceananigans
 using Oceananigans.Units
-# `ContinuousForcing` lives in `Oceananigans.Forcings`, which Oceananigans `using`s
-# internally but does not re-export at top level. `ZeroForcing` is defined locally below,
-# so it is deliberately not imported here.
+# `ContinuousForcing` and `Relaxation` live in `Oceananigans.Forcings`, which
+# Oceananigans `using`s internally but does not re-export at top level, so they are
+# imported by name. `ZeroForcing` is defined locally below.
 using Oceananigans.BoundaryConditions: ContinuousBoundaryFunction
 using Oceananigans: BulkDrag
 using Oceananigans.Forcings: ContinuousForcing, MultipleForcings, Relaxation
@@ -119,33 +119,34 @@ stepping, checkpointing and JLD2 output machinery and therefore only needs the m
 """
 
 """
-    _boundary_velocity_target(source, name::AbstractString) -> target
+    _materialise_boundary_velocity(grid, source, face::Symbol) -> Field
 
-The momentum sponge's target, from a supplied boundary velocity.
+The boundary velocity as a field on the model's own grid.
 
-The target is a CALLABLE, and that is not incidental. A `Relaxation` whose target is a
-`Field` is inert for a face-located velocity field in this Oceananigans build: the
-tendency it computes is exactly zero, whatever the field contains, and a boundary
-relaxation that silently does nothing is worse than one that is absent. The same
-`Relaxation` with a callable target works, and the same `Relaxation` with a field
-target works for a centre-located tracer, which is why the tracer sponge has always
-used one.
+`face` is `:x` for the zonal component and `:y` for the meridional one, because the
+target of a relaxation on `u` is indexed on `u`'s own faces, and a target on the wrong
+faces is not a wrong answer, it is an answer about the wrong places. The field's data
+array has the same size and offsets as the relaxed field's own, so the kernel's index
+arithmetic is the same for both.
 
-A callable that captures an interpolation object lowers into a GPU kernel here, and
-gives the same answer on CPU and GPU, so the boundary velocity is interpolated where
-it is needed rather than materialised onto a field.
-
-`source` is called as `(lon, lat, z, t)` with `z` NEGATIVE DOWN, the model's convention
-and the one the boundary interpolators are built in.
+`source` is called with `z` NEGATIVE DOWN, the model's convention and the one the
+boundary interpolators are built in. A source that is only callable as
+`(lon, lat, z, t)` is called with `t = 0`: the boundary velocity is a climatology, and
+the tidal signal is supplied separately by the tidal forcing.
 """
-function _boundary_velocity_target(source, name::AbstractString)
-    applicable(source, 0.0, 0.0, 0.0, 0.0) && return source
-    error(
-        "The boundary $(name) must be callable as (lon, lat, z, t) with z negative down. " *
-        "A field is not usable here: Oceananigans' field-target Relaxation is inert for a " *
-        "face-located velocity field, so a boundary velocity supplied as a field would " *
-        "relax nothing at all without saying so."
-    )
+function _materialise_boundary_velocity(grid, source, face::Symbol)
+    fld = face === :x ? XFaceField(grid) : YFaceField(grid)
+    if applicable(source, 0.0, 0.0, 0.0)
+        set!(fld, (x, y, z) -> Float64(source(x, y, z)))
+    elseif applicable(source, 0.0, 0.0, 0.0, 0.0)
+        set!(fld, (x, y, z) -> Float64(source(x, y, z, 0.0)))
+    else
+        error(
+            "A boundary velocity must be callable as (lon, lat, z) or (lon, lat, z, t) " *
+            "with z negative down."
+        )
+    end
+    return fld
 end
 function build_hydrodynamic_model(
     grid;
@@ -322,7 +323,7 @@ function build_hydrodynamic_model(
             lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width,
             act_e, act_w, act_n, act_s
         )
-        # The momentum sponge's target.
+        # The momentum sponge's target, materialised onto the model's own faces.
         #
         # With observed boundary velocities (GLORYS `uo`/`vo`) the sponge relaxes toward the
         # measured current; without them it falls back to the analytical `ExponentialInflow`
@@ -331,19 +332,26 @@ function build_hydrodynamic_model(
         # Nova Scotia Current, and a model whose open edges are its main water source and
         # whose inflow speed is a constant is resting on two numbers.
         #
-        # Both forms are CALLABLE. A `Relaxation` whose target is a `Field` computes an
-        # exactly zero tendency for a face-located velocity field in this Oceananigans
-        # build, so the callable form is the one that works.
-        u_target = if !isnothing(boundary_velocities) && haskey(boundary_velocities, :u)
-            _boundary_velocity_target(boundary_velocities.u, "velocity")
-        else
-            sponge_relaxation.u_ref
-        end
-        v_target = if !isnothing(boundary_velocities) && haskey(boundary_velocities, :v)
-            _boundary_velocity_target(boundary_velocities.v, "velocity")
-        else
-            sponge_relaxation.v_ref
-        end
+        # The target is a FIELD, and that is not incidental. A `Relaxation` whose target is
+        # a `Field` lowers into a GPU kernel; one whose target is a callable does not,
+        # unless the callable is `isbits` -- and a spatially varying velocity is not
+        # `isbits` whatever it is built from. The tidal coefficients are a small NamedTuple
+        # of numbers and so can be passed by value, which is why the tidal relaxation has
+        # always been able to be a callable and a momentum one could not be.
+        u_target = _materialise_boundary_velocity(
+            grid,
+            if !isnothing(boundary_velocities) && haskey(boundary_velocities, :u)
+                boundary_velocities.u
+            else
+                sponge_relaxation.u_ref
+            end, :x)
+        v_target = _materialise_boundary_velocity(
+            grid,
+            if !isnothing(boundary_velocities) && haskey(boundary_velocities, :v)
+                boundary_velocities.v
+            else
+                sponge_relaxation.v_ref
+            end, :y)
 
         # Disentangle the upstream inflow momentum forcing from the lateral radiation sponge.
         #
@@ -393,12 +401,35 @@ function build_hydrodynamic_model(
         if !isnothing(u_tide_val)
             if tidal_placement === :boundary
                 # The boundary is relaxed toward the SUM of the background velocity and the
-                # tide, in ONE relaxation, because that is what "the boundary carries this
-                # current" means. Two relaxations would not do it: two relaxations settle
-                # on the WEIGHTED AVERAGE of their two targets, so the tidal amplitude at
-                # the boundary would arrive at half strength.
-                u_comb_target = (x, y, z, t) -> Float64(u_target(x, y, z, t) + u_tide_val(x, y, z, t))
-                u_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = u_comb_target)
+                # tide, because that is what "the boundary carries this current" means. Two
+                # separate RELAXATIONS would not do it: two relaxations settle on the
+                # WEIGHTED AVERAGE of their two targets, so the tidal amplitude at the
+                # boundary would arrive at half strength.
+                #
+                # The sum is written here as a relaxation toward the background field plus
+                # an ADDITIVE tidal term:
+                #
+                #     rate * (u_bnd + u_tide - u)
+                #   = rate * (u_bnd - u)   +   rate * u_tide
+                #
+                # The second term carries no -u in it, so the two together are the combined
+                # relaxation and not the average of two relaxations. It has to be additive
+                # rather than a second relaxation, because a sum is not reachable by two
+                # relaxations at any rates: their steady state is a weighted average of
+                # their targets, and a weighted average of a background and a tide is
+                # neither of them.
+                #
+                # The additive term is a `ContinuousForcing`, which applies the rate and
+                # the mask ITSELF: it adds `func(...)` to the tendency and ignores
+                # `parameters.rate` and `parameters.mask`. Its function also takes the
+                # parameters as its LAST argument, and a function of four arguments is
+                # called with five, which does not lower into a GPU kernel.
+                u_forcing = MultipleForcings(
+                    Relaxation(rate = relax_rate, mask = sponge_mask, target = u_target),
+                    ContinuousForcing(
+                        (x, y, z, t, p) -> p.rate * p.mask(x, y, z) * Float64(u_tide_val(x, y, z, t));
+                        parameters = (rate = relax_rate, mask = sponge_mask))
+                )
             else
                 u_tide_target = (x, y, z, t) -> Float64(u_tide_val(x, y, z, t))
                 u_forcing = MultipleForcings(
@@ -409,8 +440,12 @@ function build_hydrodynamic_model(
         end
         if !isnothing(v_tide_val)
             if tidal_placement === :boundary
-                v_comb_target = (x, y, z, t) -> Float64(v_target(x, y, z, t) + v_tide_val(x, y, z, t))
-                v_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = v_comb_target)
+                v_forcing = MultipleForcings(
+                    Relaxation(rate = relax_rate, mask = sponge_mask, target = v_target),
+                    ContinuousForcing(
+                        (x, y, z, t, p) -> p.rate * p.mask(x, y, z) * Float64(v_tide_val(x, y, z, t));
+                        parameters = (rate = relax_rate, mask = sponge_mask))
+                )
             else
                 v_tide_target = (x, y, z, t) -> Float64(v_tide_val(x, y, z, t))
                 v_forcing = MultipleForcings(
