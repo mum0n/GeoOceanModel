@@ -76,6 +76,35 @@ $$\mathcal{F}_\psi = -\frac{\gamma(\lambda, \phi)}{\tau_{\text{relax}}} \left(\p
 
 where $\psi \in \{u, v, T, S\}$ and $\tau_{\text{relax}}$ is the relaxation timescale (default 3600 seconds).
 
+#### Boundary Velocity: Observed Current vs Prescribed Constant
+
+The momentum sponge and the tracer sponge have different targets, and the difference matters.
+
+The **tracer** sponge relaxes temperature and salinity toward the observed boundary state, and
+has always done so. The **momentum** sponge relaxes toward a *prescribed velocity*: until
+now, a single uniform constant (`u_inflow`, `v_inflow`) applied over the whole open face,
+with a vertical decay. For the Scotian Shelf that constant stood in for the Nova Scotia
+Current — a southwestward, slope-following jet confined to the 200–400 m layer — and a
+uniform westward velocity over a 400 m face is not that.
+
+When the boundary source carries currents, the momentum sponge now relaxes toward the
+**observed** velocity instead. GLORYS12V1 supplies `uo` and `vo` alongside `thetao` and
+`so`; they are fetched with the same subset, interpolated on the same axes, and handed to
+the model as `boundary_velocities`. `u_inflow`/`v_inflow` remain the fallback for a
+source with no currents (WOA23 has none) and are used only when there are none.
+
+Two implementation details are not optional:
+
+- The target must be a **callable**, not a field. A `Relaxation` whose target is a `Field`
+  computes an *exactly zero* tendency for a face-located velocity field in this
+  Oceananigans build, whatever the field contains. The same `Relaxation` with a field
+  target works for a centre-located tracer, which is why the tracer sponge uses one and
+  the momentum sponge cannot. A boundary relaxation that silently does nothing is worse
+  than one that is absent, so a field is rejected with an error rather than accepted.
+- The tidal velocity is added to the boundary velocity **inside one relaxation**, because
+  the boundary carries the sum. Two separate relaxations would settle on the *average* of
+  the two targets, halving the tidal amplitude at the boundary.
+
 #### GPU Device Kernel Lowering
 
 Passing closures that capture heap-allocated objects or variables of abstract type prevents CUDA LLVM IR generation. [`CartesianSpongeMask`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl) is declared as a concrete, immutable `isbits` struct. With `Adapt.adapt_structure(to, s) = s`, the functor lowers into device registers and executes inline without GPU scalar indexing or memory allocation.

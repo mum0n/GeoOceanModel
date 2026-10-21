@@ -25,14 +25,21 @@ buffer_km = 50.0              # The margin beyond the study area (km). The later
                                # ocean across it, so the band is derived from it (about 0.45).
 
 [grid]
+# 432 x 250 over 11.471 x 4.4625 degrees is 2000 m in x and 2002 m in y: a square
+# cell. The isotropy condition for this domain is nx/ny = 1.727, and 432/250 = 1.728.
+#
+# nz = 16 puts four layers in the 200-300 m band where the shelf-break jet sits
+# (the 225-250 and 250-275 m layers). Raising nz to 20 with the depths list below
+# shifted to 20 m layers through that band costs 25% more and gives the jet six.
 nx = 432
 ny = 250
-nz = 16
+nz = 20
 vertical_stretching_mode = "oceananigans"
 nz_above = 0
 vertical_break_depth = 350.0
 vertical_grid_file = ""
-depths = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 125.0, 150.0, 175.0, 200.0, 225.0, 250.0, 275.0, 300.0, 350.0, 400.0]
+depths = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180, 200.0, 220.0, 240.0, 260.0, 280, 300.0, 325, 350.0, 375.0, 400.0]
+
 
 # Real shelf topography and geometry controls
 inshore_depth = 20.0              # Water depth at inshore boundary (m, positive downward)
@@ -63,8 +70,11 @@ ocean_boundary_source = "glorys12v1" # Target tracer and velocity state from GLO
 # it is the same quantity, and the band in degrees is derived from it.
 sponge_timescale_seconds = 3600.0 # Robust 1-hour sponge relaxation timescale
 active_boundaries = ["east","south"] # Upstream along-shelf inflow boundary (Nova Scotia Current)
-u_inflow = -0.10              # Southwestward Labrador / Nova Scotia Current (m/s)
-v_inflow = 0.0                # Zero cross-isobath inflow (m/s)
+# The momentum boundary relaxes toward the OBSERVED velocity when the boundary source
+# carries one, and GLORYS12V1 does (uo, vo). `u_inflow`/`v_inflow` are the fallback for
+# a source with no currents -- WOA23 has none -- and are used only when there are none.
+u_inflow = -0.10              # Fallback: southwestward Labrador / Nova Scotia Current (m/s)
+v_inflow = 0.0                # Fallback: zero cross-isobath inflow (m/s)
 
 [tides]
 # Astronomical tidal body and boundary forcing
@@ -98,10 +108,19 @@ s2_v_amp = 0.0                  # Unused with tpxo9 source
 [hydrodynamics]
 # Numerical solver controls and adaptive stepping
 #
-# The time step is bounded by the barotropic gravity wave, not by advection: with 45 split
-# substeps and CFL 0.1, a 2 km cell admits Δt ≈ 45 × 0.1 × 2000/58 ≈ 155 s. `max_dt` is
-# held at 120 s to stay under that, and the adaptive controller ramps up to it from
-# `sim_dt`.
+# The time step is bounded by the barotropic gravity wave, not by advection. With 45
+# split substeps, a 2 km cell and the deepest water in the domain (400 m, so
+# c = sqrt(gH) = 63 m/s), the wave Courant number is c * (dt/45) / dx = 0.167 at
+# dt = 240 s. `max_dt` is held at 240 s to stay under the 0.2 wave target.
+#
+# `target_cfl` is NOT the advective Courant number, and treating it as one is why it
+# looks mis-set. The reported "CFL" is max(advective, 0.5 * drag), and the drag term
+# -- (r + cd*|u|) * dt with cd = 2.5e-3 -- dominates the advective terms at EVERY
+# speed, because 0.5*cd*dx = 2.7 and 0.5*cd*dy = 5.2. The controller is therefore
+# really setting dt = 0.4 / (1e-4 + 2.5e-3 * |u|_max), and the advective Courant
+# number sits near 0.03, an order of magnitude below the target. Lowering
+# `target_cfl` would cost wall-clock time and buy no accuracy: the step size is
+# protecting the bottom drag, not the advection.
 #
 # Duration is set for a run that completes end to end. The shelf at this resolution
 # resolves mesoscale structure and the spring/neap cycle; a multi-year integration at
