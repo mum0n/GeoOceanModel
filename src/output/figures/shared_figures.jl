@@ -64,6 +64,7 @@ Panels:
 - `time_index`: Snapshot index (1-based, overrides `time_seconds`)
 - `output_path`: Destination file path
 - `title`: Optional custom title
+- `domain_lon`, `domain_lat`: Optional exact map bounds; defaults to the data extent.
 
 # Outputs
 - `Figure`: CairoMakie figure with 6 panels and shared colorbars
@@ -81,59 +82,104 @@ function plot_multi_panel_dashboard(
     time_seconds::Union{Nothing, Real} = nothing,
     time_index::Union{Nothing, Int} = 1,
     output_path::Union{Nothing, AbstractString} = "outputs/multi_panel_dashboard.png",
-    title::Union{Nothing, AbstractString} = nothing
+    title::Union{Nothing, AbstractString} = nothing,
+    domain_lon::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    domain_lat::Union{Nothing, Tuple{<:Real, <:Real}} = nothing
 )::Figure
     hydro = extract_hydrodynamic_dataset(hydrodynamics; time_seconds = time_seconds, time_index = time_index)
     lons = hydro.lons
     lats = hydro.lats
     depths = hydro.depths
-    bathy = hydro.bathymetry
     k_surf = 1  # surface layer
+
+    # The seabed, on the model's own grid, is what says where the sea floor is: it is
+    # what decides which cells are land and which are water, and a bathymetry carried at
+    # another resolution cannot index a model field. So the store's own seabed is used
+    # when it has the field's shape, the caller's is the fallback, and a bathymetry of
+    # either kind that does not match is ignored rather than applied.
+    #
+    # With neither, the panels are drawn unmasked. That is the honest rendering: the
+    # alternative -- masking against a fabricated flat plane -- would invent a water
+    # column that the run never had, and the panels that call `mask_bathy!` below would
+    # fail on a missing mask instead of drawing what there is.
+    bathy = resolve_bathymetry_for_plot(
+        lons, lats;
+        sources = (hydro.bathymetry,
+                   hasproperty(bathymetry, :elevation) ? bathymetry.elevation : nothing),
+        fallback = nothing)
+    has_bathy = !isnothing(bathy) && size(bathy) == (length(lons), length(lats))
 
     t_hr = round(hydro.time_seconds / 3600.0, digits = 1)
     fig_title = isnothing(title) ?
         "Multi-Panel Hydrodynamic & Lagrangian Dashboard [t = $(t_hr) h]" : title
 
     fig = Figure(size = (1800, 1400), fontsize = 11)
-    Label(fig[0, 1:3], fig_title, fontsize = 16, font = :bold)
+    # Four columns per row: an axis, its colorbar, an axis, its colorbar. A colorbar
+    # placed in the cell the next axis occupies is drawn on top of it, which is how the
+    # temperature and stratification panels ended up hidden under a stack of colorbars.
+    Label(fig[0, 1:4], fig_title, fontsize = 16, font = :bold)
 
     # Panel 1: Current Speed + Vectors
     ax1 = Axis(fig[1, 1], title = "Surface Current Speed |u_h| (cm/s)",
                xlabel = "Longitude (°E)", ylabel = "Latitude (°N)", aspect = DataAspect())
     speed_surf = Float64.(hydro.speed[:, :, k_surf] .* 100.0)
-    mask_bathy!(speed_surf, bathy, k_surf)
+    has_bathy && mask_bathy!(speed_surf, bathy, k_surf)
     hm1 = heatmap!(ax1, lons, lats, speed_surf, colormap = :viridis, nan_color = :transparent)
-    quiver!(ax1, lons[1:3:end], lats[1:3:end],
-            Float64.(hydro.u[:, :, k_surf][1:3:end, 1:3:end] .* 100.0),
-            Float64.(hydro.v[:, :, k_surf][1:3:end, 1:3:end] .* 100.0),
-            color = :white, arrowsize = 8)
+    # Arrows over the surface current. `quiver!` is deprecated in Makie in favour of
+    # `arrows2d!`, and `arrowsize` in favour of `tipwidth`/`tiplength`; the advection
+    # figure already draws its vectors that way, and a figure that warns is a figure
+    # whose next failure is a warning nobody reads.
+    q_pts = Point2f[]
+    q_dirs = Vec2f[]
+    for j in 1:3:length(lats), i in 1:3:length(lons)
+        uu = Float64(hydro.u[i, j, k_surf]) * 100.0
+        vv = Float64(hydro.v[i, j, k_surf]) * 100.0
+        (isnan(uu) || isnan(vv)) && continue
+        push!(q_pts, Point2f(lons[i], lats[j]))
+        push!(q_dirs, Vec2f(uu * 0.4, vv * 0.4))
+    end
+    if !isempty(q_pts)
+        if isdefined(Makie, :arrows2d!)
+            arrows2d!(ax1, q_pts, q_dirs,
+                      tipwidth = 6, tiplength = 10, lengthscale = 1.0,
+                      tipcolor = :white, shaftcolor = :white)
+        else
+            arrows!(ax1, q_pts, q_dirs,
+                    tipwidth = 6, tiplength = 10, lengthscale = 1.0,
+                    tipcolor = :white, shaftcolor = :white)
+        end
+    end
     Colorbar(fig[1, 2], hm1, label = "cm/s", height = Relative(0.8))
+    focus_on_domain!(ax1, lons, lats; domain_lon, domain_lat)
 
     # Panel 2: Temperature + Isotherms
-    ax2 = Axis(fig[1, 2], title = "Surface Temperature (°C)",
+    ax2 = Axis(fig[1, 3], title = "Surface Temperature (°C)",
                xlabel = "Longitude (°E)", ylabel = "Latitude (°N)", aspect = DataAspect())
     temp_surf = Float64.(hydro.temperature[:, :, k_surf])
-    mask_bathy!(temp_surf, bathy, k_surf)
+    has_bathy && mask_bathy!(temp_surf, bathy, k_surf)
     hm2 = heatmap!(ax2, lons, lats, temp_surf, colormap = :thermal, nan_color = :transparent)
     contour!(ax2, lons, lats, temp_surf, levels = -2:1:20, color = :white, linewidth = 0.5)
-    Colorbar(fig[1, 3], hm2, label = "°C", height = Relative(0.8))
+    Colorbar(fig[1, 4], hm2, label = "°C", height = Relative(0.8))
+    focus_on_domain!(ax2, lons, lats; domain_lon, domain_lat)
 
     # Panel 3: Vertical Eddy Diffusivity (log scale)
     ax3 = Axis(fig[2, 1], title = "Vertical Eddy Diffusivity κ_v (log10, m²/s)",
                xlabel = "Longitude (°E)", ylabel = "Latitude (°N)", aspect = DataAspect())
     diff_surf = Float64.(hydro.diffusion[:, :, k_surf])
-    mask_bathy!(diff_surf, bathy, k_surf)
+    has_bathy && mask_bathy!(diff_surf, bathy, k_surf)
     diff_log = log10.(clamp.(diff_surf, 1e-6, 1e-2))
     hm3 = heatmap!(ax3, lons, lats, diff_log, colormap = :turbid, nan_color = :transparent)
     Colorbar(fig[2, 2], hm3, label = "log10(κ_v)", height = Relative(0.8))
+    focus_on_domain!(ax3, lons, lats; domain_lon, domain_lat)
 
     # Panel 4: Stratification N²
-    ax4 = Axis(fig[2, 2], title = "Buoyancy Frequency N² (10⁻⁴ s⁻²)",
+    ax4 = Axis(fig[2, 3], title = "Buoyancy Frequency N² (10⁻⁴ s⁻²)",
                xlabel = "Longitude (°E)", ylabel = "Latitude (°N)", aspect = DataAspect())
     strat_surf = Float64.(hydro.stratification[:, :, k_surf] .* 10000.0)
-    mask_bathy!(strat_surf, bathy, k_surf)
+    has_bathy && mask_bathy!(strat_surf, bathy, k_surf)
     hm4 = heatmap!(ax4, lons, lats, strat_surf, colormap = :ice, nan_color = :transparent)
-    Colorbar(fig[2, 3], hm4, label = "10⁻⁴ s⁻²", height = Relative(0.8))
+    Colorbar(fig[2, 4], hm4, label = "10⁻⁴ s⁻²", height = Relative(0.8))
+    focus_on_domain!(ax4, lons, lats; domain_lon, domain_lat)
 
     # Panel 5: Vertical Cross-Section (Temperature)
     ax5 = Axis(fig[3, 1], title = "Temperature Cross-Section (Central Latitude)",
@@ -141,7 +187,7 @@ function plot_multi_panel_dashboard(
     j_mid = argmin(abs.(lats .- mean(lats)))
     nx, nz = length(lons), length(depths)
     sec_temp = zeros(Float64, nx, nz)
-    b_section = bathy[:, j_mid]
+    b_section = has_bathy ? bathy[:, j_mid] : fill(NaN, nx)
     for i in 1:nx, k in 1:nz
         z_val = depths[k]
         b_val = b_section[i]
@@ -152,12 +198,15 @@ function plot_multi_panel_dashboard(
         end
     end
     co5 = contourf!(ax5, lons, depths, sec_temp, colormap = :thermal, levels = 16)
-    lines!(ax5, lons, b_section, color = :black, linewidth = 2.5)
+    has_bathy && lines!(ax5, lons, b_section, color = :black, linewidth = 2.5)
     Colorbar(fig[3, 2], co5, label = "°C", height = Relative(0.8))
+    # The cross-section runs along the configured domain when one was supplied.
+    lon_bounds = isnothing(domain_lon) ? extrema(lons) : domain_lon
+    CairoMakie.xlims!(ax5, lon_bounds...)
 
     # Panel 6: Particle Trajectories (if provided)
     if !isnothing(trajectories)
-        ax6 = Axis(fig[3, 2:3], title = "Larval Trajectories (Stage Coloration)",
+        ax6 = Axis(fig[3, 3:4], title = "Larval Trajectories (Stage Coloration)",
                    xlabel = "Longitude (°E)", ylabel = "Latitude (°N)", aspect = DataAspect())
         n_p, n_t = size(trajectories.lons)
         stage_colors = Dict(
@@ -176,24 +225,25 @@ function plot_multi_panel_dashboard(
                      color = col, markersize = 6, strokecolor = :white, strokewidth = 0.5)
         end
         # Bathymetry contours
-        contour!(ax6, lons, lats, bathy, levels = [-200, -500, -1000, -2000],
-                 color = :gray, linewidth = 0.8, linestyle = :dash)
+        has_bathy && contour!(ax6, lons, lats, bathy, levels = [-200, -500, -1000, -2000],
+                              color = :gray, linewidth = 0.8, linestyle = :dash)
     else
         # Fallback: Connectivity matrix if provided
         if !isnothing(connectivity)
-            ax6 = Axis(fig[3, 2], title = "Regional Connectivity P_ij",
+            ax6 = Axis(fig[3, 3], title = "Regional Connectivity P_ij",
                        xlabel = "Destination Stratum", ylabel = "Source Stratum")
             hm6 = heatmap!(ax6, connectivity.source_labels, connectivity.dest_labels,
                           connectivity.matrix, colormap = :blues)
-            Colorbar(fig[3, 3], hm6, label = "P_ij")
+            Colorbar(fig[3, 4], hm6, label = "P_ij")
         else
-            ax6 = Axis(fig[3, 2], title = "Surface Salinity (PSU)")
-            sal_surf = Float64.(hydro.salinity[:, :, k_surf])
-            mask_bathy!(sal_surf, bathy, k_surf)
+            ax6 = Axis(fig[3, 3], title = "Surface Salinity (PSU)")
+            sal_surf = Float64.(field_or_nan(hydro, :salinity)[:, :, k_surf])
+            has_bathy && mask_bathy!(sal_surf, bathy, k_surf)
             hm6 = heatmap!(ax6, lons, lats, sal_surf, colormap = :haline, nan_color = :transparent)
-            Colorbar(fig[3, 3], hm6, label = "PSU", height = Relative(0.8))
+            Colorbar(fig[3, 4], hm6, label = "PSU", height = Relative(0.8))
         end
     end
+    focus_on_domain!(ax6, lons, lats; domain_lon, domain_lat)
 
     if !isnothing(output_path)
         mkpath(dirname(output_path))

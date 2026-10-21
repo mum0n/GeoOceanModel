@@ -15,7 +15,7 @@ import CairoMakie: record
     export_interactive_tracks_html(
         output_path::AbstractString;
         trajectories::Union{Nothing, NamedTuple} = nothing,
-        scenarios_data::Union{Nothing, AbstractDict} = nothing,
+        runs_data::Union{Nothing, AbstractDict} = nothing,
         hydrodynamics::Union{Nothing, NamedTuple, AbstractDict, Any} = nothing,
         gridded_dispersal::Union{Nothing, NamedTuple} = nothing,
         connectivity::Union{Nothing, NamedTuple} = nothing,
@@ -44,7 +44,7 @@ free surface elevation, upwelling, bathymetry), and regional Crab Fishing Area (
 # Inputs
 - `output_path::AbstractString`: Destination path (e.g. `"outputs/interactive_larval_tracks.html"`).
 - `trajectories::NamedTuple`: Particle tracking trajectory NamedTuple.
-- `scenarios_data`: Optional dictionary mapping scenario names to data bundles.
+- `runs_data`: Optional dictionary mapping run names to data bundles.
 - `hydrodynamics`: Optional hydrodynamic model output (Oceananigans model, NamedTuple, or Dict).
 - `gridded_dispersal`: Optional 2D spatial dispersal fields.
 - `connectivity`: Optional connectivity transition matrix.
@@ -59,7 +59,7 @@ free surface elevation, upwelling, bathymetry), and regional Crab Fishing Area (
 function export_interactive_tracks_html(
     output_path::AbstractString;
     trajectories::Union{Nothing, NamedTuple} = nothing,
-    scenarios_data::Union{Nothing, AbstractDict} = nothing,
+    runs_data::Union{Nothing, AbstractDict} = nothing,
     hydrodynamics::Union{Nothing, NamedTuple, AbstractDict, Any} = nothing,
     gridded_dispersal::Union{Nothing, NamedTuple} = nothing,
     connectivity::Union{Nothing, NamedTuple} = nothing,
@@ -75,14 +75,14 @@ function export_interactive_tracks_html(
         mkpath(out_dir)
     end
 
-    # 1. Structure scenarios dictionary
-    scenarios_dict = Dict{String, Any}()
-    if !isnothing(scenarios_data) && !isempty(scenarios_data)
-        for (k, v) in scenarios_data
+    # 1. Structure runs dictionary
+    runs_dict = Dict{String, Any}()
+    if !isnothing(runs_data) && !isempty(runs_data)
+        for (k, v) in runs_data
             key_str = string(k)
             t_obj = hasproperty(v, :trajectories) ? v.trajectories : (v isa NamedTuple && hasproperty(v, :lons) ? v : nothing)
             if !isnothing(t_obj)
-                scenarios_dict[key_str] = (
+                runs_dict[key_str] = (
                     trajectories = t_obj,
                     gridded_dispersal = hasproperty(v, :gridded_dispersal) ? v.gridded_dispersal : (hasproperty(v, :empirical_movement) ? v.empirical_movement : gridded_dispersal),
                     connectivity = hasproperty(v, :connectivity) ? v.connectivity : connectivity,
@@ -92,7 +92,7 @@ function export_interactive_tracks_html(
             end
         end
     elseif !isnothing(trajectories)
-        scenarios_dict["Active Simulation"] = (
+        runs_dict["Active Simulation"] = (
             trajectories = trajectories,
             gridded_dispersal = gridded_dispersal,
             connectivity = connectivity,
@@ -100,7 +100,7 @@ function export_interactive_tracks_html(
             hydrodynamics = hydrodynamics
         )
     else
-        error("Either `trajectories` or `scenarios_data` must be provided to `export_interactive_tracks_html`.")
+        error("Either `trajectories` or `runs_data` must be provided to `export_interactive_tracks_html`.")
     end
 
     # 2. Extract Management Strata and Centroids
@@ -170,10 +170,10 @@ function export_interactive_tracks_html(
     end
     strata_json = "[" * join(strata_json_entries, ",\n") * "]"
 
-    # 3. Serialize each scenario
-    scenario_json_blocks = String[]
-    for (scen_key, scen_data) in scenarios_dict
-        trajs = canonicalize_trajectories(scen_data.trajectories)
+    # 3. Serialize each run
+    run_json_blocks = String[]
+    for (run_key, run_data) in runs_dict
+        trajs = canonicalize_trajectories(run_data.trajectories)
         lons = trajs.lons
         lats = trajs.lats
         depths = trajs.depths
@@ -256,7 +256,7 @@ function export_interactive_tracks_html(
         mean_temp_val = round(mean(temps), digits = 2)
 
         # Gridded settlement density, velocity quivers, and thermal field
-        g_disp = scen_data.gridded_dispersal
+        g_disp = run_data.gridded_dispersal
         dens_entries = String[]
         quiver_entries = String[]
         therm_entries = String[]
@@ -305,7 +305,7 @@ function export_interactive_tracks_html(
         end
 
         # Demographic connectivity flows
-        conn = scen_data.connectivity
+        conn = run_data.connectivity
         flow_entries = String[]
         if !isnothing(conn) && hasproperty(conn, :matrix) && hasproperty(conn, :strata_names)
             mat = conn.matrix
@@ -335,9 +335,9 @@ function export_interactive_tracks_html(
         end
 
         # 4. Hydrodynamic Model Outputs (Advection, Temperature, Salinity, Elevation, Upwelling, Bathymetry)
-        hydro_source = hasproperty(scen_data, :hydrodynamics) && !isnothing(scen_data.hydrodynamics) ?
-                       scen_data.hydrodynamics :
-                       (hasproperty(scen_data, :model) && !isnothing(scen_data.model) ? scen_data.model : hydrodynamics)
+        hydro_source = hasproperty(run_data, :hydrodynamics) && !isnothing(run_data.hydrodynamics) ?
+                       run_data.hydrodynamics :
+                       (hasproperty(run_data, :model) && !isnothing(run_data.model) ? run_data.model : hydrodynamics)
 
         min_lon_p = minimum(lons) - 0.4
         max_lon_p = maximum(lons) + 0.4
@@ -478,9 +478,9 @@ function export_interactive_tracks_html(
             }
         }"""
 
-        scen_json = """
-        "$(scen_key)": {
-            "name": "$(scen_key)",
+        run_json = """
+        "$(run_key)": {
+            "name": "$(run_key)",
             "times": [$(join(t_days, ","))],
             "stats": {
                 "n_particles": $(n_p),
@@ -499,11 +499,11 @@ function export_interactive_tracks_html(
             "hydrodynamics": $(hydro_json)
         }
         """
-        push!(scenario_json_blocks, scen_json)
+        push!(run_json_blocks, run_json)
     end
 
-    scenarios_master_json = "{\n" * join(scenario_json_blocks, ",\n") * "\n}"
-    default_scen_key = first(keys(scenarios_dict))
+    runs_master_json = "{\n" * join(run_json_blocks, ",\n") * "\n}"
+    default_run_key = first(keys(runs_dict))
 
     html_content = """<!DOCTYPE html>
 <html lang="en">
@@ -581,7 +581,7 @@ function export_interactive_tracks_html(
             gap: 16px;
         }
 
-        .scenario-selector-box {
+        .run-selector-box {
             display: flex;
             align-items: center;
             gap: 8px;
@@ -591,14 +591,14 @@ function export_interactive_tracks_html(
             border: 1px solid var(--panel-border);
         }
 
-        .scenario-selector-box label {
+        .run-selector-box label {
             font-size: 0.72rem;
             text-transform: uppercase;
             font-weight: 600;
             color: var(--accent-blue);
         }
 
-        .scenario-selector-box select {
+        .run-selector-box select {
             background: #0f172a;
             color: #fff;
             border: 1px solid rgba(255,255,255,0.2);
@@ -893,12 +893,12 @@ function export_interactive_tracks_html(
     <header>
         <div class="header-title">
             <h1>Larval <span>Dispersal</span> & Ocean Hydrodynamics</h1>
-            <div class="header-subtitle">Multi-Scenario Hydrodynamic Particle Tracking Dashboard (*Chionoecetes opilio*)</div>
+            <div class="header-subtitle">Multi-Run Hydrodynamic Particle Tracking Dashboard (*Chionoecetes opilio*)</div>
         </div>
         <div class="header-controls">
-            <div class="scenario-selector-box">
-                <label for="scenario-select">Scenario:</label>
-                <select id="scenario-select" onchange="switchScenario(this.value)"></select>
+            <div class="run-selector-box">
+                <label for="run-select">Run:</label>
+                <select id="run-select" onchange="switchRun(this.value)"></select>
             </div>
             <div class="metric-chips">
                 <div class="chip">
@@ -1083,11 +1083,11 @@ function export_interactive_tracks_html(
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <script>
-        const SCENARIOS = $(scenarios_master_json);
+        const RUNS = $(runs_master_json);
         const STRATA = $(strata_json);
-        let activeScenKey = "$(default_scen_key)";
-        let currentScen = SCENARIOS[activeScenKey];
-        const PARTICLES = currentScen.particles;
+        let activeRunKey = "$(default_run_key)";
+        let currentRun = RUNS[activeRunKey];
+        const PARTICLES = currentRun.particles;
 
         const STAGE_COLORS = {
             "zoea1": "#38bdf8", "zoea2": "#06b6d4", "zoea3": "#0d9488", "zoea4": "#eab308",
@@ -1127,11 +1127,11 @@ function export_interactive_tracks_html(
             layer.bindTooltip("<b>" + s.name + "</b>").addTo(strataLayer);
         });
 
-        const scenSelect = document.getElementById('scenario-select');
-        Object.keys(SCENARIOS).forEach(k => {
+        const runSelect = document.getElementById('run-select');
+        Object.keys(RUNS).forEach(k => {
             const opt = document.createElement('option'); opt.value = k; opt.textContent = k;
-            if (k === activeScenKey) opt.selected = true;
-            scenSelect.appendChild(opt);
+            if (k === activeRunKey) opt.selected = true;
+            runSelect.appendChild(opt);
         });
 
         let currentStep = 0, isPlaying = false, playSpeed = 1, animTimer = null, showTrails = true, colorMode = "stage", outcomeFilter = "all", focusParticleId = -1;
@@ -1277,7 +1277,7 @@ function export_interactive_tracks_html(
             [hydroAdvectionLayer, hydroSpeedLayer, hydroTempLayer, hydroSalLayer,
              hydroStratLayer, hydroDiffLayer, hydroUpwellingLayer].forEach(l => l.clearLayers());
 
-            const hydro = currentScen.hydrodynamics;
+            const hydro = currentRun.hydrodynamics;
             if (!hydro || !hydro.lons || !hydro.lats) return;
 
             const hLons = hydro.lons;
@@ -1366,7 +1366,7 @@ function export_interactive_tracks_html(
             }
         }
 
-        function renderActiveScenario() {
+        function renderActiveRun() {
             [fullTracksLayer, progressTracksLayer, activeHeadsLayer, releaseMarkersLayer,
              settlementMarkersLayer, settlementDensityLayer, hydroAdvectionLayer,
              hydroSpeedLayer, hydroTempLayer, hydroSalLayer, hydroStratLayer, hydroDiffLayer,
@@ -1377,14 +1377,14 @@ function export_interactive_tracks_html(
             progressTrackPolylines = [];
             activeRasterLayers = [];
 
-            const pList = currentScen.particles;
-            const nTimes = currentScen.times.length;
+            const pList = currentRun.particles;
+            const nTimes = currentRun.times.length;
 
             // 1. Summary Chips
-            document.getElementById('chip-cohort').textContent = currentScen.stats.n_particles;
-            document.getElementById('chip-settled').textContent = `\${currentScen.stats.n_settled} (\${currentScen.stats.settle_pct}%)`;
-            document.getElementById('chip-survival').textContent = `\${currentScen.stats.survival_pct}%`;
-            document.getElementById('chip-pld').textContent = `\${currentScen.stats.mean_pld_days} d`;
+            document.getElementById('chip-cohort').textContent = currentRun.stats.n_particles;
+            document.getElementById('chip-settled').textContent = `\${currentRun.stats.n_settled} (\${currentRun.stats.settle_pct}%)`;
+            document.getElementById('chip-survival').textContent = `\${currentRun.stats.survival_pct}%`;
+            document.getElementById('chip-pld').textContent = `\${currentRun.stats.mean_pld_days} d`;
 
             // 2. Trajectories, Heads & Markers
             pList.forEach((p) => {
@@ -1448,7 +1448,7 @@ function export_interactive_tracks_html(
             });
 
             // 3. Hydrodynamic Model Outputs Setup
-            const hydro = currentScen.hydrodynamics;
+            const hydro = currentRun.hydrodynamics;
             selectedDepthIdx = 0;
             const depthSelect = document.getElementById('hydro-depth-select');
             if (depthSelect) {
@@ -1497,9 +1497,9 @@ function export_interactive_tracks_html(
             }
 
             // 4. Nursery Settlement Density Heatmap
-            if (currentScen.settlement_density && currentScen.settlement_density.length > 0) {
-                const maxDens = Math.max(...currentScen.settlement_density.map(d => d.density));
-                currentScen.settlement_density.forEach(d => {
+            if (currentRun.settlement_density && currentRun.settlement_density.length > 0) {
+                const maxDens = Math.max(...currentRun.settlement_density.map(d => d.density));
+                currentRun.settlement_density.forEach(d => {
                     const norm = maxDens > 0 ? (d.density / maxDens) : 0.5;
                     const col = norm > 0.66 ? '#ef4444' : norm > 0.33 ? '#f59e0b' : '#38bdf8';
                     const rect = L.circle([d.lat, d.lon], {
@@ -1514,8 +1514,8 @@ function export_interactive_tracks_html(
             }
 
             // 5. Demographic Connectivity Flows
-            if (currentScen.connectivity_flows && currentScen.connectivity_flows.length > 0) {
-                currentScen.connectivity_flows.forEach(flow => {
+            if (currentRun.connectivity_flows && currentRun.connectivity_flows.length > 0) {
+                currentRun.connectivity_flows.forEach(flow => {
                     const weight = Math.max(2.0, flow.prob * 10.0);
                     const flowLine = L.polyline([[flow.src_lat, flow.src_lon], [flow.dst_lat, flow.dst_lon]], {
                         color: '#a855f7',
@@ -1556,24 +1556,24 @@ function export_interactive_tracks_html(
             updateFrame(0);
         }
 
-        function switchScenario(key) {
-            if (SCENARIOS[key]) {
-                activeScenKey = key;
-                currentScen = SCENARIOS[key];
+        function switchRun(key) {
+            if (RUNS[key]) {
+                activeRunKey = key;
+                currentRun = RUNS[key];
                 isPlaying = false;
                 document.getElementById('play-btn').textContent = "▶ Play";
                 clearTimeout(animTimer);
-                renderActiveScenario();
+                renderActiveRun();
             }
         }
 
         function updateFrame(step) {
             currentStep = step;
-            const nTimes = currentScen.times.length;
-            const pList = currentScen.particles;
+            const nTimes = currentRun.times.length;
+            const pList = currentRun.particles;
 
             document.getElementById('time-slider').value = step;
-            document.getElementById('time-readout').textContent = `Day \${currentScen.times[step].toFixed(2)} / \${currentScen.times[nTimes - 1].toFixed(2)} d`;
+            document.getElementById('time-readout').textContent = `Day \${currentRun.times[step].toFixed(2)} / \${currentRun.times[nTimes - 1].toFixed(2)} d`;
 
             pList.forEach((p, idx) => {
                 const isFiltered = (outcomeFilter === "settled" && p.status !== "settled_successful") ||
@@ -1654,7 +1654,7 @@ function export_interactive_tracks_html(
         function selectParticle(id) {
             focusParticleId = id;
             document.getElementById('particle-select').value = id;
-            const p = currentScen.particles.find(item => item.id === id);
+            const p = currentRun.particles.find(item => item.id === id);
             if (p) {
                 map.setView([p.lats[currentStep], p.lons[currentStep]], 9);
                 updateHUD(p, currentStep);
@@ -1664,7 +1664,7 @@ function export_interactive_tracks_html(
 
         function playLoop() {
             if (!isPlaying) return;
-            const nTimes = currentScen.times.length;
+            const nTimes = currentRun.times.length;
             let nextStep = currentStep + playSpeed;
             if (nextStep >= nTimes) nextStep = 0;
             updateFrame(nextStep);
@@ -1676,7 +1676,7 @@ function export_interactive_tracks_html(
             if (focusParticleId !== -1) return;
             const lat = e.latlng.lat;
             const lon = e.latlng.lng;
-            const hydro = currentScen.hydrodynamics;
+            const hydro = currentRun.hydrodynamics;
             if (hydro && hydro.lons && hydro.lats) {
                 const hLons = hydro.lons;
                 const hLats = hydro.lats;
@@ -1715,31 +1715,31 @@ function export_interactive_tracks_html(
             { id: 'layer-density', layer: settlementDensityLayer, onSelect: () => updateLegend("Nursery Settlement Density", "%", "0.0", "100.0", "linear-gradient(to right, #1e3a8a, #06b6d4, #f59e0b, #ef4444)") },
             { id: 'layer-hydro-advection', layer: hydroAdvectionLayer },
             { id: 'layer-hydro-speed', layer: hydroSpeedLayer, onSelect: () => {
-                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
-                updateLegend("Current Speed (|u_h|)", "cm/s", "0.0", (lvl && lvl.speed) ? lvl.speed.max : (currentScen.hydrodynamics?.grids?.speed?.max || "25.0"), "linear-gradient(to right, #3b82f6, #06b6d4, #10b981, #facc15, #ef4444)");
+                const lvl = currentRun.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                updateLegend("Current Speed (|u_h|)", "cm/s", "0.0", (lvl && lvl.speed) ? lvl.speed.max : (currentRun.hydrodynamics?.grids?.speed?.max || "25.0"), "linear-gradient(to right, #3b82f6, #06b6d4, #10b981, #facc15, #ef4444)");
             }},
             { id: 'layer-hydro-temp', layer: hydroTempLayer, onSelect: () => {
-                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
-                updateLegend("Seawater Temperature (T)", "°C", (lvl && lvl.temperature) ? lvl.temperature.min : (currentScen.hydrodynamics?.grids?.temperature?.min || "1.5"), (lvl && lvl.temperature) ? lvl.temperature.max : (currentScen.hydrodynamics?.grids?.temperature?.max || "14.5"), "linear-gradient(to right, #1d4ed8, #06b6d4, #10b981, #f59e0b, #ef4444)");
+                const lvl = currentRun.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                updateLegend("Seawater Temperature (T)", "°C", (lvl && lvl.temperature) ? lvl.temperature.min : (currentRun.hydrodynamics?.grids?.temperature?.min || "1.5"), (lvl && lvl.temperature) ? lvl.temperature.max : (currentRun.hydrodynamics?.grids?.temperature?.max || "14.5"), "linear-gradient(to right, #1d4ed8, #06b6d4, #10b981, #f59e0b, #ef4444)");
             }},
             { id: 'layer-hydro-sal', layer: hydroSalLayer, onSelect: () => {
-                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
-                updateLegend("Practical Salinity (S)", "PSU", (lvl && lvl.salinity) ? lvl.salinity.min : (currentScen.hydrodynamics?.grids?.salinity?.min || "31.0"), (lvl && lvl.salinity) ? lvl.salinity.max : (currentScen.hydrodynamics?.grids?.salinity?.max || "35.5"), "linear-gradient(to right, #10b981, #06b6d4, #3b82f6, #6366f1, #8b5cf6)");
+                const lvl = currentRun.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                updateLegend("Practical Salinity (S)", "PSU", (lvl && lvl.salinity) ? lvl.salinity.min : (currentRun.hydrodynamics?.grids?.salinity?.min || "31.0"), (lvl && lvl.salinity) ? lvl.salinity.max : (currentRun.hydrodynamics?.grids?.salinity?.max || "35.5"), "linear-gradient(to right, #10b981, #06b6d4, #3b82f6, #6366f1, #8b5cf6)");
             }},
             { id: 'layer-hydro-strat', layer: hydroStratLayer, onSelect: () => {
-                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                const lvl = currentRun.hydrodynamics?.depth_levels?.[selectedDepthIdx];
                 updateLegend("Stratification (N²)", "10⁻⁴ s⁻²", (lvl && lvl.stratification) ? lvl.stratification.min : "0.0", (lvl && lvl.stratification) ? lvl.stratification.max : "5.0", "linear-gradient(to right, #440154, #3b528b, #21908c, #5dc963, #fde725)");
             }},
             { id: 'layer-hydro-diff', layer: hydroDiffLayer, onSelect: () => {
-                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                const lvl = currentRun.hydrodynamics?.depth_levels?.[selectedDepthIdx];
                 updateLegend("Turbulent Diffusivity (κ_v)", "10⁻⁴ m²/s", (lvl && lvl.diffusion) ? lvl.diffusion.min : "0.1", (lvl && lvl.diffusion) ? lvl.diffusion.max : "10.0", "linear-gradient(to right, #0d0887, #6a00a8, #b12a90, #e16462, #fca636, #f0f921)");
             }},
-            { id: 'layer-hydro-eta', layer: hydroEtaLayer, onSelect: () => updateLegend("Free Surface Height (η)", "cm", currentScen.hydrodynamics?.grids?.elevation?.min || "-10.0", currentScen.hydrodynamics?.grids?.elevation?.max || "+10.0", "linear-gradient(to right, #3b82f6, #f8fafc, #ef4444)") },
+            { id: 'layer-hydro-eta', layer: hydroEtaLayer, onSelect: () => updateLegend("Free Surface Height (η)", "cm", currentRun.hydrodynamics?.grids?.elevation?.min || "-10.0", currentRun.hydrodynamics?.grids?.elevation?.max || "+10.0", "linear-gradient(to right, #3b82f6, #f8fafc, #ef4444)") },
             { id: 'layer-hydro-w', layer: hydroUpwellingLayer, onSelect: () => {
-                const lvl = currentScen.hydrodynamics?.depth_levels?.[selectedDepthIdx];
-                updateLegend("Vertical Velocity / Upwelling", "mm/s", (lvl && lvl.upwelling) ? lvl.upwelling.min : (currentScen.hydrodynamics?.grids?.upwelling?.min || "-0.5"), (lvl && lvl.upwelling) ? lvl.upwelling.max : (currentScen.hydrodynamics?.grids?.upwelling?.max || "+0.5"), "linear-gradient(to right, #1e40af, #94a3b8, #b91c1c)");
+                const lvl = currentRun.hydrodynamics?.depth_levels?.[selectedDepthIdx];
+                updateLegend("Vertical Velocity / Upwelling", "mm/s", (lvl && lvl.upwelling) ? lvl.upwelling.min : (currentRun.hydrodynamics?.grids?.upwelling?.min || "-0.5"), (lvl && lvl.upwelling) ? lvl.upwelling.max : (currentRun.hydrodynamics?.grids?.upwelling?.max || "+0.5"), "linear-gradient(to right, #1e40af, #94a3b8, #b91c1c)");
             }},
-            { id: 'layer-hydro-bathy', layer: hydroBathyLayer, onSelect: () => updateLegend("Seafloor Bathymetry", "m", currentScen.hydrodynamics?.grids?.bathymetry?.min || "-3000", "0", "linear-gradient(to right, #030712, #1e3a8a, #0284c7, #38bdf8)") },
+            { id: 'layer-hydro-bathy', layer: hydroBathyLayer, onSelect: () => updateLegend("Seafloor Bathymetry", "m", currentRun.hydrodynamics?.grids?.bathymetry?.min || "-3000", "0", "linear-gradient(to right, #030712, #1e3a8a, #0284c7, #38bdf8)") },
             { id: 'layer-strata', layer: strataLayer },
             { id: 'layer-conn', layer: connectivityFlowsLayer }
         ];
@@ -1831,7 +1831,7 @@ function export_interactive_tracks_html(
         });
 
         // Initialize First Render
-        renderActiveScenario();
+        renderActiveRun();
     </script>
 </body>
 </html>
@@ -1881,7 +1881,7 @@ end
 """
     plot_interactive_trajectories_map(
         trajectories::Union{Nothing, NamedTuple} = nothing;
-        scenarios_data = nothing,
+        runs_data = nothing,
         hydrodynamics = nothing,
         gridded_dispersal = nothing,
         connectivity = nothing,
@@ -1893,11 +1893,11 @@ end
     ) -> String
 
 Convenience wrapper to generate and export an interactive Leaflet HTML map of particle tracks,
-supporting multi-scenario data dictionaries, hydrodynamic Eulerian flow fields, and full spatial layer suites.
+supporting multi-run data dictionaries, hydrodynamic Eulerian flow fields, and full spatial layer suites.
 """
 function plot_interactive_trajectories_map(
     trajectories::Union{Nothing, NamedTuple} = nothing;
-    scenarios_data = nothing,
+    runs_data = nothing,
     hydrodynamics = nothing,
     gridded_dispersal = nothing,
     connectivity = nothing,
@@ -1910,7 +1910,7 @@ function plot_interactive_trajectories_map(
     return export_interactive_tracks_html(
         output_path;
         trajectories = trajectories,
-        scenarios_data = scenarios_data,
+        runs_data = runs_data,
         hydrodynamics = hydrodynamics,
         gridded_dispersal = gridded_dispersal,
         connectivity = connectivity,

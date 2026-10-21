@@ -34,51 +34,120 @@ to_cpu_offset_array(x) = x
 # Import domain constants for fallback coordinate generation
 
 """
-    compute_advective_cfl(
-        model,
-        Δt::Real;
-        bottom_drag::Real = 1e-4,
-        cd_drag::Real = 2.5e-3
-    ) -> Float64
+    _grid_halos(grid) -> ((Nx, Hx), (Ny, Hy), (Nz, Hz))
 
-Estimate the composite Courant-Friedrichs-Lewy (CFL) stability parameter
-across the computational domain, evaluating advective velocity transport
-in interior cells and the explicit bottom friction / drag Courant limit.
-
-# Mathematical Formulation
-```math
-\\text{CFL}_{\\text{adv}} = \\max \\left(
-    \\frac{|u| \\Delta t}{\\Delta x},
-    \\frac{|v| \\Delta t}{\\Delta y},
-    \\frac{|w| \\Delta t}{\\Delta z}
-\\right)
-```
-```math
-\\text{CFL}_{\\text{drag}} = (r_{\\text{drag}} + C_d |\\boldsymbol{u}_h|) \\Delta t
-```
-The composite stability index returned is:
-```math
-\\text{CFL} = \\max(\\text{CFL}_{\\text{adv}}, 0.5 \\, \\text{CFL}_{\\text{drag}})
-```
-ensuring that adaptive time-step controllers (e.g. `TimeStepWizard`) automatically
-throttle \$\\Delta t\$ during intense spring-neap tidal acceleration episodes.
-
-# References
-- Canuto, C., et al. (2007). *Spectral Methods*. Springer-Verlag.
+The grid's cell counts and halo widths, as the pairs `_interior_1d` matches a metric's
+length against. A grid that does not publish a halo width is taken to have none.
 """
-# Smallest vertical cell thickness (m).
-#
-# The CFL must use the SMALLEST cell, never the mean. `Lz / Nz` is the mean, and on a stretched
-# grid it badly underestimates the constraint: the two-segment shelf grid reports `Lz/Nz = 125 m`
-# while its surface cell is about 5.4 m, a factor of ~23. Using the mean let the adaptive
-# time-stepper pick a dt stable for 125 m cells but violently unstable for the surface layer -- the
-# run reached max(|u|) = 7.6 m/s at CFL 0.428 against a 0.20 target and diverged. On the previous
-# uniform grid the same formula was already ~5.6x optimistic (250 m mean against a 44.7 m cell).
-#
-# Falls back to `Lz / Nz` if the grid does not expose a cell-centre vector.
+function _grid_halos(grid)
+    halo(sym) = hasproperty(grid, sym) ? Int(getproperty(grid, sym)) : 0
+    return ((Int(grid.Nx), halo(:Hx)), (Int(grid.Ny), halo(:Hy)), (Int(grid.Nz), halo(:Hz)))
+end
+
+"""
+    _interior_1d(a::AbstractVector, grid) -> AbstractVector
+
+The interior of a one-dimensional metric, along the axis the metric actually has.
+
+A metric carries the axes it varies in, and its halo is as wide as the grid's, at BOTH
+ends. So the interior of a vector over an axis of length N is the middle N elements: on a
+32x38x8 grid with halos (7, 7, 5) a vector over x has 46 elements (1:32 are the domain),
+one over y has 52 (1:38), one over z has 18 (1:8), and a vector over x FACES has 47
+(1:33). Which axis a vector belongs to follows from its length, which is why the length is
+matched against every axis in turn.
+
+The halo is not a harmless extra. The zonal metric of a spherical grid carries a ZERO in
+its halo, and a zero as a cell size is a division by zero rather than a small number, so
+the interior has to be taken before the metric is used.
+"""
+function _interior_1d(a::AbstractVector, grid)
+    n = length(a)
+    specs = _grid_halos(grid)
+    for (N, H) in specs
+        n == N + 2 * H && return a[1:N]
+    end
+    for (N, H) in specs
+        n == N + 1 + 2 * H && return a[1:(N + 1)]
+    end
+    return a
+end
+
+"""
+    _minimum_interior(metric, grid) -> Float64
+
+The smallest value a metric takes over the grid's interior.
+
+A metric is a field over the axes it varies in, and which axes those are depends on the
+grid: on a latitude-longitude grid the zonal metric varies with latitude and is a vector
+over y. The interior is taken along the axes the metric actually has, so a vector is
+sliced along its own axis rather than indexed as though it were a field -- which, on a
+vector, is a BoundsError.
+"""
+function _minimum_interior(metric, grid)
+    a = to_cpu_offset_array(metric)
+    if ndims(a) == 1
+        return Float64(minimum(_interior_1d(a, grid)))
+    elseif ndims(a) == 2
+        return Float64(minimum(a[1:grid.Nx, 1:grid.Ny]))
+    else
+        return Float64(minimum(a[1:grid.Nx, 1:grid.Ny, 1:grid.Nz]))
+    end
+end
+
+"""
+    _horizontal_spacing(grid, axis::Symbol) -> Float64
+
+The horizontal cell size, in meters, along `axis` (`:x` or `:y`).
+
+The grid's own metrics are the answer wherever it has them: they are the true cell sizes.
+A latitude-longitude grid has no meridional metric ARRAY -- its meridional spacing is one
+number for the whole grid -- so a metric that is a plain number is taken as it stands.
+
+When the grid exposes no metric of that kind at all, the spacing is derived from the
+spherical geometry, which is what a latitude-longitude grid's cells are: R Δφ tall, and
+R cos(φ) Δλ wide, the narrowest zonal cell being the one at the highest latitude.
+"""
+function _horizontal_spacing(grid, axis::Symbol)
+    names = axis === :x ? (:Δxᶜᶜᵃ, :Δxᶜᶜᶜ, :Δx) :
+                           (:Δyᶜᶜᵃ, :Δyᶠᶜᵃ, :Δyᶜᶠᵃ, :Δy)
+    for nm in names
+        hasproperty(grid, nm) || continue
+        m = getproperty(grid, nm)
+        m isa AbstractArray && return _minimum_interior(m, grid)
+        m isa Real && return Float64(m)
+    end
+    r_earth = hasproperty(grid, :radius) ? Float64(getproperty(grid, :radius)) : 6_371_000.0
+    if axis === :x
+        λf = _interior_1d(to_cpu_offset_array(getproperty(grid, :λᶠᵃᵃ)), grid)
+        φc = _interior_1d(to_cpu_offset_array(getproperty(grid, :φᵃᶜᵃ)), grid)
+        dlon = minimum(diff(collect(Float64, λf)))
+        lat_max_abs = maximum(abs, collect(Float64, φc))
+        return r_earth * cosd(lat_max_abs) * deg2rad(dlon)
+    else
+        φf = _interior_1d(to_cpu_offset_array(getproperty(grid, :φᵃᶠᵃ)), grid)
+        dlat = minimum(diff(collect(Float64, φf)))
+        return r_earth * deg2rad(dlat)
+    end
+end
+
+"""
+    min_vertical_spacing(base_g) -> Float64
+
+The smallest vertical cell thickness (m).
+
+The CFL must use the SMALLEST cell, never the mean. `Lz / Nz` is the mean, and on a stretched
+grid it badly underestimates the constraint: the two-segment shelf grid reports `Lz/Nz = 125 m`
+while its surface cell is about 5.4 m, a factor of ~23. Using the mean let the adaptive
+time-stepper pick a dt stable for 125 m cells but violently unstable for the surface layer -- the
+run reached max(|u|) = 7.6 m/s at CFL 0.428 against a 0.20 target and diverged. On the previous
+uniform grid the same formula was already ~5.6x optimistic (250 m mean against a 44.7 m cell).
+
+Falls back to `Lz / Nz` if the grid does not expose a cell-centre vector.
+"""
 function min_vertical_spacing(base_g)
     if hasproperty(base_g, :z) && hasproperty(base_g.z, :cᵃᵃᶠ)
-        c = collect(Float64, parent(base_g.z.cᵃᵃᶠ))
+        c = to_cpu_offset_array(base_g.z.cᵃᵃᶠ)
+        c = _interior_1d(c, base_g)
         if length(c) > 1
             d = minimum(abs.(diff(c)))
             isfinite(d) && d > 0 && return Float64(d)
@@ -126,6 +195,39 @@ function format_geographic_location(lon_deg::Real, lat_deg::Real, depth_m::Real)
     return "$(lon_abs)$(lon_dir), $(lat_abs)$(lat_dir), $(dep_val)m"
 end
 
+"""
+    compute_advective_cfl(
+        model,
+        Δt::Real;
+        bottom_drag::Real = 1e-4,
+        cd_drag::Real = 2.5e-3
+    ) -> Float64
+
+Estimate the composite Courant-Friedrichs-Lewy (CFL) stability parameter
+across the computational domain, evaluating advective velocity transport
+in interior cells and the explicit bottom friction / drag Courant limit.
+
+# Mathematical Formulation
+```math
+\\text{CFL}_{\\text{adv}} = \\max \\left(
+    \\frac{|u| \\Delta t}{\\Delta x},
+    \\frac{|v| \\Delta t}{\\Delta y},
+    \\frac{|w| \\Delta t}{\\Delta z}
+\\right)
+```
+```math
+\\text{CFL}_{\\text{drag}} = (r_{\\text{drag}} + C_d |\\boldsymbol{u}_h|) \\Delta t
+```
+The composite stability index returned is:
+```math
+\\text{CFL} = \\max(\\text{CFL}_{\\text{adv}}, 0.5 \\, \\text{CFL}_{\\text{drag}})
+```
+ensuring that adaptive time-step controllers (e.g. `TimeStepWizard`) automatically
+throttle \$\\Delta t\$ during intense spring-neap tidal acceleration episodes.
+
+# References
+- Canuto, C., et al. (2007). *Spectral Methods*. Springer-Verlag.
+"""
 function compute_advective_cfl(
     model,
     Δt::Real;
@@ -137,34 +239,19 @@ function compute_advective_cfl(
     w_int = interior(model.velocities.w)
     w_max = maximum(abs, w_int)
 
-    # Estimate horizontal grid spacing (in meters)
+    # Estimate horizontal grid spacing (in meters).
+    #
+    # The metrics are not all the same shape, and the difference is not cosmetic. On a
+    # latitude-longitude grid the zonal metric varies with LATITUDE -- a cell is narrower
+    # towards the pole -- so it is stored as a vector over y, 52 elements wide on a 32x38
+    # grid with halos (7, 7, 5), while the meridional metric is a single number for the
+    # whole grid. The old code indexed the zonal metric as though it were a field over the
+    # domain, `metric[1:Nx, 1:Ny]`, which is a BoundsError on exactly that vector: the run
+    # died at iteration 0, before a single time step, with an error that named neither the
+    # grid nor the metric it came from.
     base_g = model.grid isa ImmersedBoundaryGrid ? model.grid.underlying_grid : model.grid
-    dx_approx = if hasproperty(base_g, :Δxᶜᶜᵃ)
-        dx_cpu = to_cpu_offset_array(base_g.Δxᶜᶜᵃ)
-        Float64(minimum(dx_cpu[1:base_g.Nx, 1:base_g.Ny]))
-    elseif hasproperty(base_g, :radius) && hasproperty(base_g, :λᶠᵃᵃ)
-        # Spherical grid: compute minimum zonal spacing at highest absolute latitude
-        r_earth = Float64(base_g.radius)
-        dlon_deg = minimum(diff(collect(base_g.λᶠᵃᵃ[1:base_g.Nx + 1])))
-        lat_max_abs = max(abs(base_g.φᵃᶠᵃ[1]), abs(base_g.φᵃᶠᵃ[base_g.Ny + 1]))
-        r_earth * cosd(lat_max_abs) * deg2rad(dlon_deg)
-    elseif hasproperty(base_g, :Lx)
-        Float64(base_g.Lx) / base_g.Nx
-    else
-        1000.0
-    end
-    dy_approx = if hasproperty(base_g, :Δyᶜᶜᵃ)
-        dy_cpu = to_cpu_offset_array(base_g.Δyᶜᶜᵃ)
-        Float64(minimum(dy_cpu[1:base_g.Nx, 1:base_g.Ny]))
-    elseif hasproperty(base_g, :radius) && hasproperty(base_g, :φᵃᶠᵃ)
-        r_earth = Float64(base_g.radius)
-        dlat_deg = minimum(diff(collect(base_g.φᵃᶠᵃ[1:base_g.Ny + 1])))
-        r_earth * deg2rad(dlat_deg)
-    elseif hasproperty(base_g, :Ly)
-        Float64(base_g.Ly) / base_g.Ny
-    else
-        1000.0
-    end
+    dx_approx = _horizontal_spacing(base_g, :x)
+    dy_approx = _horizontal_spacing(base_g, :y)
     # Smallest vertical cell, NOT Lz/Nz: see `min_vertical_spacing`. This single line is the
     # difference between a stable surface layer and a diverging one on a stretched grid.
     dz_approx = min_vertical_spacing(base_g)
@@ -186,7 +273,11 @@ function compute_advective_cfl(
             dz_k = Float64(dz_raw)
             cfl_z = (w_max * Δt) / max(1.0, dz_k)
         elseif dz_raw isa AbstractArray
-            dz_vec = to_cpu_offset_array(dz_raw)
+            # The cell thicknesses are the metric's INTERIOR: the halo holds extrapolated
+            # values, and on a stretched grid they are the thicknesses of layers that are
+            # not there. Reading them would pair the surface layer's velocity with a
+            # thickness from the other end of the column.
+            dz_vec = _interior_1d(to_cpu_offset_array(dz_raw), base_g)
             for k in 1:nz
                 dz_k = Float64(dz_vec[k])
                 w_bot = maximum(abs, @view(w_int[:, :, k]))
@@ -1288,30 +1379,11 @@ function setup_hydrodynamic_simulation(
         metrics = try
             base_g = s.model.grid isa ImmersedBoundaryGrid ? s.model.grid.underlying_grid : s.model.grid
             dz_min = min_vertical_spacing(base_g)
-            dx_m = if hasproperty(base_g, :Δxᶜᶜᵃ)
-                dx_cpu = to_cpu_offset_array(base_g.Δxᶜᶜᵃ)
-                Float64(minimum(dx_cpu[1:base_g.Nx, 1:base_g.Ny]))
-            elseif hasproperty(base_g, :radius) && hasproperty(base_g, :λᶠᵃᵃ)
-                r_earth = Float64(base_g.radius)
-                dlon_deg = minimum(diff(collect(base_g.λᶠᵃᵃ[1:base_g.Nx + 1])))
-                lat_max_abs = max(abs(base_g.φᵃᶠᵃ[1]), abs(base_g.φᵃᶠᵃ[base_g.Ny + 1]))
-                r_earth * cosd(lat_max_abs) * deg2rad(dlon_deg)
-            else
-                1000.0
-            end
-            dy_m = if hasproperty(base_g, :Δyᶜᶜᵃ)
-                dy_cpu = to_cpu_offset_array(base_g.Δyᶜᶜᵃ)
-                Float64(minimum(dy_cpu[1:base_g.Nx, 1:base_g.Ny]))
-            elseif hasproperty(base_g, :radius) && hasproperty(base_g, :φᵃᶠᵃ)
-                r_earth = Float64(base_g.radius)
-                dlat_deg = minimum(diff(collect(base_g.φᵃᶠᵃ[1:base_g.Ny + 1])))
-                r_earth * deg2rad(dlat_deg)
-            else
-                1000.0
-            end
+            dx_m = _horizontal_spacing(base_g, :x)
+            dy_m = _horizontal_spacing(base_g, :y)
             cflz_val = 0.0
             if hasproperty(base_g, :z) && hasproperty(base_g.z, :Δᵃᵃᶜ)
-                dz_vec_p = to_cpu_offset_array(base_g.z.Δᵃᵃᶜ)
+                dz_vec_p = _interior_1d(to_cpu_offset_array(base_g.z.Δᵃᵃᶜ), base_g)
                 for k in 1:base_g.Nz
                     dz_k = Float64(dz_vec_p[k])
                     w_k = max(maximum(abs, @view(w_int[:, :, k])),
@@ -1402,21 +1474,16 @@ function setup_hydrodynamic_simulation(
                     g = 9.80665
                     # Deepest water column (positive depth below surface).
                     z_faces = if hasproperty(base_g, :z) && hasproperty(base_g.z, :cᵃᵃᶠ)
-                        zc = collect(Float64, parent(base_g.z.cᵃᵃᶠ))
-                        maximum(abs, zc)
+                        # The INTERIOR faces: the halo extrapolates the column past the bed,
+                        # and a depth the model does not have is not a depth to reason about.
+                        zc = _interior_1d(to_cpu_offset_array(base_g.z.cᵃᵃᶠ), base_g)
+                        maximum(abs, collect(Float64, zc))
                     else
                         abs(Float64(base_g.Lz))
                     end
                     c_wave = sqrt(g * z_faces)
                     # Minimum horizontal spacing.
-                    dx_min = if hasproperty(base_g, :Δxᶜᶜᵃ)
-                        dx_cpu = to_cpu_offset_array(base_g.Δxᶜᶜᵃ)
-                        Float64(minimum(dx_cpu[1:base_g.Nx, 1:base_g.Ny]))
-                    elseif hasproperty(base_g, :Lx)
-                        Float64(base_g.Lx) / base_g.Nx
-                    else
-                        1000.0
-                    end
+                    dx_min = _horizontal_spacing(base_g, :x)
                     substeps = 45  # matches SplitExplicitFreeSurface in driver.jl
                     cfl_wave = c_wave * (s.Δt / substeps) / max(1.0, dx_min)
                     if cfl_wave > 0.5

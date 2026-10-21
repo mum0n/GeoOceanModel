@@ -7,12 +7,11 @@ in Oceananigans.jl for coastal shelf domains.
 
 using Oceananigans
 using Oceananigans.Units
-using Oceananigans.OrthogonalSphericalShellGrids: OrthogonalSphericalShellGrid
 # `ContinuousForcing` lives in `Oceananigans.Forcings`, which Oceananigans `using`s
 # internally but does not re-export at top level. `ZeroForcing` is defined locally below,
 # so it is deliberately not imported here.
 using Oceananigans.BoundaryConditions: ContinuousBoundaryFunction
-using Oceananigans: BulkDrag
+using Oceananigans: BulkDrag, AbstractField
 using Oceananigans.Forcings: ContinuousForcing, MultipleForcings, Relaxation
 using Dates
 using NCDatasets
@@ -23,85 +22,10 @@ using SeawaterPolynomials.TEOS10: TEOS10EquationOfState
 import Adapt
 
 """
-    rotate_to_curvilinear(x, y, cos_dλ, sin_dλ, cos_dφ, sin_dφ) -> (Float64, Float64)
-
-Convert geographic coordinates (longitude `x`, latitude `y` in degrees) to curvilinear
-rotated coordinates (λ', φ' in degrees) given precomputed Euler rotation
-coefficients for a rotated North Pole (λ_p, φ_p).
-"""
-@inline function rotate_to_curvilinear(x, y, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
-    λ_rad = deg2rad(Float64(x))
-    φ_rad = deg2rad(Float64(y))
-    cos_φ = cos(φ_rad)
-    sin_φ = sin(φ_rad)
-    cos_λ = cos(λ_rad)
-    sin_λ = sin(λ_rad)
-    cx = cos_φ * cos_λ
-    cy = cos_φ * sin_λ
-    cz = sin_φ
-
-    # Z-axis rotation by lon_pole (dλ)
-    x1 = cos_dλ * cx + sin_dλ * cy
-    y1 = -sin_dλ * cx + cos_dλ * cy
-    z1 = cz
-
-    # Y-axis rotation by (π/2 - lat_pole) (dφ)
-    xp = cos_dφ * x1 - sin_dφ * z1
-    yp = y1
-    zp = sin_dφ * x1 + cos_dφ * z1
-
-    λp = rad2deg(atan(yp, xp))
-    # Protect against machine-precision overshoot (|zp| - 1.0 > 0 at boundary points)
-    zp_bounded = if abs(zp) <= 1.0
-        zp
-    elseif abs(zp) <= 1.0 + 1e-12
-        sign(zp) * 1.0
-    else
-        throw(DomainError(zp, "Curvilinear rotation coordinate |zp| > 1: non-spherical coordinate projection"))
-    end
-    φp = rad2deg(asin(zp_bounded))
-    return (λp, φp)
-end
-
-"""
-    extract_rotated_grid_bounds(
-        base_g,
-        north_pole::Tuple{Real, Real}
-    ) -> (Tuple{Float64, Float64}, Tuple{Float64, Float64})
-
-Extract the curvilinear rotated coordinate bounding box
-`((rot_lon_min, rot_lon_max), (rot_lat_min, rot_lat_max))` in degrees from
-the boundary corners of a `RotatedLatitudeLongitudeGrid`.
-"""
-function extract_rotated_grid_bounds(base_g, north_pole::Tuple{Real, Real})
-    dλ = deg2rad(Float64(north_pole[1]))
-    dφ = π / 2.0 - deg2rad(Float64(north_pole[2]))
-    cos_dλ = cos(dλ)
-    sin_dλ = sin(dλ)
-    cos_dφ = cos(dφ)
-    sin_dφ = sin(dφ)
-
-    nx, ny = base_g.Nx, base_g.Ny
-    λ11 = Float64(Array(base_g.λᶠᶠᵃ[1:1, 1:1])[1, 1])
-    φ11 = Float64(Array(base_g.φᶠᶠᵃ[1:1, 1:1])[1, 1])
-    λ22 = Float64(Array(base_g.λᶠᶠᵃ[nx+1:nx+1, ny+1:ny+1])[1, 1])
-    φ22 = Float64(Array(base_g.φᶠᶠᵃ[nx+1:nx+1, ny+1:ny+1])[1, 1])
-
-    p1 = rotate_to_curvilinear(λ11, φ11, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
-    p2 = rotate_to_curvilinear(λ22, φ22, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
-
-    rot_lon_min = min(p1[1], p2[1])
-    rot_lon_max = max(p1[1], p2[1])
-    rot_lat_min = min(p1[2], p2[2])
-    rot_lat_max = max(p1[2], p2[2])
-    return (rot_lon_min, rot_lon_max), (rot_lat_min, rot_lat_max)
-end
-
-"""
     CartesianSpongeMask <: Function
 
 `isbits` callable functor implementing Price & Aumont (2011) quadratic lateral sponge
-relaxation weights γ ∈ [0, 1] on unrotated Cartesian / geographic spherical grids.
+relaxation weights γ ∈ [0, 1] on the geographic spherical grid.
 """
 struct CartesianSpongeMask <: Function
     lon_min::Float64
@@ -152,141 +76,6 @@ Adapt.adapt_structure(to, s::CartesianSpongeMask) = s
     return max(gamma_e, gamma_w, gamma_n, gamma_s)
 end
 
-"""
-    RotatedSpongeMask <: Function
-
-`isbits` callable functor implementing boundary-aligned quadratic lateral sponge
-relaxation weights γ ∈ [0, 1] on rotated orthogonal spherical shell grids.
-
-# Mathematical Formulation
-Converts geographic coordinates (\$\\lambda, \\phi\$) to curvilinear rotated
-coordinates (\$\\lambda', \\phi'\$) via inverse 3D spherical Euler rotation:
-```math
-\\begin{aligned}
-x_1 &= \\cos(\\lambda_p) \\cos(\\phi) \\cos(\\lambda) + \\sin(\\lambda_p) \\cos(\\phi) \\sin(\\lambda) \\\\
-y_1 &= -\\sin(\\lambda_p) \\cos(\\phi) \\cos(\\lambda) + \\cos(\\lambda_p) \\cos(\\phi) \\sin(\\lambda) \\\\
-z_1 &= \\sin(\\phi) \\\\
-x' &= \\cos(\\phi_p^*) x_1 - \\sin(\\phi_p^*) z_1 \\\\
-y' &= y_1 \\\\
-z' &= \\sin(\\phi_p^*) x_1 + \\cos(\\phi_p^*) z_1 \\\\
-\\lambda' &= \\operatorname{atan2}(y', x') \\\\
-\\phi' &= \\arcsin(z')
-\\end{aligned}
-```
-where \$\\lambda_p\$ is the North Pole longitude and \$\\phi_p^* = \\frac{\\pi}{2} - \\phi_p\$.
-The quadratic sponge dampening is evaluated natively in (\$\\lambda', \\phi'\$), guaranteeing
-strictly boundary-aligned damping along the true curvilinear grid perimeter without
-diagonal truncation or artificial shear discontinuities.
-"""
-struct RotatedSpongeMask <: Function
-    cos_dλ::Float64
-    sin_dλ::Float64
-    cos_dφ::Float64
-    sin_dφ::Float64
-    lon_ref::Float64
-    rot_lon_min::Float64
-    rot_lon_max::Float64
-    rot_lat_min::Float64
-    rot_lat_max::Float64
-    sponge_width::Float64
-    active_east::Bool
-    active_west::Bool
-    active_north::Bool
-    active_south::Bool
-end
-Adapt.adapt_structure(to, s::RotatedSpongeMask) = s
-
-function RotatedSpongeMask(
-    lon_pole::Real, lat_pole::Real,
-    rot_lon_range::Tuple{Real, Real},
-    rot_lat_range::Tuple{Real, Real},
-    sponge_width::Real;
-    active_east::Bool = true,
-    active_west::Bool = false,
-    active_north::Bool = false,
-    active_south::Bool = true
-)
-    dλ = deg2rad(Float64(lon_pole))
-    dφ = π / 2.0 - deg2rad(Float64(lat_pole))
-    return RotatedSpongeMask(
-        cos(dλ), sin(dλ), cos(dφ), sin(dφ),
-        0.5 * (Float64(rot_lon_range[1]) + Float64(rot_lon_range[2])),
-        Float64(rot_lon_range[1]), Float64(rot_lon_range[2]),
-        Float64(rot_lat_range[1]), Float64(rot_lat_range[2]),
-        Float64(sponge_width),
-        active_east, active_west, active_north, active_south
-    )
-end
-
-@inline function (s::RotatedSpongeMask)(x, y, z)
-    λ_rad = deg2rad(Float64(x))
-    φ_rad = deg2rad(Float64(y))
-    cos_φ = cos(φ_rad)
-    sin_φ = sin(φ_rad)
-    cos_λ = cos(λ_rad)
-    sin_λ = sin(λ_rad)
-    cx = cos_φ * cos_λ
-    cy = cos_φ * sin_λ
-    cz = sin_φ
-
-    x1 = s.cos_dλ * cx + s.sin_dλ * cy
-    y1 = -s.sin_dλ * cx + s.cos_dλ * cy
-    z1 = cz
-
-    xp = s.cos_dφ * x1 - s.sin_dφ * z1
-    yp = y1
-    zp = s.sin_dφ * x1 + s.cos_dφ * z1
-
-    λp = rad2deg(atan(yp, xp))
-    if λp < 0.0 && s.lon_ref > 0.0
-        λp += 360.0
-    elseif λp > 180.0 && s.lon_ref < 0.0
-        λp -= 360.0
-    end
-    zp_bounded = if abs(zp) <= 1.0
-        zp
-    elseif abs(zp) <= 1.0 + 1e-12
-        sign(zp) * 1.0
-    else
-        throw(DomainError(zp, "Curvilinear rotation coordinate |zp| > 1: non-spherical coordinate projection"))
-    end
-    φp = rad2deg(asin(zp_bounded))
-
-    gamma_e = if !s.active_east || λp <= (s.rot_lon_max - s.sponge_width)
-        0.0
-    elseif λp >= s.rot_lon_max
-        1.0
-    else
-        ((λp - (s.rot_lon_max - s.sponge_width)) / s.sponge_width)^2
-    end
-
-    gamma_w = if !s.active_west || λp >= (s.rot_lon_min + s.sponge_width)
-        0.0
-    elseif λp <= s.rot_lon_min
-        1.0
-    else
-        (((s.rot_lon_min + s.sponge_width) - λp) / s.sponge_width)^2
-    end
-
-    gamma_n = if !s.active_north || φp <= (s.rot_lat_max - s.sponge_width)
-        0.0
-    elseif φp >= s.rot_lat_max
-        1.0
-    else
-        ((φp - (s.rot_lat_max - s.sponge_width)) / s.sponge_width)^2
-    end
-
-    gamma_s = if !s.active_south || φp >= (s.rot_lat_min + s.sponge_width)
-        0.0
-    elseif φp <= s.rot_lat_min
-        1.0
-    else
-        (((s.rot_lat_min + s.sponge_width) - φp) / s.sponge_width)^2
-    end
-
-    return max(gamma_e, gamma_w, gamma_n, gamma_s)
-end
-
 # Import domain constants
 
 """
@@ -328,6 +117,58 @@ stepping, checkpointing and JLD2 output machinery and therefore only needs the m
   tidal waves to enter and propagate hydrostatically across the continental shelf. Pass `:interior`
   only when simulating closed unconstrained basins without lateral sponges.
 """
+
+"""
+    _materialise_boundary_velocity(grid, source, face::Symbol, scale::Real) -> Field
+
+The boundary velocity as a field on the model's own grid, multiplied by `scale`.
+
+A materialised FIELD is what a `Relaxation` target must be when the value comes from an
+interpolation. A `Field` is adapted to the device array and indexed as `target[i, j, k]`
+inside the tendency kernel, so it executes natively on both CPU and GPU; a closure
+capturing an interpolation object is not `isbits` and cannot be lowered into a GPU
+kernel at all. This is the same construction the tracer sponge already uses for the
+observed boundary temperature and salinity.
+
+`face` is `:x` for the zonal component and `:y` for the meridional one, because the
+target of a relaxation on `u` is indexed on `u`'s own faces. A target on the wrong
+faces is not a wrong answer, it is an answer about the wrong places.
+
+`scale` is applied here, at materialisation, because a materialised field is not
+callable and so cannot be scaled afterwards. The one use of a scale is the tidal
+combination, where the boundary velocity and the tide are relaxed toward as one sum
+written as two relaxations of half the rate each with doubled targets.
+
+The source is called as `(lon, lat, z)` with `z` NEGATIVE DOWN, the model's convention
+and the one the boundary interpolators are built in.
+"""
+function _materialise_boundary_velocity(grid, source, face::Symbol, scale::Real)
+    fld = face === :x ? XFaceField(grid) : YFaceField(grid)
+    if !applicable(source, 0.0, 0.0, 0.0)
+        error(
+            "A boundary velocity must be callable as (lon, lat, z) with z negative down. " *
+            "The value supplied is callable as (lon, lat, z, t) only, which cannot be " *
+            "materialised into a field: a time-dependent boundary velocity would have to " *
+            "be re-evaluated every timestep, and a materialised field is static."
+        )
+    end
+    set!(fld, (x, y, z) -> scale * Float64(source(x, y, z)))
+    return fld
+end
+
+"""
+    _scaled_target(target, factor::Real) -> target
+
+A relaxation target carrying a factor.
+
+A field is returned unchanged: it was scaled when it was materialised, because a field
+is not callable and cannot be scaled afterwards. A callable is wrapped, which is the
+fallback path where the target is the analytical `ExponentialInflow` profile.
+"""
+function _scaled_target(target, factor::Real)
+    target isa AbstractField && return target
+    return (x, y, z, t) -> factor * Float64(target(x, y, z, t))
+end
 function build_hydrodynamic_model(
     grid;
     Δt::Real = 120.0,
@@ -499,52 +340,34 @@ function build_hydrodynamic_model(
         act_n = :north in act_b_syms
         act_s = :south in act_b_syms
 
-        is_rotated = hasproperty(base_g, :conformal_mapping) &&
-                     hasproperty(base_g.conformal_mapping, :north_pole) &&
-                     Tuple(Float64.(base_g.conformal_mapping.north_pole)) != (0.0, 90.0)
-
-        sponge_mask = if is_rotated
-            np = Tuple(Float64.(base_g.conformal_mapping.north_pole))
-            rot_lon_rng, rot_lat_rng = extract_rotated_grid_bounds(base_g, np)
-            RotatedSpongeMask(
-                np[1], np[2], rot_lon_rng, rot_lat_rng, sponge_width;
-                active_east = act_e, active_west = act_w,
-                active_north = act_n, active_south = act_s
-            )
-        else
-            CartesianSpongeMask(
-                lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width,
-                act_e, act_w, act_n, act_s
-            )
-        end
-        # If real boundary velocities (e.g. from GLORYS) are supplied, use them directly as targets.
-        # Otherwise, fall back to the analytical ExponentialInflow reference profile.
+        sponge_mask = CartesianSpongeMask(
+            lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width,
+            act_e, act_w, act_n, act_s
+        )
+        # The momentum sponge's target.
+        #
+        # With observed boundary velocities (GLORYS `uo`/`vo`) the sponge relaxes toward the
+        # measured current; without them it falls back to the analytical `ExponentialInflow`
+        # reference profile, which is a uniform westward velocity of `u_inflow` over the
+        # whole eastern face. That fallback is a hand-entered number standing in for the
+        # Nova Scotia Current, and a model whose open edges are its main water source and
+        # whose inflow speed is a constant is resting on two numbers.
+        #
+        # The target is a FIELD, not a closure. A `Field` is adapted to the device array
+        # and indexed as `target[i, j, k]` inside the tendency kernel, so it executes
+        # natively on both CPU and GPU; a closure capturing an interpolation object is not
+        # `isbits` and cannot be lowered into a GPU kernel at all.
+        #
+        # The scale is the factor the tidal combination needs; it is applied here because
+        # a materialised field cannot be scaled afterwards.
+        scale_bnd = (!isnothing(u_tide_val) && tidal_placement === :boundary) ? 2.0 : 1.0
         u_target = if !isnothing(boundary_velocities) && haskey(boundary_velocities, :u)
-            u_val = boundary_velocities.u
-            if u_val isa Function
-                (x, y, z, t) -> Float64(u_val(x, y, z, t))
-            elseif u_val isa AbstractField
-                u_val
-            else
-                ufld = XFaceField(grid)
-                set!(ufld, (x, y, z) -> Float64(u_val(x, y, -z)))
-                ufld
-            end
+            _materialise_boundary_velocity(grid, boundary_velocities.u, :x, scale_bnd)
         else
             sponge_relaxation.u_ref
         end
-
         v_target = if !isnothing(boundary_velocities) && haskey(boundary_velocities, :v)
-            v_val = boundary_velocities.v
-            if v_val isa Function
-                (x, y, z, t) -> Float64(v_val(x, y, z, t))
-            elseif v_val isa AbstractField
-                v_val
-            else
-                vfld = YFaceField(grid)
-                set!(vfld, (x, y, z) -> Float64(v_val(x, y, -z)))
-                vfld
-            end
+            _materialise_boundary_velocity(grid, boundary_velocities.v, :y, scale_bnd)
         else
             sponge_relaxation.v_ref
         end
@@ -563,20 +386,10 @@ function build_hydrodynamic_model(
         # (East boundary). Along radiation boundaries (South boundary), relax momentum toward
         # (u, v) = (0, 0) to damp reflections without driving cross-isobath shear.
         # For tracers, `sponge_mask` continues to relax across all active open boundaries (East + South).
-        inflow_sponge_mask = if is_rotated
-            np = Tuple(Float64.(base_g.conformal_mapping.north_pole))
-            rot_lon_rng, rot_lat_rng = extract_rotated_grid_bounds(base_g, np)
-            RotatedSpongeMask(
-                np[1], np[2], rot_lon_rng, rot_lat_rng, sponge_width;
-                active_east = act_e, active_west = act_w,
-                active_north = false, active_south = false
-            )
-        else
-            CartesianSpongeMask(
-                lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width,
-                act_e, act_w, false, false
-            )
-        end
+        inflow_sponge_mask = CartesianSpongeMask(
+            lon_min_grid, lon_max_grid, lat_min_grid, lat_max_grid, sponge_width,
+            act_e, act_w, false, false
+        )
 
         u_forcing = Relaxation(rate = relax_rate, mask = inflow_sponge_mask, target = u_target)
         v_forcing = Relaxation(rate = relax_rate, mask = inflow_sponge_mask, target = v_target)
@@ -606,8 +419,28 @@ function build_hydrodynamic_model(
 
         if !isnothing(u_tide_val)
             if tidal_placement === :boundary
-                u_comb_target = (x, y, z, t) -> Float64(u_target(x, y, z, t) + u_tide_val(x, y, z, t))
-                u_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = u_comb_target)
+                # The boundary is relaxed toward the SUM of the background velocity and the
+                # tide, in ONE relaxation, because that is what "the boundary carries this
+                # current" means. Two relaxations would not do it: two relaxations settle
+                # on the WEIGHTED AVERAGE of their two targets, so the tidal amplitude at
+                # the boundary would arrive at half strength.
+                #
+                # The sum cannot be written as a single target here, because the
+                # background velocity is a field and a field is not callable. It can be
+                # written as two relaxations that are exactly equivalent to it:
+                #
+                #     rate * (u_bnd + u_tide - u)
+                #   = (rate/2) * (2*u_bnd - u) + (rate/2) * (2*u_tide - u)
+                #
+                # The algebra is exact, and the mask and the rate are the same on both
+                # sides, so the tendency the model receives is unchanged. Each target
+                # carries a factor of two and each relaxation half the rate.
+                u_forcing = MultipleForcings(
+                    Relaxation(rate = relax_rate / 2, mask = sponge_mask,
+                               target = _scaled_target(u_target, 2.0)),
+                    Relaxation(rate = relax_rate / 2, mask = sponge_mask,
+                               target = (x, y, z, t) -> 2.0 * Float64(u_tide_val(x, y, z, t)))
+                )
             else
                 u_tide_target = (x, y, z, t) -> Float64(u_tide_val(x, y, z, t))
                 u_forcing = MultipleForcings(
@@ -618,8 +451,12 @@ function build_hydrodynamic_model(
         end
         if !isnothing(v_tide_val)
             if tidal_placement === :boundary
-                v_comb_target = (x, y, z, t) -> Float64(v_target(x, y, z, t) + v_tide_val(x, y, z, t))
-                v_forcing = Relaxation(rate = relax_rate, mask = sponge_mask, target = v_comb_target)
+                v_forcing = MultipleForcings(
+                    Relaxation(rate = relax_rate / 2, mask = sponge_mask,
+                               target = _scaled_target(v_target, 2.0)),
+                    Relaxation(rate = relax_rate / 2, mask = sponge_mask,
+                               target = (x, y, z, t) -> 2.0 * Float64(v_tide_val(x, y, z, t)))
+                )
             else
                 v_tide_target = (x, y, z, t) -> Float64(v_tide_val(x, y, z, t))
                 v_forcing = MultipleForcings(
@@ -742,12 +579,7 @@ function build_hydrodynamic_model(
         :forcing => merged_forcing
     )
     isnothing(free_surface) || (kwargs[:free_surface] = free_surface)
-    eff_mom_adv = if (base_g isa OrthogonalSphericalShellGrid) && (momentum_advection isa WENO)
-        VectorInvariant()
-    else
-        momentum_advection
-    end
-    isnothing(eff_mom_adv) || (kwargs[:momentum_advection] = eff_mom_adv)
+    isnothing(momentum_advection) || (kwargs[:momentum_advection] = momentum_advection)
     isnothing(tracer_advection) || (kwargs[:tracer_advection] = tracer_advection)
 
     model = HydrostaticFreeSurfaceModel(grid; kwargs...)

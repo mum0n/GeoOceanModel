@@ -15,7 +15,9 @@ lat_min = 45.0                # Southern boundary latitude (°N)
 lat_max = 46.9                # Northern boundary latitude (°N)
 z_min = -1500.0               # Maximum bathymetric water depth (m, negative down)
 z_max = 0.0                   # Free surface elevation (m)
-buffer_km = 20.0              # Boundary buffer margin in kilometres
+buffer_km = 20.0              # The margin beyond the study area (km). The lateral sponge
+                               # band is this margin: the model relaxes toward the prescribed
+                               # ocean across it, so the band is derived from it.
 
 [grid]
 # Discretization resolution and coordinate stretching
@@ -54,7 +56,9 @@ bulk_heat_flux = true         # Compute bulk sensible/latent flux from air state
 method = "none"               # "none" (unconstrained) or "relaxation" (sponge)
 obc_type = "flather_chapman"  # "flather_chapman", "radiation", or "clamped"
 ocean_boundary_source = "synthetic" # "glorys12v1", "woa23", "hycom", or "synthetic"
-sponge_layer_width = 0.25     # Width of lateral sponge zone in degrees
+# The sponge band's width is [domain] buffer_km: the band the model relaxes
+# toward the prescribed ocean lives in the margin beyond the study area, so
+# it is the same quantity, and the band in degrees is derived from it.
 sponge_timescale_seconds = 3600.0 # Relaxation timescale in seconds (1 hour)
 u_inflow = -0.15              # Prescribed background zonal inflow velocity (m/s)
 v_inflow = 0.05               # Prescribed background meridional inflow velocity (m/s)
@@ -82,15 +86,10 @@ tidal_v_amp = 0.0               # Unused with tpxo9 source
 s2_u_amp = 0.0                  # Unused with tpxo9 source
 s2_v_amp = 0.0                  # Unused with tpxo9 source
 
-[climate]
-# Long-term climate scenario projections
-scenario = "climatology"      # "climatology", "historical", "ssp126", "ssp245", "ssp585"
-projection_year = 2022        # Target simulation climate year
-
 [hydrodynamics]
 # Numerical solver controls and time-stepping
 sim_duration_hours = 72.0     # Total simulation duration in hours
-sim_dt_seconds = 60.0        # Initial numerical time step in seconds
+sim_dt_seconds = 60.0         # Initial numerical time step in seconds
 min_dt_seconds = 5.0          # Minimum allowable time step floor (seconds)
 max_dt_seconds = 300.0        # Maximum allowable time step ceiling (seconds)
 adaptive_cfl = true           # Enable adaptive time stepping based on CFL

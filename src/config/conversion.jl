@@ -59,13 +59,6 @@ function configuration_to_options(config_dict::AbstractDict;
     ny = Int(get_val("grid", "ny", 50))
     nz = Int(get_val("grid", "nz", 10))
 
-    grid_orientation = Symbol(lowercase(String(get_val("grid", "orientation", "standard"))))
-    rotation_azimuth = Float64(get_val("grid", "rotation_azimuth", 50.0))
-    center_lon = Float64(get_val("grid", "center_lon", -63.0))
-    center_lat = Float64(get_val("grid", "center_lat", 44.0))
-    along_shelf_extent_km = Float64(get_val("grid", "along_shelf_extent_km", 850.0))
-    cross_shelf_extent_km = Float64(get_val("grid", "cross_shelf_extent_km", 220.0))
-
     bathy_source = String(get_val("data", "bathy_source", "etopo2022"))
     coastline_source = String(get_val("data", "coastline_source", "natural_earth_10m"))
     wind_source = String(get_val("data", "wind_source", "open_meteo"))
@@ -94,9 +87,6 @@ function configuration_to_options(config_dict::AbstractDict;
     tidal_v = Float64(get_val("tides", "tidal_v_amp", 0.12))
     s2_u = Float64(get_val("tides", "s2_u_amp", 0.11))
     s2_v = Float64(get_val("tides", "s2_v_amp", 0.05))
-
-    scenario = Symbol(get_val("climate", "scenario", "ssp245"))
-    proj_year = Int(get_val("climate", "projection_year", 2050))
 
     sim_hours = Float64(get_val("hydrodynamics", "sim_duration_hours", 12.0))
     sim_dt    = Float64(get_val("hydrodynamics", "sim_dt_seconds", 120.0))
@@ -211,8 +201,8 @@ function configuration_to_options(config_dict::AbstractDict;
      # shared between runs: one shared `inputs/` let a run with a changed domain silently
      # reuse another domain's bathymetry, the quiet mismatch `resolved_config.toml` and
      # `data_provenance.json` exist to expose. The cost is disk -- a dataset is fetched once
-     # per scenario rather than once per machine -- and that is the intended trade, because it
-     # makes each scenario a self-contained, shareable directory under
+     # per configuration rather than once per machine -- and that is the intended trade, because it
+     # makes each configuration a self-contained, shareable directory under
      # `lakehouse/GeoOceanModel/<name>/`.
      #
      # The path is resolved against THIS PACKAGE'S ROOT, not the current working directory:
@@ -283,11 +273,20 @@ function configuration_to_options(config_dict::AbstractDict;
         length(v_depths) == nz + 1 || error(
             "[grid] depths has $(length(v_depths)) entries, but nz = $nz requires " *
             "$(nz + 1) faces.")
-        # The deepest face has to reach the bottom of the domain, or the grid silently stops
-        # short of the seabed and the deepest water column is left unresolvable.
-        abs(last(v_depths) - abs(z_min)) <= 1.0 || error(
-            "[grid] depths ends at $(last(v_depths)) m but [domain] z_min is $(z_min) m. " *
-            "The deepest face must reach the domain bottom.")
+        # The depths define the column, so they define the domain's vertical extent: the
+        # first face is the surface and the last is the floor. `[domain] z_min` and
+        # `z_max` are not a second statement of the same thing -- when the depths are
+        # given they are redundant, and a second number kept in step with them by hand is
+        # one more thing to drift -- and it was the one that drifted. The depths win.
+        _z_floor = -last(v_depths)
+        _z_surface = first(v_depths)
+        if abs(last(v_depths) - abs(z_min)) > 1.0 || abs(_z_surface - z_max) > 1e-6
+            println("[domain] z_min ($(z_min) m) and z_max ($(z_max) m) are ignored: " *
+                    "[grid] depths run from $(_z_surface) m to $(last(v_depths)) m, and " *
+                    "that is the column.")
+        end
+        z_min = _z_floor
+        z_max = _z_surface
     end
     if !isempty(v_file)
         src = abspath(v_file)
@@ -316,7 +315,22 @@ function configuration_to_options(config_dict::AbstractDict;
 
     # Lateral boundary relaxation (Price & Aumont 2011) parameters
     boundary_method = Symbol(lowercase(String(get_val("boundaries", "method", "relaxation"))))
-    sponge_width_val = Float64(get_val("boundaries", "sponge_layer_width", 0.35))
+    # The lateral sponge's width IS the domain's margin. The band the model relaxes
+    # toward the prescribed ocean lives in the margin beyond the study area, so the two
+    # are one quantity -- and the configs had it twice in two units: the Scotian Shelf
+    # said 50 km in one place and 0.45° (about 50 km) in the other, while the default
+    # config's two disagreed, 20 km against 0.25°, which is about 28 km. One number
+    # now: the margin, in kilometres, and the band in degrees is derived from it.
+    _sponge_default_deg = Float64(get_val("boundaries", "sponge_layer_width", 0.35))
+    _margin_stated = haskey(config_dict, "domain") && haskey(config_dict["domain"], "buffer_km")
+    sponge_width_val = if _margin_stated
+        # The band is measured north-south as well as east-west, and the latitude
+        # conversion is the one that matches a margin stated in kilometres.
+        _dlon, _dlat = buffer_distance_to_degrees(buffer_km, 0.5 * (lat_min + lat_max))
+        _dlat
+    else
+        _sponge_default_deg
+    end
     sponge_tau_val   = Float64(get_val("boundaries", "sponge_timescale_seconds", 3600.0))
     u_inflow_val     = Float64(get_val("boundaries", "u_inflow", -0.15))
     v_inflow_val     = Float64(get_val("boundaries", "v_inflow", 0.05))
@@ -361,12 +375,6 @@ function configuration_to_options(config_dict::AbstractDict;
         domain_lat = (lat_min, lat_max),
         domain_z = (z_min, z_max),
         grid_size = (nx, ny, nz),
-        grid_orientation = grid_orientation,
-        rotation_azimuth = rotation_azimuth,
-        center_lon = center_lon,
-        center_lat = center_lat,
-        along_shelf_extent_km = along_shelf_extent_km,
-        cross_shelf_extent_km = cross_shelf_extent_km,
         bathy_source = bathy_source,
     coastline_source = coastline_source,
     wind_source = wind_source,
@@ -380,8 +388,6 @@ function configuration_to_options(config_dict::AbstractDict;
         tidal_v_amp = tidal_v,
         s2_u_amp = s2_u,
         s2_v_amp = s2_v,
-        scenario = scenario,
-        projection_year = proj_year,
         sim_dt = sim_dt,
         sim_duration = sim_hours * 3600.0,
         min_dt_seconds = min_dt_seconds,
@@ -505,12 +511,6 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "nx" => opts.grid_size[1],
             "ny" => opts.grid_size[2],
             "nz" => opts.grid_size[3],
-            "orientation" => string(opts.grid_orientation),
-            "rotation_azimuth" => opts.rotation_azimuth,
-            "center_lon" => opts.center_lon,
-            "center_lat" => opts.center_lat,
-            "along_shelf_extent_km" => opts.along_shelf_extent_km,
-            "cross_shelf_extent_km" => opts.cross_shelf_extent_km,
             "vertical_stretching_mode" => string(opts.vertical_stretching_mode),
             "nz_above" => opts.nz_above,
             "vertical_break_depth" => opts.vertical_break_depth,
@@ -550,10 +550,6 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "tidal_v_amp" => opts.tidal_v_amp,
             "s2_u_amp" => opts.s2_u_amp,
             "s2_v_amp" => opts.s2_v_amp
-        ),
-        "climate" => Dict{String, Any}(
-            "scenario" => string(opts.scenario),
-            "projection_year" => opts.projection_year
         ),
         "hydrodynamics" => Dict{String, Any}(
             "sim_duration_hours" => opts.sim_duration / 3600.0,
@@ -666,12 +662,6 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :domain_lat               => opts.domain_lat,
         :domain_z                 => opts.domain_z,
         :grid_size                => opts.grid_size,
-        :grid_orientation         => opts.grid_orientation,
-        :rotation_azimuth         => opts.rotation_azimuth,
-        :center_lon               => opts.center_lon,
-        :center_lat               => opts.center_lat,
-        :along_shelf_extent_km    => opts.along_shelf_extent_km,
-        :cross_shelf_extent_km    => opts.cross_shelf_extent_km,
         :vertical_stretching_mode => opts.vertical_stretching_mode,
         :nz_above                 => opts.nz_above,
         :vertical_break_depth     => opts.vertical_break_depth,
@@ -689,7 +679,6 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         :drag_formulation         => :garratt_1977,
         :bulk_heat_flux           => true,
         :climatology              => false,
-        :mhw_temp_anomaly         => opts.scenario == :mhw ? 3.5 : 0.0,
         :ocean_boundary_source    => opts.ocean_boundary_source,
         :hydrography_source       => opts.hydrography_source,
         :hydrography_month        => opts.hydrography_month,
@@ -734,9 +723,6 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
 
     return HydrodynamicConfig(
         d[:domain_lon], d[:domain_lat], d[:domain_z], d[:grid_size],
-        Symbol(d[:grid_orientation]), Float64(d[:rotation_azimuth]),
-        Float64(d[:center_lon]), Float64(d[:center_lat]),
-        Float64(d[:along_shelf_extent_km]), Float64(d[:cross_shelf_extent_km]),
         Symbol(d[:vertical_stretching_mode]),
         Int(d[:nz_above]),
         abs(Float64(d[:vertical_break_depth])),
@@ -751,7 +737,7 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         abs(Float64(d[:shelf_slope])),
         Symbol(d[:atmospheric_source]),
         Symbol(d[:drag_formulation]), Bool(d[:bulk_heat_flux]),
-        Bool(d[:climatology]), Float64(d[:mhw_temp_anomaly]),
+        Bool(d[:climatology]),
         Symbol(d[:ocean_boundary_source]), Symbol(d[:obc_type]),
         Float64(d[:sponge_layer_width]), Float64(d[:sponge_timescale]),
         Bool(d[:enable_tides]), Symbol(d[:tides_source]),

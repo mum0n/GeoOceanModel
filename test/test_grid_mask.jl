@@ -1,4 +1,5 @@
 using Test
+using CairoMakie
 using GeoOceanModel
 using GeoData
 using GeoDataSources
@@ -92,4 +93,11 @@ const OCEAN_TMP_ENV = joinpath(@__DIR__, "outputs", "_test_geoceanmodel_env")
         domain_lon = (-61.0, -58.0), domain_lat = (43.0, 46.0),
         grid_size = (11, 11), coastline = NamedTuple[])
     @test !any(isnan, unmasked.u)
+
+    local fig = Figure()
+    local ax = Axis(fig[1, 1])
+    GeoOceanModel.focus_on_domain!(
+        ax, [0.0, 1.0], [0.0, 1.0];
+        domain_lon = (-0.25, 1.25), domain_lat = (-0.5, 1.5))
+    @test ax.limits[] !== nothing
 end

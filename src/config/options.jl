@@ -14,7 +14,7 @@ finds all of them here.
     HydrodynamicOptions
 
 Runtime parameter specification for regional hydrodynamic circulation,
-tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
+tidal harmonics, air-sea heat fluxes, and Lagrangian snow crab
 (Chionoecetes opilio) larval transport modeling.
 
 # Fields
@@ -22,12 +22,6 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `domain_lat::Tuple{Float64, Float64}`: Latitude bounding box (min_lat, max_lat) in °N.
 - `domain_z::Tuple{Float64, Float64}`: Vertical depth range (z_min, z_max) in meters.
 - `grid_size::Tuple{Int, Int, Int}`: Grid cell counts (Nx, Ny, Nz).
-- `grid_orientation::Symbol`: Grid orientation (:standard or :rotated).
-- `rotation_azimuth::Float64`: Bearing along shelf strike in degrees clockwise from North.
-- `center_lon::Float64`: Central longitude in °E for rotated grid coordinates.
-- `center_lat::Float64`: Central latitude in °N for rotated grid coordinates.
-- `along_shelf_extent_km::Float64`: Domain dimension along shelf strike in kilometers.
-- `cross_shelf_extent_km::Float64`: Domain dimension across shelf strike in kilometers.
 - `bathy_source::String`: Which bathymetry product to ingest, read verbatim from
   `[data] bathy_source` (for example `"etopo2022"`, `"synthetic"`). There is no separate
   real/synthetic switch: acquisition always reads the named product, and falls back to analytic
@@ -35,8 +29,6 @@ tidal harmonics, CMIP6 climate anomalies, and Lagrangian snow crab
 - `enable_tides::Bool`: Whether to include astronomical tidal body forcing (M2).
 - `tidal_u_amp::Float64`: Zonal tidal velocity amplitude in m/s.
 - `tidal_v_amp::Float64`: Meridional tidal velocity amplitude in m/s.
-- `scenario::Symbol`: Climate scenario (:historical, :ssp126, :ssp245, :ssp585, :mhw).
-- `projection_year::Int`: Target climate scenario year (e.g. 2050).
 - `sim_dt::Float64`: Initial hydrodynamic integration time step in seconds.
 - `sim_duration::Float64`: Total hydrodynamic simulation duration in seconds.
 - `adaptive_cfl::Bool`: Whether to adaptively modulate hydrodynamic time stepping.
@@ -117,12 +109,6 @@ struct HydrodynamicOptions
     domain_lat               :: Tuple{Float64, Float64}
     domain_z                 :: Tuple{Float64, Float64}
     grid_size                :: Tuple{Int, Int, Int}
-    grid_orientation         :: Symbol
-    rotation_azimuth         :: Float64
-    center_lon               :: Float64
-    center_lat               :: Float64
-    along_shelf_extent_km    :: Float64
-    cross_shelf_extent_km    :: Float64
     bathy_source             :: String
     coastline_source         :: String
     wind_source              :: String
@@ -136,8 +122,6 @@ struct HydrodynamicOptions
     tidal_v_amp              :: Float64
     s2_u_amp                 :: Float64
     s2_v_amp                 :: Float64
-    scenario                 :: Symbol
-    projection_year          :: Int
     sim_dt                   :: Float64
     sim_duration             :: Float64
     min_dt_seconds           :: Float64
@@ -328,12 +312,6 @@ function HydrodynamicOptions(;
     domain_lat            :: Tuple{Real, Real} = (40.0, 48.5),
     domain_z              :: Tuple{Real, Real} = (-3500.0, 0.0),
     grid_size             :: Tuple{Int, Int, Int} = (50, 50, 10),
-    grid_orientation      :: Symbol = :standard,
-    rotation_azimuth      :: Real = 50.0,
-    center_lon            :: Real = -63.0,
-    center_lat            :: Real = 44.0,
-    along_shelf_extent_km :: Real = 850.0,
-    cross_shelf_extent_km :: Real = 220.0,
     bathy_source           :: AbstractString = "etopo2022",
     coastline_source       :: AbstractString = "natural_earth_10m",
     wind_source            :: AbstractString = "open_meteo",
@@ -347,8 +325,6 @@ function HydrodynamicOptions(;
     tidal_v_amp           :: Real = 0.12,
     s2_u_amp              :: Real = 0.11,
     s2_v_amp              :: Real = 0.05,
-    scenario              :: Symbol = :ssp245,
-    projection_year       :: Int = 2050,
     sim_dt                :: Real = 120.0,
     sim_duration          :: Real = 43200.0,
     min_dt_seconds        :: Real = 2.0,
@@ -467,12 +443,6 @@ function HydrodynamicOptions(;
         (Float64(domain_lat[1]), Float64(domain_lat[2])),
         (Float64(domain_z[1]), Float64(domain_z[2])),
         grid_size,
-        Symbol(lowercase(string(grid_orientation))),
-        Float64(rotation_azimuth),
-        Float64(center_lon),
-        Float64(center_lat),
-        Float64(along_shelf_extent_km),
-        Float64(cross_shelf_extent_km),
         bathy_source,
         coastline_source,
         wind_source,
@@ -486,8 +456,6 @@ function HydrodynamicOptions(;
         Float64(tidal_v_amp),
         Float64(s2_u_amp),
         Float64(s2_v_amp),
-        scenario,
-        projection_year,
         Float64(sim_dt),
         Float64(sim_duration),
         Float64(min_dt_seconds),
@@ -602,12 +570,6 @@ struct HydrodynamicConfig
     domain_lat               :: Tuple{Float64, Float64}
     domain_z                 :: Tuple{Float64, Float64}
     grid_size                :: Tuple{Int, Int, Int}
-    grid_orientation         :: Symbol
-    rotation_azimuth         :: Float64
-    center_lon               :: Float64
-    center_lat               :: Float64
-    along_shelf_extent_km    :: Float64
-    cross_shelf_extent_km    :: Float64
     vertical_stretching_mode :: Symbol
     nz_above :: Int
     vertical_break_depth :: Float64
@@ -624,7 +586,6 @@ struct HydrodynamicConfig
     drag_formulation         :: Symbol
     bulk_heat_flux           :: Bool
     climatology              :: Bool
-    mhw_temp_anomaly         :: Float64
     ocean_boundary_source    :: Symbol
     obc_type                 :: Symbol
     sponge_layer_width       :: Float64

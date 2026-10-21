@@ -48,7 +48,7 @@ const AVAILABLE_SEGMENTS = Dict{Symbol, @NamedTuple{file::String, desc::String}}
     ),
     :sponge => (
         file = "test_sponge.jl",
-        desc = "Lateral Sponge Relaxation & Rotated Grid Boundary Dampening"
+        desc = "Lateral Sponge Relaxation"
     )
 )
 

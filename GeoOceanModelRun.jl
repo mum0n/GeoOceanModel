@@ -3,7 +3,7 @@
 # ==============================================================================
 #
 #  This file holds CLI interaction only: environment bootstrap, flag parsing, and dispatch.
-#  The segments -- data, grid, model, climate, simulation -- are `src/driver.jl`, imported
+#  The segments -- data, grid, model, simulation -- are `src/driver.jl`, imported
 #  below, because a script that defines the behaviour is a script nobody can test and
 #  `Pkg.test` cannot reach a function a script defines. `run_segments` composes them in the
 #  dependency order `run_production_pipeline` uses.
@@ -67,7 +67,9 @@ using GeoOceanModel
 using GeoOceanModel: configuration_to_options,
     options_to_configuration, save_configuration, resolve_config_name, load_configuration,
     run_segment_data, run_segment_grid, run_segment_model,
-    run_segment_simulation, HydrodynamicOptions
+    run_segment_simulation, run_segment_viz, HydrodynamicOptions,
+    output_zarr_path
+using GeoData
 using TOML
 
 """
@@ -91,12 +93,26 @@ function display_help(io::IO = stdout)
     End to end:
       --all        data through --sim: produce the flow solution, then stop.
 
+    From a run that has already finished:
+      --viz        Draw this half's figures from the stored flow solution. It reads
+                  the output store and needs nothing else, so it runs against a run
+                  that finished hours ago. The larval half's own figures -- the
+                  trajectories, the connectivity -- are the larval package's, drawn
+                  by its own --viz.
+
     Configuration:
       --config=FILE      A path, or a name resolved against configs/.
                          Default: configs/default.toml.
       --output-dir=DIR   Where the run writes.
       --save-config[=D]  Write the fully-resolved configuration, then exit.
-      --overwrite        Purge previous output store and checkpoints; start at t = 0.
+
+    Clearing what a previous run left behind:
+      --overwrite        Overwrite the MODEL RESULTS: the output store and the
+                         checkpoints. The downloaded store -- the ingested bathymetry,
+                         coastline, winds and vertical grid -- is KEPT, so the run does
+                         not fetch them again. Asks before it deletes.
+      --blank_state      Wipe ALL of this run's state, the downloaded store included: the
+                         next run fetches everything again. Asks before it deletes.
       --help, -h         This message.
 
     Two configurations:
@@ -119,16 +135,21 @@ wrong thing, which is the failure a CLI should refuse.
 function parse_args(args::Vector{String})
     out = Dict{String, Any}(
         "segments" => String[], "config" => "", "save_config" => nothing,
-        "output_dir" => "", "all" => false, "overwrite" => false, "help" => false)
+        "output_dir" => "", "all" => false, "overwrite" => false, "blank_state" => false,
+        "help" => false, "viz" => false)
     for a in args
         if a in ("--data", "--grid", "--model", "--sim")
             push!(out["segments"], replace(a, "--" => ""))
         elseif a == "--all"
             out["all"] = true
+        elseif a == "--viz"
+            out["viz"] = true
         elseif a in ("--help", "-h")
             out["help"] = true
         elseif a in ("--overwrite", "--fresh")
             out["overwrite"] = true
+        elseif a in ("--blank_state", "--blank-state")
+            out["blank_state"] = true
         elseif a == "--save-config"
             out["save_config"] = ""
         elseif startswith(a, "--save-config=")
@@ -198,6 +219,39 @@ function load_options(flag::AbstractString; overwrite::Bool = false)
 end
 
 """
+    clear_run_state(opts::HydrodynamicOptions; blank_state::Bool, input = stdin) -> Bool
+
+Clear what a previous run of this configuration left behind, after warning about it and
+being told to go ahead. Returns `false` when the operator declined, in which case the
+caller must not run.
+
+Two kinds of state live in this run's output directory, and the two flags mean different
+things because of it:
+
+  * the MODEL RESULTS -- the flow solution store and the checkpoints it resumes from.
+    `--overwrite` clears these and keeps the rest.
+  * the DOWNLOADED STORE -- this run's `inputs/`: the bathymetry, the coastline, the
+    winds, the vertical grid. `--blank_state` clears these as well, so the next run
+    fetches them again.
+
+The shared GeoData store under the lakehouse is never touched: it holds datasets several
+runs depend on, and this run's own directory is the only thing a purge may reach into.
+
+`input` is the stream the answer is read from: `stdin` in a run, and a buffer when the
+run is being driven from a script.
+"""
+function clear_run_state(opts::HydrodynamicOptions; blank_state::Bool = false,
+                        input::IO = stdin)
+    out_dir = opts.output_dir
+    results = [output_zarr_path(out_dir)]
+    result_globs = [joinpath(out_dir, "checkpoints", "*.jld2"),
+                    joinpath(out_dir, "*.attempt")]
+    inputs = [opts.input_dir]
+    return GeoData.purge_run_state(out_dir; results, result_globs, inputs,
+                                   blank_state = blank_state, input = input)
+end
+
+"""
     SEG_CHAIN
 
 The ocean segments in dependency order, as `run_production_pipeline` composes them. A later
@@ -211,10 +265,10 @@ const SEG_CHAIN = ["data", "grid", "model", "sim"]
 
 Run the ocean segments, in `SEG_CHAIN` order, up to the furthest one requested. Each step
 takes the previous one's result exactly as `run_production_pipeline` does -- the model gets
-the grid's immersed wrapper and Segment 1's wind stress; the climate and simulation steps get
-the model -- so a partial run and a full run reach the same code path.
+the grid's immersed wrapper and Segment 1's wind stress; the simulation step gets the
+model -- so a partial run and a full run reach the same code path.
 
-Returns `(data, grid, model, climate, sim)`, with `nothing` in the slots not run.
+Returns `(data, grid, model, sim)`, with `nothing` in the slots not run.
 """
 function run_segments(opts::HydrodynamicOptions, requested::Vector{String})
     order = String.(requested)
@@ -226,10 +280,6 @@ function run_segments(opts::HydrodynamicOptions, requested::Vector{String})
     # before it runs too because a later one builds on an earlier one's state -- the model
     # needs the grid's immersed wrapper, the simulation needs the model. An empty request
     # stops after the model (data, grid, model); `--all` runs every segment.
-    #
-    # climate is the exception. It perturbs the stratification instead of building anything,
-    # so it runs only when named: `--all` and `--sim` alone both produce the flow solution
-    # from the unperturbed model, which is what the larval half tracks through.
     target_idx = isempty(order) ? 3 : maximum(i -> findfirst(==(i), SEG_CHAIN), order)
     plan = collect(1:target_idx)
 
@@ -249,8 +299,7 @@ function run_segments(opts::HydrodynamicOptions, requested::Vector{String})
             sim_res = run_segment_simulation(; opts = opts, model = model_res.model)
         end
     end
-    return (data = data_res, grid = grid_res, model = model_res,
-            climate = nothing, sim = sim_res)
+    return (data = data_res, grid = grid_res, model = model_res, sim = sim_res)
 end
 
 function main(args::Vector{String})
@@ -258,7 +307,7 @@ function main(args::Vector{String})
     flags["help"] && return display_help()
 
     opts = try
-        load_options(flags["config"]; overwrite = flags["overwrite"])
+        load_options(flags["config"]; overwrite = flags["overwrite"] || flags["blank_state"])
     catch err
         println("Configuration error: $(sprint(showerror, err))")
         return display_help()
@@ -276,18 +325,43 @@ function main(args::Vector{String})
     println("="^73)
 
     if !isnothing(flags["save_config"])
+        if flags["overwrite"] || flags["blank_state"]
+            error("--save-config writes the resolved configuration and exits; it cannot also " *
+                  "clear a previous run's state. Run them one at a time.")
+        end
         dest = isempty(flags["save_config"]) ? cfg_file : flags["save_config"]
         save_configuration(options_to_configuration(opts), dest)
         println("Resolved configuration written to $(dest)")
         return nothing
     end
 
-    # --all runs the whole chain, data through the simulation, without the climate
-    # perturbation (see `run_segments`: `climate` is named or it does not run). The segment
-    # functions are the package's own `src/driver.jl`, imported above; this script only
-    # decides how far down the chain to go and then dispatches.
+    # --all runs the whole chain, data through the simulation. The segment functions are
+    # the package's own `src/driver.jl`, imported above; this script only decides how far
+    # down the chain to go and then dispatches.
+    if flags["viz"]
+        # The figures are drawn from the store a run left behind, so they need none of
+        # the segments: `--viz` on its own is a complete request. It is also the one
+        # request that cannot be combined with a request to wipe that store.
+        if flags["overwrite"] || flags["blank_state"]
+            error("--viz draws the figures from the store a run left behind, so it cannot " *
+                  "also overwrite or wipe that store.")
+        end
+        run_segment_viz(; opts = opts)
+        return nothing
+    end
     requested = flags["all"] ? SEG_CHAIN : flags["segments"]
     isempty(requested) && return display_help()
+
+    # The state a previous run left behind is cleared BEFORE the segments run, so the run
+    # that follows sees the state it is meant to see. `--blank_state` clears the
+    # downloaded store too, which is why the data segment then fetches it again.
+    if flags["overwrite"] || flags["blank_state"]
+        cleared = clear_run_state(opts; blank_state = flags["blank_state"])
+        if !cleared
+            println("Aborted: the existing state was left untouched.")
+            return nothing
+        end
+    end
 
     results = run_segments(opts, requested)
     return nothing

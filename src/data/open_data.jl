@@ -502,6 +502,10 @@ end
     fetch_boundary_hydrography(source::Symbol; kwargs...) -> NamedTuple
 
 Acquire boundary hydrography via GeoDataSources.
+
+With `with_velocities = true` the boundary zonal and meridional velocity are fetched
+and returned as well, for a momentum sponge that relaxes toward an observed current
+rather than toward a hand-entered constant.
 """
 function fetch_boundary_hydrography(
     source::Symbol;
@@ -509,7 +513,8 @@ function fetch_boundary_hydrography(
     lat_range::Tuple{Real, Real} = (40.0, 48.5),
     input_dir::AbstractString = "inputs",
     month::Int = 0,
-    verbose::Bool = true
+    verbose::Bool = true,
+    with_velocities::Bool = false
 )
     return fetch_boundary_hydrography_geodata(
         source;
@@ -517,7 +522,8 @@ function fetch_boundary_hydrography(
         lat_range = lat_range,
         input_dir = input_dir,
         month = month,
-        verbose = verbose
+        verbose = verbose,
+        with_velocities = with_velocities
     )
 end
 

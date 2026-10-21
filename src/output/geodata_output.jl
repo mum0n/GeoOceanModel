@@ -83,11 +83,6 @@ mutable struct GeodataOutputCallback
     # Optional maximum water depth (m) to archive. Depths deeper than this (e.g. > 400 m)
     # are subsampled out to reduce vertical array volume by up to 50% for epipelagic larval drift.
     max_save_depth::Float64
-    # The regridding plan for a rotated grid, held between intervals. The grid does not
-    # move during a run, so the plan -- which target cell takes its value from which
-    # source cell, and the bearing of the grid's axes at each cell -- is the same for
-    # every interval, and is worked out once.
-    regrid_plan::Any
 end
 
 """
@@ -116,7 +111,7 @@ function GeodataOutputCallback(output_dir::AbstractString, interval::Real,
     end
     return GeodataOutputCallback(store, output_dir, collect(String.(fields)), Ref(start),
                                  nothing, nothing, Float64(interval), Float64(spinup_seconds),
-                                 Float64(max_save_depth), nothing)
+                                 Float64(max_save_depth))
 end
 
 """
@@ -178,8 +173,12 @@ function _build_store_dataset(store::AbstractString, ax, names::Vector{String}, 
         :depth => GeoArray(ax.z, (dz,), crs, Dict{String, Any}()),
         :time => GeoArray(tim.coords, (tim,), crs, Dict{String, Any}()))
 
+    # The run's metadata goes into the dataset's attributes BEFORE the save, because the
+    # save is what writes the store's `.zattrs`. Setting an attribute on the dataset
+    # afterwards changed an in-memory dictionary and nothing on disk: the store was
+    # written without its seabed, and a reader that went looking for it found nothing.
     ds = GeoDataset(vars, coords, Dict(:lon => dl, :lat => dt, :depth => dz, :time => tim), crs,
-                    Dict{String, Any}(), GeoData.ZarrBackend(), String(store))
+                    run_metadata(model), GeoData.ZarrBackend(), String(store))
     GeoData.geosave(String(store), ds; backend = :zarr, overwrite = true)
     # Reopened for write, because the callback writes into this dataset's arrays: `geoload`
     # defaults to read-only, and of the Zarr modes only `"w"` hands out a writeable array
@@ -187,6 +186,30 @@ function _build_store_dataset(store::AbstractString, ax, names::Vector{String}, 
     # because a writer that silently cleared its earlier intervals would produce a run whose
     # first slice is missing.
     return GeoData.geoload(String(store); backend = :zarr, mode = "w")
+end
+
+"""
+    _model_field(model, name) -> Field
+
+The model's own field for a name the store writes.
+
+Salinity is a tracer here, exactly as temperature is, and it is the model's field: the
+model integrates it and a run's store is that model's output. A model built without a
+tracer is asked to write one only by mistake, and says so.
+
+Returning the model's field is what keeps the store honest in the other direction too:
+the reader will not invent a salinity for a store that lacks one, so the only way for a
+reader to have a real one is for the writer to have put the model's own there.
+"""
+function _model_field(model, name::AbstractString)
+    name == "u" && return model.velocities.u
+    name == "v" && return model.velocities.v
+    name == "w" && return model.velocities.w
+    (name == "T" || name == "S") || error("unknown field $(name)")
+    sym = Symbol(name)
+    !hasproperty(model.tracers, sym) &&
+        error("The model carries no '$(name)' tracer, so the store cannot carry one.")
+    return getproperty(model.tracers, sym)
 end
 
 """
@@ -220,185 +243,14 @@ function _to_centres(arr::AbstractArray{T, 3}, grid_shape::Tuple{Int, Int, Int})
 end
 
 """
-    _rotated_regrid_plan(base, lons2d, lats2d, rot_bounds) -> NamedTuple
-
-The plan for regridding a rotated-grid run onto a regular geographic (longitude,
-latitude) grid: the target axes, the source cell each target cell takes its value
-from, and the bearing of the grid's own axes at every target cell.
-
-Why the writer does this, and not the reader. On a rotated grid the cells are not at the
-intersections of two straight lines of longitude and latitude, so a store that records
-one-dimensional axes cannot say where a cell is. Averaging each row and each column --
-what this did before -- puts a cell at a place no cell occupies, and a reader given only
-those axes has no way to know. The velocity has the same defect in a second way: on a
-rotated grid `u` and `v` are components along the grid's own axes (along-shelf and
-cross-shelf), not east and north, so an arrow drawn from them points fifty degrees off.
-A store is a record of where things are; it belongs in geography.
-
-`rot_bounds` is the curvilinear box `((rot_lon_min, rot_lon_max), (rot_lat_min,
-rot_lat_max))` the grid spans -- the same box `extract_rotated_grid_bounds` reports.
-"""
-function _rotated_regrid_plan(base, lons2d::Matrix{Float64}, lats2d::Matrix{Float64},
-                               rot_bounds::Tuple{Tuple{Float64, Float64}, Tuple{Float64, Float64}})
-    np = Tuple(Float64.(base.conformal_mapping.north_pole))
-    dλ = deg2rad(np[1])
-    dφ = π / 2.0 - deg2rad(np[2])
-    cos_dλ, sin_dλ = cos(dλ), sin(dλ)
-    cos_dφ, sin_dφ = cos(dφ), sin(dφ)
-    (rot_lon_min, rot_lon_max), (rot_lat_min, rot_lat_max) = rot_bounds
-
-    nx, ny = size(lons2d)
-    lon_t = collect(range(Float64(minimum(lons2d)), Float64(maximum(lons2d)); length = nx))
-    lat_t = collect(range(Float64(minimum(lats2d)), Float64(maximum(lats2d)); length = ny))
-
-    δ = 1.0e-4                      # degrees, for the Jacobian's finite differences
-    R = 6_371_000.0                 # metres, for the metric factors
-    fi = fill(NaN, nx, ny)
-    fj = fill(NaN, nx, ny)
-    bearing = fill(NaN, nx, ny)
-    for j in 1:ny, i in 1:nx
-        lon = lon_t[i]
-        lat = lat_t[j]
-        λp, φp = rotate_to_curvilinear(lon, lat, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
-        fi[i, j] = (λp - rot_lon_min) / (rot_lon_max - rot_lon_min) * (nx - 1) + 1.0
-        fj[i, j] = (φp - rot_lat_min) / (rot_lat_max - rot_lat_min) * (ny - 1) + 1.0
-
-        # The bearing of the grid's own x axis: the direction of increasing lambda',
-        # which is perpendicular to the gradient of phi'. The partial derivatives come
-        # from the mapping itself, expressed in the local (east, north) frame -- a degree
-        # of longitude is R cos(phi) long, a degree of latitude R.
-        λm, φm = rotate_to_curvilinear(lon - δ, lat, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
-        λp2, φp2 = rotate_to_curvilinear(lon + δ, lat, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
-        dλp_dλ = (λp2 - λm) / 2δ
-        dφp_dλ = (φp2 - φm) / 2δ
-        λm2, φm2 = rotate_to_curvilinear(lon, lat - δ, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
-        λp3, φp3 = rotate_to_curvilinear(lon, lat + δ, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
-        dλp_dφ = (λp3 - λm2) / 2δ
-        dφp_dφ = (φp3 - φm2) / 2δ
-        m_per_deg_lon = R * cosd(lat)
-        g_e = dφp_dλ / m_per_deg_lon      # gradient of phi', east component
-        g_n = dφp_dφ / R                  # gradient of phi', north component
-        l_e = dλp_dλ / m_per_deg_lon      # gradient of lambda', east component
-        l_n = dλp_dφ / R                  # gradient of lambda', north component
-        v_e, v_n = g_n, -g_e               # perpendicular to grad(phi')
-        n = hypot(v_e, v_n)
-        if n > 0
-            v_e /= n
-            v_n /= n
-            if l_e * v_e + l_n * v_n < 0    # point it along increasing lambda'
-                v_e = -v_e
-                v_n = -v_n
-            end
-            bearing[i, j] = atan(v_e, v_n)   # bearing, clockwise from north
-        end
-    end
-
-    # The bilinear stencil, fixed once: which four source cells each target cell mixes,
-    # and by how much. A target outside the curvilinear domain has no source, and stays
-    # NaN -- which is the honest answer, and the same one the model's own land mask gives.
-    i0 = Array{Int}(undef, nx, ny)
-    j0 = Array{Int}(undef, nx, ny)
-    ti = fill(NaN, nx, ny)
-    tj = fill(NaN, nx, ny)
-    for j in 1:ny, i in 1:nx
-        a, b = fi[i, j], fj[i, j]
-        if isfinite(a) && isfinite(b) && 1.0 <= a <= nx && 1.0 <= b <= ny
-            ia = clamp(floor(Int, a), 1, nx)
-            jb = clamp(floor(Int, b), 1, ny)
-            i0[i, j] = ia
-            j0[i, j] = jb
-            ti[i, j] = a - ia
-            tj[i, j] = b - jb
-        else
-            i0[i, j] = 0
-            j0[i, j] = 0
-        end
-    end
-
-    return (lon = lon_t, lat = lat_t, i0 = i0, j0 = j0, ti = ti, tj = tj,
-            bearing = bearing)
-end
-
-"""
-    _apply_regrid(plan, fields::Dict{String, Any}) -> Dict{String, Any}
-
-The fields of a rotated-grid run, on the regular geographic grid `plan` describes, with
-the horizontal velocity turned from the grid's own axes into east and north.
-
-The rotation: on the grid, `u` is along the x axis and `v` along the y axis, and the x
-axis has the bearing ψ (clockwise from north) at each cell. So
-
-    u_east  = u·sin ψ - v·cos ψ
-    u_north = u·cos ψ + v·sin ψ
-
-which is the inverse of the mapping the run itself uses to apply wind stress to a
-rotated grid.
-"""
-function _apply_regrid(plan, fields::Dict{String, Any})
-    out = Dict{String, Any}()
-    for (name, arr) in fields
-        A = Array{Float32}(arr)
-        nx, ny = length(plan.lon), length(plan.lat)
-        B = fill(Float32(NaN), (nx, ny, size(A, 3)))
-        w00 = (1.0 .- plan.ti) .* (1.0 .- plan.tj)
-        w10 = plan.ti .* (1.0 .- plan.tj)
-        w01 = (1.0 .- plan.ti) .* plan.tj
-        w11 = plan.ti .* plan.tj
-        inside = (plan.i0 .> 0) .& (plan.j0 .> 0)
-        # The gather is clamped to the first cell: a target outside the curvilinear
-        # domain has no source, and its value is masked to NaN below.
-        i0c = max.(plan.i0, 1)
-        j0c = max.(plan.j0, 1)
-        for k in 1:size(A, 3)
-            # CartesianIndex, so the gather is elementwise: two index matrices used
-            # directly would take their cross product, not the cell each target wants.
-            a00 = A[CartesianIndex.(i0c, j0c, k)]
-            a10 = A[CartesianIndex.(min.(i0c .+ 1, nx), j0c, k)]
-            a01 = A[CartesianIndex.(i0c, min.(j0c .+ 1, ny), k)]
-            a11 = A[CartesianIndex.(min.(i0c .+ 1, nx), min.(j0c .+ 1, ny), k)]
-            B[:, :, k] = Float32.(w00 .* a00 .+ w10 .* a10 .+ w01 .* a01 .+ w11 .* a11)
-        end
-        B[.!inside, :, :] .= Float32(NaN)
-        out[name] = B
-    end
-
-    if haskey(out, "u") && haskey(out, "v")
-        # The bearing is in RADIANS (it comes from `atan`), so the ordinary sine and
-        # cosine, not the degree variants.
-        ψ = plan.bearing
-        s = sin.(ψ)
-        c = cos.(ψ)
-        U = out["u"]
-        V = out["v"]
-        Us = similar(U)
-        Vs = similar(V)
-        for k in 1:size(U, 3)
-            # The grid's x axis has the bearing ψ (clockwise from north), so it is the
-            # unit vector (sin ψ, cos ψ) in (east, north); the y axis is ninety degrees
-            # from it the other way, (-cos ψ, sin ψ). A velocity on the grid is then
-            #     east  = u·sin ψ - v·cos ψ
-            #     north = u·cos ψ + v·sin ψ
-            # which is the inverse of the mapping the run itself uses to apply wind
-            # stress to a rotated grid.
-            Us[:, :, k] = U[:, :, k] .* s .- V[:, :, k] .* c
-            Vs[:, :, k] = U[:, :, k] .* c .+ V[:, :, k] .* s
-        end
-        out["u"] = Us
-        out["v"] = Vs
-    end
-    return out
-end
-
-"""
     _grid_shape_for_centres(raw_ax) -> (nx, ny, nz)
 
 Return the interior grid shape from the coordinate axes extracted by `_field_arrays`.
-For standard `LatitudeLongitudeGrid`, `raw_ax.x`/`raw_ax.y` are 1D vectors of length Nx/Ny.
-For rotated `OrthogonalSphericalShellGrid`, they are 2D matrices of size (Nx, Ny).
+For a `LatitudeLongitudeGrid`, `raw_ax.x`/`raw_ax.y` are 1D vectors of length Nx/Ny.
 """
 function _grid_shape_for_centres(raw_ax)
-    nx = ndims(raw_ax.x) == 2 ? size(raw_ax.x, 1) : length(raw_ax.x)
-    ny = ndims(raw_ax.x) == 2 ? size(raw_ax.x, 2) : length(raw_ax.y)
+    nx = length(raw_ax.x)
+    ny = length(raw_ax.y)
     nz = length(raw_ax.z)
     return (nx, ny, nz)
 end
@@ -422,13 +274,6 @@ function _field_arrays(model)
     # rest of the code reports; hand-slicing the halo here shifted them by the halo width.
     if base isa Oceananigans.Grids.LatitudeLongitudeGrid
         c = extract_grid_coordinates(base)
-        return (x = Float64.(c.lons), y = Float64.(c.lats), z = Float64.(c.depths))
-    elseif base isa Oceananigans.Grids.OrthogonalSphericalShellGrid
-        c = extract_grid_coordinates(base)
-        # c.lons/c.lats are 2D matrices (Nx×Ny) for rotated curvilinear grids. They are
-        # kept as they are: the cells are not on a longitude-latitude lattice, and the
-        # writer regrids them onto one before they are written. Averaging each row and
-        # each column -- what this did before -- put a cell at a place no cell occupies.
         return (x = Float64.(c.lons), y = Float64.(c.lats), z = Float64.(c.depths))
     end
     # Metric/rectilinear grid (the unit tests): Cartesian horizontal centres in metres, halo
@@ -467,10 +312,7 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
 
     fields = Dict{String, Any}()
     for name in cb.field_names
-        f = name == "u" ? model.velocities.u :
-            name == "v" ? model.velocities.v :
-            name == "w" ? model.velocities.w :
-            name == "T" ? model.tracers.T : error("unknown field $(name)")
+        f = _model_field(model, name)
         # `u` is on x-faces, `v` on y-faces, `w` on z-faces: Oceananigans' own staggering. They
         # are averaged onto cell centres here, in one `_to_centres` call, so the store holds
         # every field on the one grid its dimension records describe -- and a reader does not
@@ -478,23 +320,6 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
         centred = Float32.(_to_centres(Array{Float32}(interior(f)),
                                        _grid_shape_for_centres(raw_ax)))
         fields[name] = length(z_indices) < length(raw_ax.z) ? centred[:, :, z_indices] : centred
-    end
-
-    # A rotated grid's cells are not on a longitude-latitude lattice. They are put on one
-    # here, before they are written, so that the store says where its cells are and its
-    # velocities are east and north. A store is a record of where things are; a reader
-    # given a smeared one-dimensional axis has no way to undo that.
-    if ndims(raw_ax.x) == 2
-        g = model.grid
-        base_g = hasproperty(g, :underlying_grid) ? g.underlying_grid : g
-        if isnothing(cb.regrid_plan)
-            np = Tuple(Float64.(base_g.conformal_mapping.north_pole))
-            cb.regrid_plan = _rotated_regrid_plan(base_g, raw_ax.x, raw_ax.y,
-                                                   extract_rotated_grid_bounds(base_g, np))
-        end
-        plan = cb.regrid_plan
-        fields = _apply_regrid(plan, fields)
-        ax = (x = plan.lon, y = plan.lat, z = raw_ax.z[z_indices])
     end
 
     ds = cb.store_ds
@@ -509,7 +334,6 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
         ds = _build_store_dataset(output_zarr_path(cb.output_dir), ax, cb.field_names, nt,
                                   sim.model)
         cb.store_ds = ds
-        record_run_metadata!(ds, model)
     end
     if isnothing(cb.time_array)
         # The store's own time array, opened once. See the note where it is written: this is
@@ -597,6 +421,9 @@ returns, extracted from a live model so the store can carry it: a figure that ma
 against the seabed must see the one the run used, not a re-derived stand-in.
 """
 function seabed_from_model(model)
+    # A store that is not a simulation's -- the stitched mosaic -- has no grid to take a
+    # seabed from, and is asked for one with `model = nothing`.
+    (isnothing(model) || !hasproperty(model, :grid)) && return nothing
     g = model.grid
     g isa ImmersedBoundaryGrid || return nothing
     ib = g.immersed_boundary
@@ -606,25 +433,37 @@ function seabed_from_model(model)
 end
 
 """
-    record_run_metadata!(ds, model)
+    run_metadata(model) -> Dict{String, Any}
 
-Record what a reader cannot recover from a path, into the dataset's own attributes.
+What a reader cannot recover from the store's path or from its arrays: the seabed the
+run used, a title, and the moment the store was made.
 
-The grid no longer belongs here: the store's dimension records carry the interior cell centres,
-in GeoData's own structure, because the store is a GeoData dataset. What is left is the seabed
-the run used -- the same value the JLD2 `serialized/grid` branch of
-`read_immersed_bathymetry` returns, extracted from the live model so a figure that masks below
-the seafloor sees the one the run used and not a re-derived stand-in. It does not vary with
-time, and it is not a dimension of any field, so an attribute is where it belongs.
+The store's attributes are written by the save that creates it, so these have to be in
+the dataset *before* that save. They used to be set on the dataset afterwards, which
+changed an in-memory dictionary and left the store's `.zattrs` without them -- so the
+seabed, which is the one thing a figure needs to know where the sea floor is, was
+absent from every store a run produced.
+
+The seabed is written flat, in column-major order, with its shape alongside it. Zarr's
+attribute writer turns a Julia matrix into a list of COLUMNS, so a matrix written here
+would be read back transposed; on a grid whose two horizontal dimensions differ -- 32 by
+38, not a square -- a transposed seabed is a matrix of the wrong shape that still looks
+like data. A flat list plus a shape is unambiguous whatever the writer does with it.
+
+`model` is `nothing` for a store that is not a simulation's -- the stitched mosaic --
+and such a store simply has no seabed to record.
 """
-function record_run_metadata!(ds::GeoDataset, model)
+function run_metadata(model)
+    attrs = Dict{String, Any}(
+        "title" => "Realized hydrodynamic simulation",
+        "created_utc" => string(Dates.now(Dates.UTC)),
+    )
     seabed = seabed_from_model(model)
     if !isnothing(seabed)
-        ds.attrs["bottom_height"] = seabed
+        attrs["bottom_height"] = collect(Float64, vec(seabed))
+        attrs["bottom_height_shape"] = [size(seabed, 1), size(seabed, 2)]
     end
-    ds.attrs["title"] = "Realized hydrodynamic simulation"
-    ds.attrs["created_utc"] = string(Dates.now(Dates.UTC))
-    return nothing
+    return attrs
 end
 
 """

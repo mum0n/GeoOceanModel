@@ -17,7 +17,7 @@ Locate the configuration file in the project workspace, or return `""` when ther
 Only project-root locations are searched. A configuration is an input the operator supplies;
 it is never discovered inside a previous run's containerised `inputs/` directory, and it is
 never guessed at. In particular there is no fallback to `configs/default.toml`: a run that
-silently adopts a different scenario than the one intended produces output that looks
+silently adopts a different configuration than the one intended produces output that looks
 complete and answers a question nobody asked. Callers must fail loudly instead, which is what
 `load_configuration` does with an empty path.
 
@@ -166,7 +166,9 @@ function get_default_configuration()::Dict{String, Any}
             "method" => "relaxation",
             "ocean_boundary_source" => "glorys12v1",
             "obc_type" => "flather_chapman",
-            "sponge_layer_width" => 0.35,
+            # The sponge band's width is not a setting here: it is [domain] buffer_km,
+            # which is the margin the band lives in. It is derived when the options are
+            # built, and recorded in the resolved configuration.
             "sponge_timescale" => 3600.0,
             "u_inflow" => -0.15,
             "v_inflow" => 0.05
@@ -183,12 +185,6 @@ function get_default_configuration()::Dict{String, Any}
             "tidal_v_amp" => 0.12,
             "tidal_period" => 44712.0,
             "tidal_phase" => 0.0
-        ),
-        "climate" => Dict{String, Any}(
-            "scenario" => "ssp245",
-            "projection_year" => 2050,
-            "baseline_year" => 2015,
-            "horizon_year" => 2050
         ),
         "hydrodynamics" => Dict{String, Any}(
             "sim_duration_hours" => 12.0,

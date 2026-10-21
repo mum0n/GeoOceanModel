@@ -11,6 +11,110 @@ using CairoMakie
 import CairoMakie: record
 
 """
+    focus_on_domain!(ax, lons, lats)
+
+Limit an axis to the model's own domain.
+
+The extent of a figure of the model is the model. Left to itself, an axis takes the
+extent of everything drawn on it, and the coastline is a continent: an axis scaled to
+the rings shows the model's domain as a patch in the corner. The limits are set from
+the model's own coordinates, so the figure is the domain, whatever else is drawn on it.
+"""
+function focus_on_domain!(
+    ax,
+    lons,
+    lats;
+    domain_lon::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    domain_lat::Union{Nothing, Tuple{<:Real, <:Real}} = nothing
+)
+    lon_bounds = isnothing(domain_lon) ? extrema(lons) : domain_lon
+    lat_bounds = isnothing(domain_lat) ? extrema(lats) : domain_lat
+    CairoMakie.xlims!(ax, lon_bounds...)
+    CairoMakie.ylims!(ax, lat_bounds...)
+    return ax
+end
+
+"""
+    draw_coastline!(ax, coastline; lons = nothing, lats = nothing) -> Int
+
+The coastline rings, drawn over a field.
+
+A field without the land beside it is a field with no geography: a reader cannot tell
+whether the pale area is a bay, a bank, or the edge of the data, and cannot see that a
+model's domain reaches the coast. The rings are the run's own where it has them, so the
+land drawn is the land the model ran on.
+
+Each ring is `(name, code, lons, lats)`.
+
+The rings are clipped to the model's own domain, and this is not a matter of taste. The
+rings are the coast of a continent -- the Atlantic seaboard from Labrador to Florida --
+and Makie scales an axis to whatever is drawn on it. Drawn whole, they carried the axis
+out to 105°W and 72°N, and the model's own domain, a degree and a half across, became a
+patch a few pixels wide in one corner of the figure. A figure of the model, drawn at the
+scale of the continent, is a figure of the continent.
+
+`lons` and `lats` are the model's coordinates. Without them the rings are drawn whole,
+which is what a caller that has no model extent to clip to gets.
+"""
+function draw_coastline!(ax, coastline; lons = nothing, lats = nothing)
+    isnothing(coastline) && return 0
+    window = if isnothing(lons) || isnothing(lats)
+        nothing
+    else
+        (minimum(lons), maximum(lons), minimum(lats), maximum(lats))
+    end
+    n = 0
+    for ring in coastline
+        isempty(ring.lons) && continue
+        runs = isnothing(window) ? [collect(eachindex(ring.lons))] :
+               _clip_polyline(ring.lons, ring.lats, window)
+        for run in runs
+            length(run) < 2 && continue
+            lines!(ax, ring.lons[run], ring.lats[run]; color = :black, linewidth = 1.5)
+            n += 1
+        end
+    end
+    return n
+end
+
+"""
+    _clip_polyline(lons, lats, window) -> Vector{Vector{Int}}
+
+The indices of a polyline that fall inside `window = (xmin, xmax, ymin, ymax)`, split
+into contiguous runs.
+
+A run, rather than a single list, because a polyline that leaves the window and comes
+back has two separate pieces inside it, and joining them would draw a line across the
+window that the coast never took. The window is widened by a margin first, so that a
+coast that crosses the edge is drawn to the edge rather than stopping short of it.
+"""
+function _clip_polyline(lons, lats, window)
+    xmin, xmax, ymin, ymax = window
+    # A margin of a tenth of the window's own size: enough to carry a coast that runs
+    # just outside the model's domain into the frame, small enough not to bring in a
+    # neighbouring landmass.
+    mx = 0.1 * (xmax - xmin)
+    my = 0.1 * (ymax - ymin)
+    inside = findall(i -> (xmin - mx) <= lons[i] <= (xmax + mx) &&
+                           (ymin - my) <= lats[i] <= (ymax + my),
+                     eachindex(lons))
+    isempty(inside) && return Vector{Int}[]
+
+    runs = Vector{Int}[]
+    current = Int[inside[1]]
+    for k in 2:length(inside)
+        if inside[k] == inside[k - 1] + 1
+            push!(current, inside[k])
+        else
+            push!(runs, current)
+            current = Int[inside[k]]
+        end
+    end
+    push!(runs, current)
+    return runs
+end
+
+"""
     plot_hydrodynamic_advection(
         hydrodynamics::Any;
         depth::Union{Nothing, Real} = nothing,
@@ -48,6 +152,7 @@ Flow orientation angle:
 - `output_path`: Destination file path.
 - `quiver_stride`: Spatial subsampling step for vector arrows.
 - `colormap`: CairoMakie colormap symbol (default `:turbo`).
+- `domain_lon`, `domain_lat`: Optional exact axis bounds; defaults to the data extent.
 
 # Outputs
 - `Figure`: CairoMakie figure object.
@@ -62,7 +167,10 @@ function plot_hydrodynamic_advection(
     title::AbstractString = "Ocean Hydrodynamic Advection Velocity Field",
     output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_advection.png",
     quiver_stride::Int = 2,
-    colormap::Symbol = :turbo
+    colormap::Symbol = :turbo,
+    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing,
+    domain_lon::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    domain_lat::Union{Nothing, Tuple{<:Real, <:Real}} = nothing
 )
     hydro = extract_hydrodynamic_dataset(
         hydrodynamics;
@@ -137,6 +245,10 @@ function plot_hydrodynamic_advection(
         end
     end
 
+    # The coastline, drawn over the field: the land the model ran on.
+    focus_on_domain!(ax, lons, lats; domain_lon, domain_lat)
+    draw_coastline!(ax, coastline; lons = lons, lats = lats)
+
     if !isnothing(output_path)
         mkpath(dirname(output_path))
         save(output_path, fig)
@@ -172,6 +284,7 @@ at a specific depth and time.
 - `time_index`: Snapshot index.
 - `title`: Figure title.
 - `output_path`: Destination path.
+- `domain_lon`, `domain_lat`: Optional exact axis bounds; defaults to the data extent.
 
 # Outputs
 - `Figure`: CairoMakie figure object.
@@ -183,7 +296,10 @@ function plot_hydrodynamic_tracers(
     time_seconds::Union{Nothing, Real} = nothing,
     time_index::Union{Nothing, Int} = 1,
     title::AbstractString = "Hydrodynamic Model Seawater Tracers",
-    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_tracers.png"
+    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_tracers.png",
+    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing,
+    domain_lon::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    domain_lat::Union{Nothing, Tuple{<:Real, <:Real}} = nothing
 )
     hydro = extract_hydrodynamic_dataset(
         hydrodynamics;
@@ -199,7 +315,9 @@ function plot_hydrodynamic_tracers(
     t_hr = round(hydro.time_seconds / 3600.0, digits = 1)
 
     t_mat = hydro.temperature[:, :, k]
-    s_mat = hydro.salinity[:, :, k]
+    # A record without a salinity is drawn as no data, not as a constant: a panel of
+    # invented salinity reads as an observation.
+    s_mat = field_or_nan(hydro, :salinity)[:, :, k]
 
     fig = Figure(size = (1180, 540), fontsize = 12)
 
@@ -224,6 +342,12 @@ function plot_hydrodynamic_tracers(
     hm2 = heatmap!(ax2, lons, lats, s_mat, colormap = :viridis;
                      colorrange = _field_colorrange(s_mat))
     Colorbar(fig[1, 4], hm2, label = "Salinity (PSU)")
+
+    # The coastline, drawn over the field: the land the model ran on.
+    focus_on_domain!(ax1, lons, lats; domain_lon, domain_lat)
+    focus_on_domain!(ax2, lons, lats; domain_lon, domain_lat)
+    draw_coastline!(ax1, coastline; lons = lons, lats = lats)
+    draw_coastline!(ax2, coastline; lons = lons, lats = lats)
 
     if !isnothing(output_path)
         mkpath(dirname(output_path))
@@ -270,6 +394,7 @@ Vertical salinity gradient (halocline strength):
 - `stations`: Optional vector of named coordinates `[(lon=..., lat=..., name=...)]`.
 - `title`: Figure title.
 - `output_path`: Destination path.
+- `domain_lon`, `domain_lat`: Optional exact axis bounds; defaults to the data extent.
 
 # Outputs
 - `Figure`: CairoMakie figure object.
@@ -282,7 +407,10 @@ function plot_hydrodynamic_stratification(
     time_index::Union{Nothing, Int} = 1,
     stations::Union{Nothing, AbstractVector} = nothing,
     title::AbstractString = "Hydrodynamic Seawater Stratification & Pycnocline Structure",
-    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_stratification.png"
+    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_stratification.png",
+    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing,
+    domain_lon::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    domain_lat::Union{Nothing, Tuple{<:Real, <:Real}} = nothing
 )
     hydro = extract_hydrodynamic_dataset(
         hydrodynamics;
@@ -299,7 +427,7 @@ function plot_hydrodynamic_stratification(
     t_hr = round(hydro.time_seconds / 3600.0, digits = 1)
 
     n2_mat = hydro.stratification[:, :, k] .* 10000.0 # 10^-4 s^-2
-    s_mat  = hydro.salinity[:, :, k]
+    s_mat  = field_or_nan(hydro, :salinity)[:, :, k]
 
     # Default representative shelf stations if not provided
     station_list = if !isnothing(stations) && !isempty(stations)
@@ -362,12 +490,20 @@ function plot_hydrodynamic_stratification(
         scatter!(ax2, [lons[i_st]], [lats[j_st]], color = col, marker = mkr, markersize = 12, strokecolor = :white, strokewidth = 1.5)
 
         # Plot vertical 1D salinity profile S(z)
-        s_profile = hydro.salinity[i_st, j_st, :]
+        s_profile = field_or_nan(hydro, :salinity)[i_st, j_st, :]
         lines!(ax3, s_profile, depths, color = col, linewidth = 2.4, label = st_name)
         scatter!(ax3, s_profile, depths, color = col, marker = mkr, markersize = 8)
     end
 
     axislegend(ax3, position = :rb)
+
+    # The coastline, drawn over the field: the land the model ran on. The third panel is
+    # a vertical profile, not a map, so it has no domain to focus on.
+    focus_on_domain!(ax1, lons, lats; domain_lon, domain_lat)
+    focus_on_domain!(ax2, lons, lats; domain_lon, domain_lat)
+    draw_coastline!(ax1, coastline; lons = lons, lats = lats)
+    draw_coastline!(ax2, coastline; lons = lons, lats = lats)
+    draw_coastline!(ax3, coastline; lons = lons, lats = lats)
 
     if !isnothing(output_path)
         mkpath(dirname(output_path))
@@ -408,6 +544,7 @@ Ri = \\\\\\\\\\\\\\frac{N^2}{\\left(\\\\\\\\\\\\\\frac{\\\\\\\\\\\\\\partial u}{
 - `time_index`: Snapshot index.
 - `title`: Figure title.
 - `output_path`: Destination file path.
+- `domain_lon`, `domain_lat`: Optional exact axis bounds; defaults to the data extent.
 
 # Outputs
 - `Figure`: CairoMakie figure object.
@@ -419,7 +556,10 @@ function plot_hydrodynamic_diffusion(
     time_seconds::Union{Nothing, Real} = nothing,
     time_index::Union{Nothing, Int} = 1,
     title::AbstractString = "Hydrodynamic Turbulent Eddy Diffusivity & Viscosity",
-    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_diffusion.png"
+    output_path::Union{Nothing, AbstractString} = "outputs/hydrodynamic_diffusion.png",
+    coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing,
+    domain_lon::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    domain_lat::Union{Nothing, Tuple{<:Real, <:Real}} = nothing
 )
     hydro = extract_hydrodynamic_dataset(
         hydrodynamics;
@@ -491,6 +631,14 @@ function plot_hydrodynamic_diffusion(
     end
 
     axislegend(ax3, position = :rb)
+
+    # The coastline, drawn over the field: the land the model ran on. The third panel is
+    # a vertical profile, not a map, so it has no domain to focus on.
+    focus_on_domain!(ax1, lons, lats; domain_lon, domain_lat)
+    focus_on_domain!(ax2, lons, lats; domain_lon, domain_lat)
+    draw_coastline!(ax1, coastline; lons = lons, lats = lats)
+    draw_coastline!(ax2, coastline; lons = lons, lats = lats)
+    draw_coastline!(ax3, coastline; lons = lons, lats = lats)
 
     if !isnothing(output_path)
         mkpath(dirname(output_path))
@@ -617,7 +765,7 @@ function plot_hydrodynamic_section(
 
     # Resolve variable 3D field and colorbar properties
     field_3d, cmap, var_label = if variable == :salinity || variable == :S
-        (hydro.salinity, :viridis, "Practical Salinity (PSU)")
+        (field_or_nan(hydro, :salinity), :viridis, "Practical Salinity (PSU)")
     elseif variable == :density || variable == :rho
         (hydro.density, :dense, "Potential Density (kg m⁻³)")
     elseif variable == :stratification || variable == :N2
@@ -705,7 +853,7 @@ function plot_hydrodynamic_section(
         Colorbar(fig[1, 2], co, label = var_label)
     end
 
-    if !isnothing(output_path)
+        if !isnothing(output_path)
         mkpath(dirname(output_path))
         save(output_path, fig)
     end
@@ -823,7 +971,7 @@ function plot_hydrodynamic_timeseries(
 
     axislegend(ax, position = :rt)
 
-    if !isnothing(output_path)
+        if !isnothing(output_path)
         mkpath(dirname(output_path))
         save(output_path, fig)
     end
@@ -867,6 +1015,7 @@ Flexible unified renderer for 2D spatial distribution of any hydrodynamic variab
 - `title`: Optional custom figure title.
 - `output_path`: Optional file destination.
 - `colormap`: Optional custom colormap symbol.
+- `domain_lon`, `domain_lat`: Optional exact axis bounds; defaults to the data extent.
 
 # Outputs
 - `Figure`: CairoMakie figure object.
@@ -880,7 +1029,9 @@ function plot_hydrodynamic_field(
     time_index::Union{Nothing, Int} = 1,
     title::Union{Nothing, AbstractString} = nothing,
     output_path::Union{Nothing, AbstractString} = nothing,
-    colormap::Union{Nothing, Symbol} = nothing
+    colormap::Union{Nothing, Symbol} = nothing,
+    domain_lon::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
+    domain_lat::Union{Nothing, Tuple{<:Real, <:Real}} = nothing
 )
     hydro = extract_hydrodynamic_dataset(
         hydrodynamics;
@@ -896,7 +1047,7 @@ function plot_hydrodynamic_field(
     t_hr = round(hydro.time_seconds / 3600.0, digits = 1)
 
     mat_2d, default_cmap, unit_label = if variable == :salinity || variable == :S
-        (hydro.salinity[:, :, k], :viridis, "Practical Salinity (PSU)")
+        (field_or_nan(hydro, :salinity)[:, :, k], :viridis, "Practical Salinity (PSU)")
     elseif variable == :density || variable == :rho
         (hydro.density[:, :, k], :dense, "Potential Density (kg m⁻³)")
     elseif variable == :stratification || variable == :N2
@@ -927,8 +1078,9 @@ function plot_hydrodynamic_field(
     ax = Axis(fig[1, 1], title = fig_title, xlabel = "Longitude (°E)", ylabel = "Latitude (°N)")
     hm = heatmap!(ax, lons, lats, mat_2d, colormap = active_cmap)
     Colorbar(fig[1, 2], hm, label = unit_label)
+    focus_on_domain!(ax, lons, lats; domain_lon, domain_lat)
 
-    if !isnothing(output_path)
+        if !isnothing(output_path)
         mkpath(dirname(output_path))
         save(output_path, fig)
     end

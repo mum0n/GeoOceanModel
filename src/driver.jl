@@ -56,6 +56,30 @@ function resolve_hydro_model_path(opts::HydrodynamicOptions, default_filename::S
 end
 
 """
+    _reference_year(opts::HydrodynamicOptions) -> Int
+
+The calendar year this run stands for: the year of its own reference time.
+
+`[data] wind_time_iso` is the instant the run is configured around, so the year it names is
+the year the run represents. Data products that are fetched per year -- the Copernicus
+hydrography is the one that needs it -- are then fetched for the year the run is actually
+about, rather than for a projection year that no longer exists as a concept here.
+
+The timestamp is read as a four-digit year at its front, which is the form the configuration
+documents. A reference time that is not in that form is an error rather than a guess: the
+wrong year silently fetches a different ocean.
+"""
+function _reference_year(opts::HydrodynamicOptions)::Int
+    stamp = strip(opts.wind_time_iso)
+    m = match(r"^(\d{4})", stamp)
+    m === nothing && error(
+        "The run's reference time '$(opts.wind_time_iso)' does not begin with a four-digit " *
+        "year, so the year this run stands for cannot be read from it. Write " *
+        "[data] wind_time_iso as YYYY-MM-DDTHH:MM:SSZ.")
+    return parse(Int, m.captures[1])
+end
+
+"""
     _woa_store_locations(opts::HydrodynamicOptions) -> Vector{String}
 
 Where WOA23 already lives in the GeoData store. Each variable is ~900 MB, so a store copy is
@@ -244,7 +268,7 @@ function run_segment_data(; opts::HydrodynamicOptions = HydrodynamicOptions())
 
     # The coastline is a fetched input like any other, and is listed in the provenance
     # registry, so it is acquired rather than seeded from a file in this repository. A stale
-    # repository copy would let two scenarios mask against different land.
+    # repository copy would let two runs mask against different land.
     # `.parquet`, not `.dat`: the data layer's `load_coastline_polygons` reads GeoParquet and
     # rejects any other suffix. The `.dat` name it used to carry was Parquet bytes under a
     # mislabel, which let the fetch succeed and the later read fail.
@@ -424,12 +448,7 @@ function run_segment_grid(; opts::HydrodynamicOptions = HydrodynamicOptions())
         z_range = opts.domain_z,
         z_faces = z_faces,
         grid_size = opts.grid_size,
-        fallback_to_cpu = opts.fallback_to_cpu,
-        orientation = opts.grid_orientation,
-        rotation_azimuth = opts.rotation_azimuth,
-        center_coords = (opts.center_lon, opts.center_lat),
-        along_shelf_extent_km = opts.along_shelf_extent_km,
-        cross_shelf_extent_km = opts.cross_shelf_extent_km
+        fallback_to_cpu = opts.fallback_to_cpu
     )
 
     println("Constructing immersed boundary by 2D bilinear regridding...")
@@ -443,16 +462,9 @@ function run_segment_grid(; opts::HydrodynamicOptions = HydrodynamicOptions())
     )
 
     println("Grid summary:")
-    if opts.grid_orientation === :rotated
-        println("  Orientation: Rotated orthogonal grid at $(opts.rotation_azimuth)° azimuth")
-        println("  Center:      ($(opts.center_lon)°E, $(opts.center_lat)°N)")
-        println("  Extent:      $(opts.along_shelf_extent_km) km along-shelf × $(opts.cross_shelf_extent_km) km cross-shelf")
-        println("  Horizontal:  Nx=$(opts.grid_size[1]) × Ny=$(opts.grid_size[2]) ($(opts.grid_size[1]*opts.grid_size[2]) total cells)")
-    else
-        println("  Orientation: Standard geographic grid")
-        println("  Longitude:   $(opts.domain_lon[1])°E to $(opts.domain_lon[2])°E (Nx=$(opts.grid_size[1]))")
-        println("  Latitude:    $(opts.domain_lat[1])°N to $(opts.domain_lat[2])°N (Ny=$(opts.grid_size[2]))")
-    end
+    println("  Orientation: Standard geographic grid")
+    println("  Longitude:   $(opts.domain_lon[1])°E to $(opts.domain_lon[2])°E (Nx=$(opts.grid_size[1]))")
+    println("  Latitude:    $(opts.domain_lat[1])°N to $(opts.domain_lat[2])°N (Ny=$(opts.grid_size[2]))")
     println("  Depth:     $(opts.domain_z[1]) m to $(opts.domain_z[2]) m (Nz=$(opts.grid_size[3]))")
     if !isnothing(z_faces)
         src = isempty(opts.vertical_grid_file) ? "stretched" : basename(opts.vertical_grid_file)
@@ -598,15 +610,16 @@ temperature is in, and whether the file is actually usable data -- lives in
 packaged, because that knowledge is what made two WOA23 readers, a truncated boundary file
 and a units error possible in the first place.
 
-The bounding box is the `[boundaries] embedding_*` region rather than the study domain. It
-has to be larger: the model needs the water just *outside* its own edges, and a subset cut
+The bounding box is the `[boundaries] embedding_*` region rather than the study domain.
+It has to be larger: the model needs the water just *outside* its own edges, and a subset cut
 to the study domain would put the interpolation's edge exactly on the sponge.
 """
 function fetch_boundary_tracers(source::Symbol, opts)
     return fetch_boundary_hydrography(source;
         lon_range = opts.embedding_lon, lat_range = opts.embedding_lat,
         input_dir = opts.input_dir,
-        month = opts.hydrography_month)
+        month = opts.hydrography_month,
+        with_velocities = true)
 end
 
     # Configure open boundary conditions (lateral sponge) if requested.
@@ -624,11 +637,30 @@ end
     # produces plausible-looking output.
     obc_src = opts.ocean_boundary_source
     boundary_tracer_data = nothing
+    boundary_velocity_data = nothing
     if obc_src in (:woa23, :glorys12v1, :glorys_climatology, :hycom)
-        boundary_tracer_data = fetch_boundary_tracers(obc_src, opts)
+        boundary_data = fetch_boundary_tracers(obc_src, opts)
+        # The tracer sponge and the momentum sponge take the data apart here, because
+        # they are different quantities relaxed by different terms. Handing the model's
+        # tracer sponge a NamedTuple that also holds `u` and `v` would have it build a
+        # tracer relaxation for the momentum, overwriting the momentum forcing with one
+        # that relaxes toward the same velocity but under the tracer's mask and rate.
+        boundary_tracer_data = NamedTuple(k => boundary_data[k] for k in (:T, :S) if haskey(boundary_data, k))
+        # The momentum sponge relaxes toward these, so the boundary carries a velocity
+        # and not only a water type. `u_inflow`/`v_inflow` remain the fallback for
+        # sources that carry no currents.
+        if haskey(boundary_data, :u) && haskey(boundary_data, :v)
+            boundary_velocity_data = (u = boundary_data.u, v = boundary_data.v)
+        end
         println("Boundary hydrography: observed temperature and salinity from $(obc_src).")
-        println("  This constrains what the incoming water IS, not how fast it is GOING -- " *
-                "the inflow speed still comes from [boundaries] u_inflow/v_inflow.")
+        if isnothing(boundary_velocity_data)
+            println("  This constrains what the incoming water IS, not how fast it is GOING -- " *
+                    "the inflow speed still comes from [boundaries] u_inflow/v_inflow.")
+        else
+            println("  Observed zonal and meridional velocity from the same source: the " *
+                    "momentum sponge relaxes toward them, and [boundaries] u_inflow/v_inflow " *
+                    "are not used.")
+        end
     elseif obc_src == :synthetic
         println("Boundary hydrography: none. The open edges are unconstrained.")
     else
@@ -733,39 +765,27 @@ end
         atmo_craft.heat_flux
     end
 
-    # ── Rotated-grid coherence: geographic → rotated stress components ───────────
-    # On a RotatedLatitudeLongitudeGrid, Oceananigans interprets FluxBoundaryCondition
-    # stress values as components along the rotated curvilinear axes (x′ along-shelf,
-    # y′ cross-shelf), not geographic east/north. Without rotation, wind stress is
-    # applied ~50° off the true direction, driving spurious cross-shelf flow.
-    #
-    # Rotation matrix (θ = azimuth clockwise from North):
-    #   τ_x′ = τ_east·sin(θ) + τ_north·cos(θ)
-    #   τ_y′ = -τ_east·cos(θ) + τ_north·sin(θ)
+    # ── Geographic forcing: stress and inflow are already in (east, north) ─────────
+    # The grid is a geographic `LatitudeLongitudeGrid`: its x axis is east and its y axis
+    # is north. The wind stress and the prescribed inflow are geographic quantities, so
+    # they are handed to the model unchanged.
     #
     # We must NOT wrap callables in closures: closures are not Adapt-safe for GPU.
-    # Instead, rotate the `TimeSeriesSurfaceStress` `.values` tuple directly and
-    # rebuild bitstype objects that Adapt can copy to device.
-    θ_rot = deg2rad(Float64(opts.rotation_azimuth))
-    sin_θ, cos_θ = sin(θ_rot), cos(θ_rot)
-
+    # The `TimeSeriesSurfaceStress` values tuple is left in place, so the object stays a
+    # bitstype that Adapt can copy to device.
     if wind_x isa TimeSeriesSurfaceStress && wind_y isa TimeSeriesSurfaceStress
-        nx = length(wind_x.values)
-        x_vals = ntuple(i -> Float64(wind_x.values[i]) * sin_θ + Float64(wind_y.values[i]) * cos_θ, nx)
-        y_vals = ntuple(i -> -Float64(wind_x.values[i]) * cos_θ + Float64(wind_y.values[i]) * sin_θ, nx)
-        wind_x_rot = TimeSeriesSurfaceStress{length(x_vals)}(x_vals, wind_x.horizon, wind_x.tstep)
-        wind_y_rot = TimeSeriesSurfaceStress{length(y_vals)}(y_vals, wind_y.horizon, wind_y.tstep)
+        wind_x_rot = wind_x
+        wind_y_rot = wind_y
     elseif wind_x isa Number && wind_y isa Number
-        wind_x_rot = wind_x * sin_θ + wind_y * cos_θ
-        wind_y_rot = -wind_x * cos_θ + wind_y * sin_θ
+        wind_x_rot = wind_x
+        wind_y_rot = wind_y
     else
         error("wind_x and wind_y must be both TimeSeriesSurfaceStress or both numbers")
     end
 
-    # Same rotation for sponge target velocities (u_inflow/v_inflow are geographic)
+    # The sponge target velocities (u_inflow/v_inflow) are geographic too.
     u_inflow_rot, v_inflow_rot = if opts.u_inflow isa Number && opts.v_inflow isa Number
-        (opts.u_inflow * sin_θ + opts.v_inflow * cos_θ,
-         -opts.u_inflow * cos_θ + opts.v_inflow * sin_θ)
+        (Float64(opts.u_inflow), Float64(opts.v_inflow))
     else
         error("u_inflow and v_inflow must be numbers")
     end
@@ -796,10 +816,11 @@ end
     # See the note in `build_hydrodynamic_model`. The keyword is the model's
     # `tidal_relaxation_timescale` (the umbrella driver's older `tidal_tau` spelling was
     # renamed in `src/model/hydrodynamic_model.jl`).
-    tidal_relaxation_timescale = opts.tidal_relaxation_timescale,
+        tidal_relaxation_timescale = opts.tidal_relaxation_timescale,
         u_inflow = u_inflow_rot,
         v_inflow = v_inflow_rot,
         boundary_tracers = boundary_tracer_data,
+        boundary_velocities = boundary_velocity_data,
         closure = closure_choice in (:nemotke, :catke) ? :catke : nothing,
         ν = 1e-2,
         κ = 1e-2,
@@ -902,7 +923,7 @@ end
             nan_count > 0 && @warn "Replaced $nan_count non-finite boundary tracer values (T→12°C, S→35 PSU)."
         else
             copernicus_file = joinpath(opts.input_dir, "copernicus_ts.nc")
-            start_yr = hasproperty(opts, :start_year) ? opts.start_year : opts.projection_year
+            start_yr = _reference_year(opts)
             try
                 if !isfile(copernicus_file)
                     println("Fetching Copernicus Marine hydrography (trying GLOPHY-2 → GLO12 → GLORYS12 → NRT)...")
@@ -987,7 +1008,7 @@ function run_segment_simulation(;
     opts::HydrodynamicOptions = HydrodynamicOptions(),
     model = nothing
 )
-    default_jld2 = "hydrodynamics_$(opts.scenario)_$(opts.projection_year).jld2"
+    default_jld2 = "hydrodynamics.jld2"
     jld2_path, _ = resolve_hydro_model_path(opts, default_jld2)
     # The store is where this run's output lives and is what resume/reuse act on; the JLD2 is
     # only the Oceananigans restart checkpoint (state, not a deliverable).
@@ -1047,7 +1068,7 @@ function run_segment_simulation(;
     #
     # `sim_duration` is the END TIME measured from t = 0, not the length of the work still to
     # do. That single decision makes extending a run require nothing but editing the number:
-    # the inputs are already cached under this scenario's input directory and are not
+    # the inputs are already cached under this run's input directory and are not
     # re-downloaded, the model state is picked up from wherever it stopped, and raising
     # `sim_duration` runs the extra time. Resuming an interrupted run and extending a finished
     # one are therefore the same operation, and neither needs a separate flag.
@@ -1124,6 +1145,10 @@ function run_segment_simulation(;
                     "$(round(opts.sim_duration / 3600.0, digits=2)) h.")
             println("Raise sim_duration in the TOML to extend this run; nothing to do at the " *
                     "current length.")
+            # "Nothing to do" has to MEAN nothing to do. Falling through would integrate the
+            # whole three days again and rewrite a store that already holds them, which is
+            # a minute of compute and a store that looks refreshed without being so.
+            return (simulation = nothing, output_path = store_path, checkpoint_path = jld2_path)
         else
             println("Extending the existing run from $(round(file_info.last_time / 3600.0, digits=2)) h " *
                     "to $(round(opts.sim_duration / 3600.0, digits=2)) h.")
@@ -1183,7 +1208,8 @@ function run_segment_simulation(;
 
     out_interval = Oceananigans.TimeInterval(
         (opts.output_schedule_seconds > 0.0) ? opts.output_schedule_seconds : 21600.0)
-    output_store = attach_output_callback!(sim, out_dir_target; fields = ("u", "v", "w", "T"),
+    output_store = attach_output_callback!(sim, out_dir_target;
+                                           fields = ("u", "v", "w", "T", "S"),
                                            schedule = out_interval, resume = resume,
                                            spinup_seconds = spinup_sec,
                                            max_save_depth = opts.max_save_depth)
@@ -1205,6 +1231,129 @@ function run_segment_simulation(;
     end
 
     return (simulation = sim, output_path = output_store, checkpoint_path = jld2_path)
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Visualisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    run_segment_viz(; opts::HydrodynamicOptions = HydrodynamicOptions()) -> NamedTuple
+
+The ocean half's own figures, drawn from the flow solution the store holds.
+
+This is a segment in its own right, and it needs none of the others: it reads the
+output store, so it can be run against a run that finished hours ago, or one that was
+interrupted and resumed. The figures are the ocean's -- the flow field, the tracers,
+the stratification, the diffusion, the dashboard -- and the larval half's own figures
+(its trajectories, its connectivity) are the larval package's, produced by its own
+`--viz`.
+
+The bathymetry and the coastline are the run's own, resolved the way the grid resolved
+them, so a figure masks against the same land the model ran on rather than against a
+second, different coast.
+
+# Inputs
+- `opts::HydrodynamicOptions`: The resolved configuration.
+
+# Outputs
+- `NamedTuple`: `(figures, output_dir)` — the paths written, and where they went.
+"""
+function run_segment_viz(; opts::HydrodynamicOptions = HydrodynamicOptions())
+    println("\n=================================================================")
+    println(" [Segment V] Visualisation: the ocean's figures from the stored flow field")
+    println("=================================================================")
+
+    store = output_zarr_path(opts.output_dir)
+    if !isdir(store) || !isfile(joinpath(store, ".zgroup"))
+        error("No flow solution to draw: $(store) holds no store. " *
+              "Run the simulation first, or point --output-dir at a run that has one.")
+    end
+
+    out_dir = joinpath(opts.output_dir, "outputs")
+    mkpath(out_dir)
+
+    # The run's own bathymetry and coastline: the same land the model ran on.
+    bathy_data = try
+        _run_bathymetry(; opts = opts)
+    catch err
+        @warn "Could not read the run's bathymetry; the figures are drawn without it: $(err)"
+        nothing
+    end
+    coastline_rings = let path = joinpath(opts.input_dir, "coastline.parquet")
+        isfile(path) ? load_coastline_polygons(path) : nothing
+    end
+    if isnothing(coastline_rings)
+        @warn "No coastline beside the run; the figures fall back to the region's rings."
+    end
+
+    figures = String[]
+    function draw(f, name)
+        path = joinpath(out_dir, name)
+        try
+            f(path)
+            push!(figures, path)
+            println("  wrote $(name)")
+        catch err
+            @warn "Could not draw $(name): $(err)"
+        end
+        return nothing
+    end
+
+    # The advection figure draws the run's bathymetry as contours over the field, so it
+    # takes the bathymetry record. The other three draw the field and the coastline
+    # beside it, and declare no bathymetry keyword: passing one to a function that does
+    # not accept it is a `MethodError`, which is how three of these five figures were
+    # failing while the advection one -- the only one that takes it -- was written.
+    draw("hydrodynamic_advection.png") do path
+        plot_hydrodynamic_advection(store; depth = opts.anim_depth,
+                                     bathymetry_data = bathy_data,
+                                     output_path = path,
+                                     coastline = coastline_rings,
+                                     domain_lon = opts.domain_lon,
+                                     domain_lat = opts.domain_lat)
+    end
+    draw("hydrodynamic_tracers.png") do path
+        plot_hydrodynamic_tracers(store; depth = opts.anim_depth,
+                                  output_path = path,
+                                  coastline = coastline_rings,
+                                  domain_lon = opts.domain_lon,
+                                  domain_lat = opts.domain_lat)
+    end
+    draw("hydrodynamic_stratification.png") do path
+        plot_hydrodynamic_stratification(store; depth = opts.anim_depth,
+                                         output_path = path,
+                                         coastline = coastline_rings,
+                                         domain_lon = opts.domain_lon,
+                                         domain_lat = opts.domain_lat)
+    end
+    draw("hydrodynamic_diffusion.png") do path
+        plot_hydrodynamic_diffusion(store; depth = opts.anim_depth,
+                                    output_path = path,
+                                    coastline = coastline_rings,
+                                    domain_lon = opts.domain_lon,
+                                    domain_lat = opts.domain_lat)
+    end
+    draw("multi_panel_dashboard.png") do path
+        # The dashboard masks every panel against the seabed. It takes the bathymetry
+        # record as a source, and uses it only when it describes the model's own grid;
+        # the store's own seabed is the one that does.
+        plot_multi_panel_dashboard(store; bathymetry = bathy_data,
+                                   output_path = path,
+                                   domain_lon = opts.domain_lon,
+                                   domain_lat = opts.domain_lat)
+    end
+
+    # The animation, when the configuration asks for one.
+    if !isnothing(bathy_data)
+        anim = render_hydrodynamic_animation_if_requested(opts, store)
+        isnothing(anim) || push!(figures, anim)
+    elseif opts.animate_hydro
+        @warn "The animation needs the run's bathymetry, which could not be read; skipped."
+    end
+
+    println("Figures written to: $(out_dir)")
+    return (figures = figures, output_dir = out_dir)
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1354,7 +1503,6 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
             data = data_res,
             grid = grid_res,
             model = model_res,
-            climate = nothing,
             simulation = sim_res,
             tracking = nothing,
             metrics = nothing,
@@ -1385,7 +1533,6 @@ function run_production_pipeline(; opts::HydrodynamicOptions = HydrodynamicOptio
         data = data_res,
         grid = grid_res,
         model = model_res,
-        climate = nothing,
         simulation = sim_res,
         tracking = track_res,
         metrics = metrics_res,

@@ -575,15 +575,13 @@ println("wet cells: ", wet, " / ", length(bathy.elevation), "  (", round(100 * w
 
 md"""
 
-## The grid: rotated orthogonal curvilinear shelf grid
+## The grid: a standard geographic shelf grid
 
-`build_shelf_grid` (dispatched through `run_segment_grid`) constructs either a standard geographic spherical grid (`LatitudeLongitudeGrid`) or an orthogonal curvilinear grid (`RotatedLatitudeLongitudeGrid`) rotated to align with the continental margin.
+`build_shelf_grid` (dispatched through `run_segment_grid`) constructs a standard geographic spherical grid (`LatitudeLongitudeGrid`) aligned with lines of longitude and latitude, bounded by the `[domain]` limits.
 
-### Curvilinear alignment along the continental margin
+### Momentum advection
 
-- **Intuitive Motivation (Generalists)**: The Scotian Shelf runs diagonally from southwest to northeast (roughly $50^\circ$ clockwise from North). A standard north-south grid simulating this region must include huge areas of deep open ocean in the south and dry mainland in the north that are not relevant to shelf biology. Rotating the coordinate frame parallel to the coastline turns this diagonal strip into a compact rectangular grid, covering the entire habitat corridor from Georges Bank to Cabot Strait with roughly 60% fewer horizontal cells ($14,300$ vs $36,000$).
-- **Mathematical Formulation (Specialists)**: An orthogonal curvilinear `RotatedLatitudeLongitudeGrid` is constructed by defining an Euler rotation pole $(\lambda_p, \phi_p)$ via [`compute_rotated_pole`](file:///c:/home/jae/projects/GeoOceanModel/src/data/grid_bathymetry.jl#L142). The local tangent unit vector $\hat{e}_\xi = \sin\theta\,\hat{e}_E + \cos\theta\,\hat{e}_N$ at azimuth $\theta = 50.0^\circ$ and cross-shelf normal $\hat{e}_\eta = \cos\theta\,\hat{e}_E - \sin\theta\,\hat{e}_N$ define the right-handed pole vector $\mathbf{P} = \hat{e}_\xi \times \hat{e}_\eta$. Centered at $(-63.0^\circ\text{E}, 44.0^\circ\text{N})$, the grid spans $L_\xi = 850.0\,\text{km}$ along-shelf and $L_\eta = 220.0\,\text{km}$ cross-shelf across $Nx = 220 \times Ny = 65$ cells.
-- **Momentum Advection**: Curvilinear metric variations require `VectorInvariant()` momentum advection to compute vorticity $\boldsymbol{\omega} = \nabla \times \boldsymbol{u}$ on cell vertices without Christoffel symbol singularities, while preserving fifth-order `WENO()` for active temperature and salinity tracers.
+Fifth-order `WENO()` advection is used for momentum and for the active temperature and salinity tracers. On a spherical grid the metric terms that carry the curvature are part of the grid itself, so the conservative form of the momentum equation is advected directly.
 
 ### Vertical discretization & standardized depths
 
@@ -626,10 +624,8 @@ println("base grid: Nx ", bg.Nx, "  Ny ", bg.Ny, "  Nz ", bg.Nz)
 # mapping, only the numbers.
 _host_values(a) = Array(parent(a))
 
-# A standard geographic grid carries 1-D longitude at its x-faces; a rotated orthogonal
-# shell grid carries geographic longitude as a 2-D cell field instead, so the span has to
-# come from the cell centres' extrema.
-_lon_host = _host_values(hasproperty(bg, :λᶠᵃᵃ) ? bg.λᶠᵃᵃ : bg.λᶜᶜᵃ)
+# A standard geographic grid carries 1-D longitude at its x-faces.
+_lon_host = _host_values(bg.λᶠᵃᵃ)
 _lon_span = (Float64(minimum(_lon_host)), Float64(maximum(_lon_host)))
 println("lon span : ", _lon_span[1], "°E to ", _lon_span[2], "°E")
 
@@ -799,9 +795,7 @@ md"""
 
 `run_segment_simulation` advances the model and writes the flow into the GeoData store. On the
 
-CLI, `--all` runs exactly these cells plus the data and grid segments — without the climate
-
-perturbation, which runs only when `--climate` is named.
+CLI, `--all` runs exactly these cells plus the data and grid segments.
 
 ### The output cadence is its own decision
 

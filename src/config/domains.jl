@@ -43,7 +43,6 @@ const CONFIG_SECTION_DOMAIN = Dict{String, Symbol}(
     "visualization"         => SHARED,
     # Ocean: what the physical model is forced and bounded by.
     "data"                  => OCEAN,
-    "climate"               => OCEAN,
     "bathymetry"            => OCEAN,
     "atmosphere"            => OCEAN,
     "boundaries"            => OCEAN,

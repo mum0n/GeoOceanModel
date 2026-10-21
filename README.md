@@ -7,9 +7,8 @@ A regional ocean hydrodynamic model that transforms geospatial environmental con
 `GeoOceanModelRun.jl` orchestrates modular execution segments implemented in [`src/driver.jl`](file:///c:/home/jae/projects/GeoOceanModel/src/driver.jl):
 
 - **Data Ingestion (`--data`)**: Assimilates high-resolution bathymetric soundings, coastline polygons, surface winds, and open-boundary hydrography via [`GeoDataSources`](file:///c:/home/jae/projects/GeoDataSources/README.md).
-- **Grid & Immersed Boundary (`--grid`)**: Constructs spherical latitude-longitude or rotated orthogonal curvilinear grids on CPU or GPU (CUDA), fitting real seafloor topography as immersed boundaries.
+- **Grid & Immersed Boundary (`--grid`)**: Constructs spherical latitude-longitude grids on CPU or GPU (CUDA), fitting real seafloor topography as immersed boundaries.
 - **Hydrodynamic Model (`--model`)**: Assembles hydrostatic free-surface primitive equation models with TEOS-10 equation of state, Coriolis accelerations, tidal body forcing, atmospheric fluxes, and open boundary sponge relaxation.
-- **Climate Perturbation (`--climate`)**: Optional thermal stratification adjustment representing projected marine heatwaves.
 - **Numerical Simulation (`--sim`)**: Advances baroclinic and barotropic modes adaptively, logging Courant numbers and streaming flow snapshots to Zarr.
 
 ## Running
@@ -20,50 +19,22 @@ julia --project=. GeoOceanModelRun.jl --all --config=scotian_shelf
 julia --project=. GeoOceanModelRun.jl --grid --config=scotian_shelf
 ```
 
-Segment flags (`--data`, `--grid`, `--model`, `--climate`, `--sim`, `--all`) execute a designated stage and its prerequisites.
+Segment flags (`--data`, `--grid`, `--model`, `--sim`, `--all`) execute a designated stage and its prerequisites.
 
 ## Grid Architecture & Coordinate Systems
 
-Computational grids are constructed via [`build_shelf_grid`](file:///c:/home/jae/projects/GeoOceanModel/src/data/grid_bathymetry.jl#L22), supporting two coordinate topologies:
+Computational grids are constructed via [`build_shelf_grid`](file:///c:/home/jae/projects/GeoOceanModel/src/data/grid_bathymetry.jl#L22) as a single coordinate topology:
 
-- **Standard Geographic Grid (`orientation = "standard"`)**:
+- **Standard Geographic Grid**:
   - *Conceptual Overview*: A conventional rectangular box aligned north-south and east-west along lines of latitude and longitude. Ideal for localized domains (e.g. Cape Breton demonstration) where the coast is relatively straight or aligned with cardinal directions.
   - *Technical Formulation*: Regular spherical `LatitudeLongitudeGrid` bounded by `[domain]` limits `lon_min`, `lon_max`, `lat_min`, `lat_max`.
-
-- **Rotated Orthogonal Curvilinear Grid (`orientation = "rotated"`)**:
-  - *Conceptual Overview*: The Atlantic Canadian continental margin runs diagonally from southwest to northeast (roughly $50^\circ$ clockwise from North). A standard north-south box simulating this region must include vast areas of deep abyssal ocean to the south and dry mainland Canada to the north, wasting substantial computing power. By rotating the computational coordinate frame parallel to the coastline and shelf edge, the simulation aligns with the natural geography, covering the entire habitat corridor from Georges Bank to Cabot Strait with roughly 60% fewer horizontal grid cells.
-  - *Technical Formulation*: Orthogonal curvilinear `RotatedLatitudeLongitudeGrid` constructed on an unrotated sphere whose North Pole has been repositioned so that the equator aligns with the target shelf strike azimuth $\theta = 50.0^\circ$. Centered at $(\lambda_0, \phi_0) = (-63.0^\circ\text{E}, 44.0^\circ\text{N})$ with along-shelf extent $L_\xi = 850.0\,\text{km}$ and cross-shelf extent $L_\eta = 220.0\,\text{km}$, discretized into $Nx = 220 \times Ny = 65 = 14,300$ horizontal cells (versus $240 \times 150 = 36,000$ cells for an unrotated bounding box).
-
-### Euler Pole Derivation (Specialist Details)
-
-For rotated grids, the geographic coordinates of the rotated North Pole $(\lambda_p, \phi_p)$ are derived in [`compute_rotated_pole`](file:///c:/home/jae/projects/GeoOceanModel/src/data/grid_bathymetry.jl#L142).
-
-Let $(\lambda_0, \phi_0)$ be the domain center in spherical coordinates and $\theta$ be the shelf strike azimuth measured clockwise from true North. The orthonormal local geographic tangent unit vectors are:
-
-$$\hat{e}_E = [-\sin\lambda_0, \cos\lambda_0, 0]^T, \quad \hat{e}_N = [-\sin\phi_0\cos\lambda_0, -\sin\phi_0\sin\lambda_0, \cos\phi_0]^T$$
-
-The along-shelf tangent vector directed toward azimuth $\theta$ is:
-
-$$\hat{e}_\xi = \sin\theta\,\hat{e}_E + \cos\theta\,\hat{e}_N$$
-
-The orthogonal cross-shelf normal vector directed into the open ocean is:
-
-$$\hat{e}_\eta = \cos\theta\,\hat{e}_E - \sin\theta\,\hat{e}_N$$
-
-The Euler rotation pole vector $\mathbf{P} = [P_x, P_y, P_z]^T$ defining the axis of the rotated sphere is the right-handed unit normal $\mathbf{P} = \hat{e}_\xi \times \hat{e}_\eta$, yielding:
-
-$$\lambda_p = \operatorname{atan2}(P_y, P_x), \quad \phi_p = \operatorname{asin}(P_z)$$
-
-Given mean Earth radius $R = 6,371\,\text{km}$, the unrotated angular coordinate half-widths $(\Delta \lambda', \Delta \phi')$ centered on the rotated equator ($\phi' = 0$) are:
-
-$$\Delta \lambda' = \frac{L_\xi}{2 R}, \quad \Delta \phi' = \frac{L_\eta}{2 R}$$
 
 ### Advection Formulations
 
 - *Conceptual Overview*: When grid lines follow curved paths rather than straight meridians, fluid moving across the grid experiences geometric coordinate curvature. The numerical equations must account for this curvature so that ocean currents do not artificially gain or lose energy.
-- *Technical Formulation*: The Oceananigans hydrostatic free-surface solver requires `VectorInvariant()` momentum advection on curvilinear grids. This formulation discretizes the advection term as $\boldsymbol{u} \cdot \nabla \boldsymbol{u} = \boldsymbol{\omega} \times \boldsymbol{u} + \frac{1}{2}\nabla|\boldsymbol{u}|^2$, computing relative vorticity $\boldsymbol{\omega} = \nabla \times \boldsymbol{u}$ directly on cell vertices without Christoffel symbol singularities. The model automatically switches momentum advection to `VectorInvariant()` on `OrthogonalSphericalShellGrid` instances, while preserving fifth-order `WENO()` advection for active temperature and salinity tracers.
+- *Technical Formulation*: The Oceananigans hydrostatic free-surface solver uses fifth-order `WENO()` advection for momentum and for the active temperature and salinity tracers. On a spherical grid the metric terms that carry the curvature are part of the grid itself, so the conservative form of the momentum equation is advected directly.
 
-## Lateral Boundary Relaxation & Curvilinear Sponge Architecture
+## Lateral Boundary Relaxation & Sponge Architecture
 
 ### Conceptual Overview (Generalists)
 
@@ -73,59 +44,41 @@ Regional ocean models simulate a localized section of the ocean rather than the 
 
 To achieve this, the model applies a peripheral buffer zone known as a sponge layer (Price & Aumont 2011). Inside this sponge band, prognostic variables are nudged toward external boundary states with a damping weight $\gamma$ that increases quadratically from $\gamma = 0$ in the interior to $\gamma = 1$ at the boundary.
 
-On a standard geographic grid aligned with lines of latitude and longitude, a sponge layer is specified using simple bounding coordinates (`lat_min`, `lat_max`, `lon_min`, `lon_max`). However, when the computational domain is rotated by $50^\circ$ to follow the Scotian Shelf margin, lines of constant geographic latitude intersect the domain diagonally. Using geographic bounding boxes on a rotated domain truncates sponge damping across roughly 95% of the southern boundary, leaving the open shelf break exposed to wave reflection while concentrating damping into a narrow corner triangle. The resulting shear discontinuity causes numerical divergence within hours.
-
-[`RotatedSpongeMask`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl) resolves this issue by rotating geographic coordinates $(\lambda, \phi)$ back into curvilinear coordinates $(\lambda', \phi')$ before evaluating the quadratic damping function. This aligns the sponge layer with the true curvilinear perimeter of the grid, providing uniform, seamless boundary damping across all designated open boundaries.
+On a geographic grid aligned with lines of latitude and longitude, the sponge band is specified with simple bounding coordinates (`lat_min`, `lat_max`, `lon_min`, `lon_max`). [`CartesianSpongeMask`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl) evaluates the quadratic damping function in those coordinates, which is exactly the grid the model runs on.
 
 ### Mathematical Formulation & Numerical Implementation (Specialists)
 
-#### Inverse Spherical Euler Rotation
-
-Let $(\lambda_p, \phi_p)$ denote the geographic coordinates of the rotated North Pole, and let $\phi_p^* = \frac{\pi}{2} - \phi_p$ be the co-latitude rotation angle. For an arbitrary grid face or center point with geographic longitude $\lambda$ and latitude $\phi$, the corresponding unit Cartesian vector in the Earth-centered inertial frame is:
-
-$$\mathbf{x} = \begin{bmatrix} \cos\phi \cos\lambda \\ \cos\phi \sin\lambda \\ \sin\phi \end{bmatrix}$$
-
-The transformation to rotated curvilinear coordinates $(\lambda', \phi')$ proceeds through two successive rotations:
-- A rotation by angle $\lambda_p$ about the $Z$-axis:
-  $$\mathbf{x}_1 = \begin{bmatrix} \cos\lambda_p & \sin\lambda_p & 0 \\ -\sin\lambda_p & \cos\lambda_p & 0 \\ 0 & 0 & 1 \end{bmatrix} \mathbf{x}$$
-- A rotation by angle $\phi_p^*$ about the $Y$-axis:
-  $$\mathbf{x}' = \begin{bmatrix} \cos\phi_p^* & 0 & -\sin\phi_p^* \\ 0 & 1 & 0 \\ \sin\phi_p^* & 0 & \cos\phi_p^* \end{bmatrix} \mathbf{x}_1$$
-
-The curvilinear coordinates $(\lambda', \phi')$ are then recovered via:
-
-$$\lambda' = \operatorname{atan2}(x'_y, x'_x), \quad \phi' = \arcsin(x'_z)$$
-
 #### Quadratic Sponge Damping
 
-The quadratic sponge weight $\gamma \in [0, 1]$ is computed natively in rotated coordinates $(\lambda', \phi')$. For an active southern boundary with lower coordinate limit $\phi'_{\min}$ and sponge layer width $L_s$:
+The quadratic sponge weight $\gamma \in [0, 1]$ is computed in geographic coordinates $(\lambda, \phi)$. For an active southern boundary with lower coordinate limit $\phi_{\min}$ and sponge layer width $L_s$:
 
-$$\gamma_s(\phi') = \begin{cases}
-1, & \phi' \le \phi'_{\min} \\
-\left(\frac{\phi'_{\min} + L_s - \phi'}{L_s}\right)^2, & \phi'_{\min} < \phi' < \phi'_{\min} + L_s \\
-0, & \phi' \ge \phi'_{\min} + L_s
+$$\gamma_s(\phi) = \begin{cases}
+1, & \phi \le \phi_{\min} \\
+\left(\frac{\phi_{\min} + L_s - \phi}{L_s}\right)^2, & \phi_{\min} < \phi < \phi_{\min} + L_s \\
+0, & \phi \ge \phi_{\min} + L_s
 \end{cases}$$
 
-Similarly, for an active eastern boundary with upper coordinate limit $\lambda'_{\max}$:
+Similarly, for an active eastern boundary with upper coordinate limit $\lambda_{\max}$:
 
-$$\gamma_e(\lambda') = \begin{cases}
-1, & \lambda' \ge \lambda'_{\max} \\
-\left(\frac{\lambda' - (\lambda'_{\max} - L_s)}{L_s}\right)^2, & \lambda'_{\max} - L_s < \lambda' < \lambda'_{\max} \\
-0, & \lambda' \le \lambda'_{\max} - L_s
+$$\gamma_e(\lambda) = \begin{cases}
+1, & \lambda \ge \lambda_{\max} \\
+\left(\frac{\lambda - (\lambda_{\max} - L_s)}{L_s}\right)^2, & \lambda_{\max} - L_s < \lambda < \lambda_{\max} \\
+0, & \lambda \le \lambda_{\max} - L_s
 \end{cases}$$
 
 The composite lateral mask combines all active boundary contributions:
 
-$$\gamma(\lambda', \phi') = \max\left(\gamma_e(\lambda'), \gamma_w(\lambda'), \gamma_n(\phi'), \gamma_s(\phi')\right)$$
+$$\gamma(\lambda, \phi) = \max\left(\gamma_e(\lambda), \gamma_w(\lambda), \gamma_n(\phi), \gamma_s(\phi)\right)$$
 
 In Oceananigans, lateral relaxation is introduced as a tendency term:
 
-$$\mathcal{F}_\psi = -\frac{\gamma(\lambda', \phi')}{\tau_{\text{relax}}} \left(\psi - \psi_{\text{target}}\right)$$
+$$\mathcal{F}_\psi = -\frac{\gamma(\lambda, \phi)}{\tau_{\text{relax}}} \left(\psi - \psi_{\text{target}}\right)$$
 
 where $\psi \in \{u, v, T, S\}$ and $\tau_{\text{relax}}$ is the relaxation timescale (default 3600 seconds).
 
 #### GPU Device Kernel Lowering
 
-Passing closures that capture heap-allocated objects or variables of abstract type prevents CUDA LLVM IR generation. Both [`CartesianSpongeMask`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl) and [`RotatedSpongeMask`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl) are declared as concrete, immutable `isbits` structs with precomputed trigonometric constants ($\cos\lambda_p, \sin\lambda_p, \cos\phi_p^*, \sin\phi_p^*$). With `Adapt.adapt_structure(to, s) = s`, the functors lower into device registers and execute inline without GPU scalar indexing or memory allocation.
+Passing closures that capture heap-allocated objects or variables of abstract type prevents CUDA LLVM IR generation. [`CartesianSpongeMask`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl) is declared as a concrete, immutable `isbits` struct. With `Adapt.adapt_structure(to, s) = s`, the functor lowers into device registers and executes inline without GPU scalar indexing or memory allocation.
 
 #### Barotropic Wave Stability & Substepping
 
@@ -166,7 +119,7 @@ In [`src/config/conversion.jl`](file:///c:/home/jae/projects/GeoOceanModel/src/c
 
 Seafloor topography is ingested from high-resolution bathymetric soundings and mapped to the computational grid via [`build_immersed_grid_from_real_data`](file:///c:/home/jae/projects/GeoOceanModel/src/data/grid_bathymetry.jl#L484):
 
-- **Curvilinear 2D Bilinear Regridding**: For rotated grids, cell centers $(\lambda_{i,j}, \phi_{i,j})$ form an unstructured non-Cartesian coordinate matrix. Topography is interpolated using optimized 2D bilinear interpolation (`_regrid_curvilinear_2d`) evaluated on CPU before GPU array transfer, eliminating host-device scalar indexing stalls.
+- **Bilinear Regridding**: Cell centres lie on a longitude-latitude lattice, so topography is interpolated with a bilinear (`regrid_2d_field`) remap onto the grid's interior centres, evaluated on CPU before GPU array transfer.
 - **Topographic Smoothing & Floors**: Bathymetry is clamped by minimum water depth $H_{\min} = \text{inshore\_depth}$ ($20.0\,\text{m}$) and maximum depth $H_{\max}$ ($1,500\,\text{m}$ or domain depth). Bounding maximum depth constrains the maximum barotropic gravity wave speed $c = \sqrt{g H_{\max}} \le 121\,\text{m/s}$, ensuring stable split-explicit free-surface subcycling.
 - **Hypertidal Masking**: Optional masking of the upper Bay of Fundy (`mask_bay_of_fundy = true`) sets hypertidal shallows to solid land, dampening non-linear tidal resonance and spurious vertical velocity spikes ($> 1\,\text{m/s}$) outside snow crab habitat.
 
@@ -195,10 +148,8 @@ Configuration files are consolidated in [`configs/`](file:///c:/home/jae/project
 
 | Configuration | Grid Type | Resolution / Size | Primary Data Sources | Purpose |
 |---|---|---|---|---|
-| [`scotian_shelf.toml`](file:///c:/home/jae/projects/GeoOceanModel/configs/scotian_shelf.toml) | Rotated ($50^\circ$) | $220 \times 65 \times 12$ ($350\,\text{m}$ floor) | NWA soundings, GLORYS12V1, ERA5 | Snow Crab production run along the Scotian Shelf margin |
-| [`default.toml`](file:///c:/home/jae/projects/GeoOceanModel/configs/default.toml) | Standard | $50 \times 50 \times 8$ ($1500\,\text{m}$ floor) | ETOPO2022, WOA23, Open-Meteo | Lightweight keyless Cape Breton demonstration |
-| [`eastern_scotian_shelf.toml`](file:///c:/home/jae/projects/GeoOceanModel/configs/eastern_scotian_shelf.toml) | Standard | $140 \times 100 \times 12$ | NWA soundings, GLORYS12V1, ERA5 | High-resolution regional Eastern Scotian Shelf domain |
-| [`western_scotian_shelf.toml`](file:///c:/home/jae/projects/GeoOceanModel/configs/western_scotian_shelf.toml) | Standard | $100 \times 70 \times 9$ | NWA soundings, GLORYS12V1, ERA5 | Regional Western Scotian Shelf / Browns Bank domain |
+| [`scotian_shelf.toml`](file:///c:/home/jae/projects/GeoOceanModel/configs/scotian_shelf.toml) | Standard | $400 \times 120 \times 16$ ($400\,\text{m}$ floor) | NWA soundings, GLORYS12V1, ERA5 | Snow Crab production run along the Scotian Shelf margin |
+| [`default.toml`](file:///c:/home/jae/projects/GeoOceanModel/configs/default.toml) | Standard | $32 \times 38 \times 8$ ($1500\,\text{m}$ floor) | ETOPO2022, WOA23, Open-Meteo | Lightweight keyless Cape Breton demonstration |
 
 ### Shared Lakehouse Configuration
 
@@ -218,13 +169,13 @@ GeoData.set_lakehouse_dir!("/path/to/shared/lakehouse")
 
 Simulations produce a directory-based Zarr archive `hydrodynamics.zarr`:
 - **Variables**: Three-dimensional prognostic fields $u, v, w, T, S$ at each output cadence interval (`output_schedule_seconds`).
-- **Coordinate Attributes**: Stored in root metadata (`.zattrs`) and `time.json`, capturing 2D curvilinear cell centres $(\lambda_{i,j}, \phi_{i,j})$ or 1D coordinates, alongside vertical layer centres and timestamps.
+- **Coordinate Attributes**: Stored in root metadata (`.zattrs`) and `time.json`, capturing the 1-D longitude and latitude cell centres alongside vertical layer centres and timestamps.
 - **State Checkpoints**: Oceananigans JLD2 state checkpoints enable seamless auto-restart from intermediate timesteps.
 
 ## Interactive Notebooks
 
 Pluto interactive documentation and inspection notebooks are located in [`notebooks/`](file:///c:/home/jae/projects/GeoOceanModel/notebooks):
-- [`notebooks/scotian_shelf.jl`](file:///c:/home/jae/projects/GeoOceanModel/notebooks/scotian_shelf.jl): Rotated curvilinear production domain, bathymetric filtering, and full hydrodynamics.
+- [`notebooks/scotian_shelf.jl`](file:///c:/home/jae/projects/GeoOceanModel/notebooks/scotian_shelf.jl): Production domain, bathymetric filtering, and full hydrodynamics.
 - [`notebooks/default.jl`](file:///c:/home/jae/projects/GeoOceanModel/notebooks/default.jl): Keyless demonstration domain.
 
 Run notebooks via:

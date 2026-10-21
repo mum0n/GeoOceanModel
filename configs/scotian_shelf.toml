@@ -15,34 +15,25 @@ lon_min = -68.0               # Western boundary longitude (°E)
 lon_max = -56.5               # Eastern boundary longitude (°E)
 lat_min = 43.0                # Southern boundary latitude (°N, aligned to shelf slope margin)
 lat_max = 47.5                # Northern boundary latitude (°N)
-z_min = -350.0                # Maximum shelf bathymetric depth (m, epipelagic & mesopelagic zone)
-z_max = 0.0                   # Free surface elevation (m)
-buffer_km = 50.0              # Boundary buffer margin in kilometres
+z_min = -350.0                # Maximum shelf bathymetric depth (m, epipelagic & mesopelagic zone).
+                               # Ignored when [grid] depths is given: the deepest face is the
+                               # floor of the column, and these depths end at 400 m.
+z_max = 0.0                   # Free surface elevation (m). Ignored when [grid] depths is
+                               # given: the first face is the surface.
+buffer_km = 50.0              # The margin beyond the study area (km). The lateral sponge
+                               # band is this margin: the model relaxes toward the prescribed
+                               # ocean across it, so the band is derived from it (about 0.45).
 
 [grid]
-# Grid orientation: "standard" (geographic box) or "rotated" (orthogonal curvilinear)
-# Oriented at 50° azimuth aligns with the shelf slope, covering Georges Bank to
-# Cabot Strait with roughly half the horizontal cells of a geographic bounding box.
-orientation = "rotated"
-rotation_azimuth = 50.0           # Grid azimuth along shelf strike (° clockwise from North)
-center_lon = -63.0                # Shelf central longitude (°E)
-center_lat = 44.0                 # Shelf central latitude (°N)
-along_shelf_extent_km = 850.0     # Domain extent along continental margin (km)
-cross_shelf_extent_km = 220.0     # Domain extent perpendicular to shelf slope (km)
-nx = 400                          # Along-shelf grid cell count (Δx ≈ 2.1 km)
-ny = 120                          # Cross-shelf grid cell count (Δx ≈ 1.8 km)
-nz = 16                           # Vertical layer count
-vertical_stretching_mode = "oceananigans" # Coordinate stretching mode
-nz_above = 0                      # Layers allocated to upper shelf stratum
-vertical_break_depth = 350.0      # Shelf-slope break depth (m, positive downward)
-vertical_grid_file = ""           # Optional CSV specifying vertical faces
-# Explicit vertical layer face depths from 0 m down to the shelf floor (350 m).
-# Surface-refined: the top 100 m is resolved in 5-20 m steps, which is the band the
-# zoeal stages occupy and where the CIL sits. Below 100 m the layers coarsen, since
-# the deeper water moves slowly and carries less of the larval signal.
+nx = 432
+ny = 250
+nz = 16
+vertical_stretching_mode = "oceananigans"
+nz_above = 0
+vertical_break_depth = 350.0
+vertical_grid_file = ""
 depths = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 125.0, 150.0, 175.0, 200.0, 225.0, 250.0, 275.0, 300.0, 350.0, 400.0]
 
-[bathymetry]
 # Real shelf topography and geometry controls
 inshore_depth = 20.0              # Water depth at inshore boundary (m, positive downward)
 shelf_slope = 180.0               # Total shelf relief / rise across shelf (m; break - inshore = 180 m)
@@ -67,9 +58,11 @@ bulk_heat_flux = true         # Compute dynamic air-sea heat fluxes
 method = "relaxation"         # Lateral boundary relaxation
 obc_type = "flather_chapman"  # Radiation boundary formulation
 ocean_boundary_source = "glorys12v1" # Target tracer and velocity state from GLORYS12V1
-sponge_layer_width = 0.45     # Increased from 0.25 to 0.45 (~50 km)
+# The sponge band's width is [domain] buffer_km: the band the model relaxes
+# toward the prescribed ocean lives in the margin beyond the study area, so
+# it is the same quantity, and the band in degrees is derived from it.
 sponge_timescale_seconds = 3600.0 # Robust 1-hour sponge relaxation timescale
-active_boundaries = ["east"] # Upstream along-shelf inflow boundary (Nova Scotia Current)
+active_boundaries = ["east","south"] # Upstream along-shelf inflow boundary (Nova Scotia Current)
 u_inflow = -0.10              # Southwestward Labrador / Nova Scotia Current (m/s)
 v_inflow = 0.0                # Zero cross-isobath inflow (m/s)
 
@@ -102,11 +95,6 @@ tidal_v_amp = 0.0               # Unused with tpxo9 source
 s2_u_amp = 0.0                  # Unused with tpxo9 source
 s2_v_amp = 0.0                  # Unused with tpxo9 source
 
-[climate]
-# Climate scenario configuration
-scenario = "climatology"      # "climatology" for verified historical run
-projection_year = 2022        # Target simulation year
-
 [hydrodynamics]
 # Numerical solver controls and adaptive stepping
 #
@@ -119,11 +107,11 @@ projection_year = 2022        # Target simulation year
 # resolves mesoscale structure and the spring/neap cycle; a multi-year integration at
 # 2 km is a multi-week compute job and is better launched as a checkpointed run than
 # held in a single session.
-# sim_duration_hours = 168.0      # 7-day integration: two spring/neap cycles
-sim_duration_hours = 13140.0      # 1.5 yr production run
+sim_duration_hours = 168.0      # 7-day integration: two spring/neap cycles
+# sim_duration_hours = 13140.0      # 1.5 yr production run
 sim_dt_seconds = 30.0          # Baseline time step in seconds
-min_dt_seconds = 1.0          # Minimum adaptive time step floor (seconds)
-max_dt_seconds = 120.0         # Maximum adaptive time step ceiling (barotropic-CFL safe at 2 km)
+min_dt_seconds = 10.0          # Minimum adaptive time step floor (seconds)
+max_dt_seconds = 240.0         # Maximum adaptive time step ceiling (barotropic-CFL safe at 2 km)
 adaptive_cfl = true           # Modulate dt according to advective and wave CFL
 target_cfl = 0.2             # Target advective CFL limit (increased from 0.08 for stability)
 target_wave_cfl = 0.2        # Target barotropic gravity wave CFL limit (increased from 0.08 for stability)
@@ -131,7 +119,8 @@ surface_heat_flux = 50.0      # Baseline sensible heat flux (W/m^2)
 sst_damping_coefficient = 40.0 # Haney SST relaxation (W m-2 K-1)
 max_current_speed = 2.0       # Current velocity ceiling in m/s (reduced from 3.0 for stability)
 max_flow_snapshots = 400      # Snapshot memory retention limit
-spinup_hours = 12.0           # Spinup before saving outputs (12 hours)
+spinup_hours = 24.0           # 1 month Spinup before saving outputs (12 hours)
+# spinup_hours = 720.0           # 1 month Spinup before saving outputs (12 hours)
 allow_analytical_fallback = false # Fail loudly if real inputs unavailable
 hydro_model_file = ""         # Hydrodynamic model checkpoint
 reuse_hydro = false           # Reuse existing flow fields if present

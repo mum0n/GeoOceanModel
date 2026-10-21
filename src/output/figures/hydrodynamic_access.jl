@@ -94,10 +94,11 @@ Compute derived physical oceanographic diagnostics:
 - Turbulent vertical eddy diffusivity \$\\\\\\\\\\\\\\kappa_v\$ and eddy viscosity \$\\\\\\\\\\\\\\nu_v\$.
 - Relative vertical vorticity \$\\\\\\\\\\\\\\zeta = \\\\\\\\\\\\\\partial v / \\\\\\\\\\\\\\partial x - \\\\\\\\\\\\\\partial u / \\\\\\\\\\\\\\partial y\$.
 
-Salinity (`sal`) is optional. The GeoData store carries u/v/w/T, which is what the output
-callback writes, so a store-backed call passes `nothing`; the density then degrades to its
-thermal term against the reference 35, and ∂S/∂z is 0.0. Neither is filled from a constant a
-run never produced, because such a value would read as observed.
+Salinity (`sal`) is optional. The output callback writes u/v/w/T/S, so a store-backed
+call has the model's own salinity; a record that carries no salinity passes `nothing`,
+and the density then degrades to its thermal term against the reference 35, and ∂S/∂z
+is 0.0. Neither is filled from a constant a run never produced, because such a value
+would read as observed.
 
 # Mixing provenance
 When `native_κ` / `native_ν` are supplied they are the model-published mixing fields and are
@@ -281,7 +282,7 @@ Read the authoritative seabed (metres, negative in the ocean) for a realized run
 
 `location` is the run's output *directory*, which holds the GeoData store -- the ocean
 half's deliverable, and the path `run_segment_simulation` hands back. The seabed is read
-from the store's own `.zattrs`, where `write_grid_metadata!` puts it because it is grid
+from the store's own `.zattrs`, where `run_metadata` puts it because it is grid
 metadata that does not vary with time.
 
 The immersed grid's `bottom_height` is the *actual* seabed the simulation ran on, so it is
@@ -295,12 +296,16 @@ is what a run now hands back.
 # Inputs
 - `location`: Path to the run's output directory (holding `hydrodynamics.zarr`), or to a
   simulation JLD2 file for older archives.
+- `expected_size`: The `(n_lon, n_lat)` shape the caller expects, when it knows it. The
+  seabed is stored flat with its shape, so this is only a cross-check; it also settles
+  the one case a shape alone cannot, a store whose seabed was nested the other way.
 
 # Outputs
 - `Matrix{Float64}`: Bottom height on the horizontal grid, indexed `[i_lon, j_lat]`;
   or `nothing` when neither the store nor the file carries an immersed grid.
 """
-function read_immersed_bathymetry(location::AbstractString)
+function read_immersed_bathymetry(location::AbstractString;
+                                   expected_size::Union{Nothing, Tuple{Int, Int}} = nothing)
     # Old archives: a JLD2 file, read from its serialized grid.
     isfile(location) && endswith(location, ".jld2") && return _read_immersed_bathymetry_jld2(location)
 
@@ -313,18 +318,57 @@ function read_immersed_bathymetry(location::AbstractString)
 
     try
         attrs = JSON3.read(read(zone, String))
-        haskey(attrs, "bottom_height") || return nothing
-        raw = attrs["bottom_height"]
-        n_lon = length(raw)
-        n_lat = isempty(raw) ? 0 : length(raw[1])
-        mat = Matrix{Float64}(undef, n_lon, n_lat)
-        for i in 1:n_lon, j in 1:n_lat
-            mat[i, j] = Float64(raw[i][j])
-        end
-        return mat
+        return _seabed_from_attrs(attrs; expected_size = expected_size)
     catch
         return nothing
     end
+end
+
+"""
+    _seabed_from_attrs(attrs; expected_size) -> Union{Matrix{Float64}, Nothing}
+
+The seabed out of a store's root attributes.
+
+Two forms are read. The one a run writes is flat -- the matrix's values in column-major
+order -- with the shape in `bottom_height_shape`; that is reshaped back to the matrix it
+was. A nested form is also accepted, as a list of rows, for a store written some other
+way. The two are told apart by whether the first element is a number.
+
+`expected_size` is a cross-check on the result, not a source of it: a seabed of the
+wrong shape is rejected rather than returned, because a figure that masks a model field
+against a mis-shaped seabed masks the wrong cells without any sign of it.
+"""
+function _seabed_from_attrs(attrs; expected_size::Union{Nothing, Tuple{Int, Int}} = nothing)
+    haskey(attrs, "bottom_height") || return nothing
+    raw = attrs["bottom_height"]
+    (isempty(raw) || raw === nothing) && return nothing
+
+    shape = haskey(attrs, "bottom_height_shape") ?
+        (Int(attrs["bottom_height_shape"][1]), Int(attrs["bottom_height_shape"][2])) : nothing
+
+    mat = if raw[1] isa Number
+        # Flat, column-major, with the shape alongside it.
+        isnothing(shape) && return nothing
+        length(raw) == prod(shape) || return nothing
+        reshape(Float64.(collect(raw)), shape[1], shape[2])
+    else
+        # Nested: read as a list of rows.
+        n_lon = length(raw)
+        n_lat = length(raw[1])
+        (n_lon == 0 || n_lat == 0) && return nothing
+        m = Matrix{Float64}(undef, n_lon, n_lat)
+        for i in 1:n_lon, j in 1:n_lat
+            m[i, j] = Float64(raw[i][j])
+        end
+        m
+    end
+
+    # A seabed of the wrong shape is worse than none: it is used to decide where the sea
+    # floor is, and a transposed one is still a plausible-looking matrix.
+    if !isnothing(expected_size) && size(mat) != expected_size
+        return nothing
+    end
+    return mat
 end
 
 """
@@ -405,6 +449,28 @@ function resolve_bathymetry_for_plot(lons, lats; sources = (), fallback = nothin
         return mat
     end
     return fallback
+end
+
+"""
+    field_or_nan(hydro, name::Symbol; ndim::Int = 3) -> AbstractArray
+
+A field of an extracted record as an array, with a field the record does not carry
+returned as all-NaN.
+
+NaN is the honest marker for "this record has no such field": every panel already
+renders it as no data, and it is not a value that can be mistaken for a measurement. A
+constant is not -- a flat 35 PSU, or a flat zero free surface, looks exactly like an
+observation, and a panel drawn from one shows a field the model never produced.
+
+The shape follows the record's own temperature field, so a missing field still lines up
+with the axes it would have had.
+"""
+function field_or_nan(hydro, name::Symbol; ndim::Int = 3)
+    v = hasproperty(hydro, name) ? getproperty(hydro, name) : nothing
+    v === nothing || return v
+    base = size(hydro.temperature)
+    shape = ndim == 2 ? (base[1], base[2]) : base
+    return fill(NaN, shape)
 end
 
 """
@@ -844,8 +910,9 @@ function extract_hydrodynamic_dataset(
         m_sel = clamp(resolve_time_index(times_s, time_seconds, time_index), 1, nt)
 
         # A field the store does not carry is `nothing` rather than a constant: the callback
-        # writes u/v/w/T, so salinity stays absent, and `compute_hydrodynamic_diagnostics`
-        # handles a missing salinity. A value fabricated here would read as observed.
+        # writes u/v/w/T/S, and a store written before that carries no salinity, which
+        # `compute_hydrodynamic_diagnostics` handles and the figures render as no data. A
+        # value fabricated here would read as observed.
         field(name) = haskey(ds.variables, name) ?
                       Array{Float64}(ds.variables[name].data[:, :, :, m_sel]) : nothing
         shape = (length(lons_s), length(lats_s), length(deps_s))
@@ -855,7 +922,11 @@ function extract_hydrodynamic_dataset(
         T_s = something(field("T"), fill(NaN, shape...))
         S_s = field("S")
 
-        bathymetry_s = read_immersed_bathymetry(hydro_input)
+        # The store's own seabed, on the store's own grid. The shape is known here, so a
+        # seabed that does not match it is rejected rather than used to mask the wrong
+        # cells.
+        bathymetry_s = read_immersed_bathymetry(
+            hydro_input; expected_size = (length(lons_s), length(lats_s)))
         diag = compute_hydrodynamic_diagnostics(lons_s, lats_s, deps_s, u_s, v_s, w_s, T_s, S_s)
         k_sel = resolve_depth_index(deps_s, depth, depth_level)
         sel_time = isempty(times_s) ? 0.0 :

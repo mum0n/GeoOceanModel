@@ -173,6 +173,8 @@ function animate_hydrodynamic_field(
 
     hm = heatmap!(ax, lons, lats, mat_obs, colormap = chosen_cmap)
     Colorbar(fig[1, 2], hm, label = unit_label)
+    xlims!(ax, domain_lon...)
+    ylims!(ax, domain_lat...)
 
     # Optional background bathymetry contours
     if !isnothing(bathymetry_data) && hasproperty(bathymetry_data, :elevation)
@@ -481,6 +483,12 @@ function animate_hydrodynamic_dashboard(
     ax4 = Axis(fig[3, 3], title = "Sea Surface Elevation η (cm) [Tides & Setup]", xlabel = "Lon (°E)", ylabel = "Lat (°N)")
     hm4 = heatmap!(ax4, lons, lats, elev_obs, colormap = :delta)
     Colorbar(fig[3, 4], hm4, label = "Elevation (cm)")
+
+    for ax in (ax1, ax2, ax4)
+        xlims!(ax, domain_lon...)
+        ylims!(ax, domain_lat...)
+    end
+    xlims!(ax3, domain_lon...)
 
     # 5. Record animation frames
     println("Recording 4-panel hydrodynamic dashboard ($(total_frames) frames @ $(framerate) fps)...")
