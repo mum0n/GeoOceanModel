@@ -46,6 +46,7 @@ using .Manifest
 using Oceananigans.Units
 using Oceananigans.Utils: prettytime
 using Oceananigans
+using GeoData
 using JSON3
 
 # ============================================================================

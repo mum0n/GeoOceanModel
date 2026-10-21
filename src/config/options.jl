@@ -179,11 +179,9 @@ struct HydrodynamicOptions
      checkpoint_prefix        :: String
      checkpoint_schedule      :: Float64
      output_schedule_seconds  :: Float64
+     progress_schedule_seconds :: Float64
      max_save_depth           :: Float64
      output_path              :: AbstractString
-     storage_backend          :: String
-     enable_zarr              :: Bool
-     zarr_path                :: String
      output_dir               :: String
      input_dir                :: String
     checkpoint_dir           :: String
@@ -382,10 +380,7 @@ function HydrodynamicOptions(;
     use_gpu               :: Bool = false,
     fallback_to_cpu       :: Bool = false,
     interactive_map       :: Bool = true,
-    enable_zarr         :: Bool = true,
-    zarr_path           :: AbstractString = joinpath("outputs", "particle_tracking.zarr"),
     output_path         :: AbstractString = joinpath("outputs", "particle_tracking.jld2"),
-    storage_backend     :: AbstractString = "zarr",
     config_file           :: AbstractString = find_default_config_path(),
     output_dir            :: AbstractString = "outputs",
     input_dir             :: AbstractString = "inputs",
@@ -398,6 +393,7 @@ function HydrodynamicOptions(;
     checkpoint_prefix     :: AbstractString = "",
     checkpoint_schedule   :: Real = 0.0,
     output_schedule_seconds :: Real = 21600.0,
+    progress_schedule_seconds :: Real = 1800.0,
     max_save_depth        :: Real = Inf,
     checkpoint_dir        :: AbstractString = "",
     checkpoint_cleanup    :: Bool = true,
@@ -533,11 +529,9 @@ function HydrodynamicOptions(;
         resolved_cp_prefix,
         Float64(checkpoint_schedule),
         Float64(output_schedule_seconds),
+        Float64(progress_schedule_seconds),
         Float64(max_save_depth),
         String(output_path),
-        String(storage_backend),
-        enable_zarr,
-        String(zarr_path),
         String(output_dir),
         String(input_dir),
         String(checkpoint_dir),
@@ -663,6 +657,5 @@ struct HydrodynamicConfig
        auto_restart             :: Bool
        use_gpu                  :: Bool
        fallback_to_cpu          :: Bool
-       storage_backend          :: String
-end
+  end
 

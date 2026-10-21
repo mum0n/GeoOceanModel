@@ -184,14 +184,17 @@ and validates its sections against the domain map, so a misspelled section is an
 rather than a silent default later.
 """
 function load_options(flag::AbstractString; overwrite::Bool = false)
-    cfg = load_configuration(resolve_config_file(flag))
+    cfg_path = resolve_config_file(flag)
+    cfg = load_configuration(cfg_path)
     if overwrite
         if !haskey(cfg, "storage")
             cfg["storage"] = Dict{String, Any}()
         end
         cfg["storage"]["overwrite"] = true
     end
-    return configuration_to_options(cfg)
+    # The configuration's own name is passed on: it is what names this run's directory in
+    # the lakehouse when the configuration does not name one itself.
+    return configuration_to_options(cfg; config_name = resolve_config_name(cfg_path))
 end
 
 """

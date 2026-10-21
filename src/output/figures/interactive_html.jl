@@ -361,6 +361,10 @@ function export_interactive_tracks_html(
 
         nz_h = length(h_depths)
         stride_h = max(1, round(Int, nx_h / 20))
+        # The surface layer: the level nearest z = 0. The store's depth axis runs
+        # deepest first, so index 1 is the deepest layer -- using it as "the surface"
+        # opened the map on the abyss while calling it the surface.
+        k_surface = argmin(abs.(h_depths))
         has_hydro_bathy = !isnothing(hydro_data.bathymetry) &&
                           ndims(hydro_data.bathymetry) == 2 &&
                           size(hydro_data.bathymetry) == (nx_h, ny_h)
@@ -391,7 +395,7 @@ function export_interactive_tracks_html(
 
                 v_item = """{"lon":$(lon_v),"lat":$(lat_v),"u":$(u_val),"v":$(v_val),"speed":$(spd_val),"dir":$(dir_deg),"w":$(w_val),"temp":$(t_val),"sal":$(s_val),"strat":$(strat_val),"diff":$(diff_val),"eta":$(eta_val),"depth":$(b_val)}"""
                 push!(vec_entries_k, v_item)
-                if k_idx == 1
+                if k_idx == k_surface
                     push!(h_vec_entries_surface, v_item)
                 end
             end
@@ -445,18 +449,18 @@ function export_interactive_tracks_html(
         b_max = isempty(valid_b) ? 0.0 : round(maximum(valid_b), digits=1)
 
         # Surface grids for backwards compatibility
-        t_min_s = isempty(filter(!isnan, hydro_data.temperature[:, :, 1])) ? 0.0 : round(minimum(filter(!isnan, hydro_data.temperature[:, :, 1])), digits=2)
-        t_max_s = isempty(filter(!isnan, hydro_data.temperature[:, :, 1])) ? 15.0 : round(maximum(filter(!isnan, hydro_data.temperature[:, :, 1])), digits=2)
-        s_min_s = isempty(filter(!isnan, hydro_data.salinity[:, :, 1])) ? 30.0 : round(minimum(filter(!isnan, hydro_data.salinity[:, :, 1])), digits=2)
-        s_max_s = isempty(filter(!isnan, hydro_data.salinity[:, :, 1])) ? 35.0 : round(maximum(filter(!isnan, hydro_data.salinity[:, :, 1])), digits=2)
-        spd_max_s = isempty(filter(!isnan, hydro_data.speed[:, :, 1] .* 100.0)) ? 25.0 : round(maximum(filter(!isnan, hydro_data.speed[:, :, 1] .* 100.0)), digits=1)
-        w_min_s = isempty(filter(!isnan, hydro_data.w[:, :, 1] .* 1000.0)) ? -0.5 : round(minimum(filter(!isnan, hydro_data.w[:, :, 1] .* 1000.0)), digits=2)
-        w_max_s = isempty(filter(!isnan, hydro_data.w[:, :, 1] .* 1000.0)) ? 0.5 : round(maximum(filter(!isnan, hydro_data.w[:, :, 1] .* 1000.0)), digits=2)
+        t_min_s = isempty(filter(!isnan, hydro_data.temperature[:, :, k_surface])) ? 0.0 : round(minimum(filter(!isnan, hydro_data.temperature[:, :, k_surface])), digits=2)
+        t_max_s = isempty(filter(!isnan, hydro_data.temperature[:, :, k_surface])) ? 15.0 : round(maximum(filter(!isnan, hydro_data.temperature[:, :, k_surface])), digits=2)
+        s_min_s = isempty(filter(!isnan, hydro_data.salinity[:, :, k_surface])) ? 30.0 : round(minimum(filter(!isnan, hydro_data.salinity[:, :, k_surface])), digits=2)
+        s_max_s = isempty(filter(!isnan, hydro_data.salinity[:, :, k_surface])) ? 35.5 : round(maximum(filter(!isnan, hydro_data.salinity[:, :, k_surface])), digits=2)
+        spd_max_s = isempty(filter(!isnan, hydro_data.speed[:, :, k_surface] .* 100.0)) ? 25.0 : round(maximum(filter(!isnan, hydro_data.speed[:, :, k_surface] .* 100.0)), digits=1)
+        w_min_s = isempty(filter(!isnan, hydro_data.w[:, :, k_surface] .* 1000.0)) ? -0.5 : round(minimum(filter(!isnan, hydro_data.w[:, :, k_surface] .* 1000.0)), digits=2)
+        w_max_s = isempty(filter(!isnan, hydro_data.w[:, :, k_surface] .* 1000.0)) ? 0.5 : round(maximum(filter(!isnan, hydro_data.w[:, :, k_surface] .* 1000.0)), digits=2)
 
-        temp_s_json = "[" * join(["[" * join([string(round(hydro_data.temperature[i, j, 1], digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
-        sal_s_json = "[" * join(["[" * join([string(round(hydro_data.salinity[i, j, 1], digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
-        spd_s_json = "[" * join(["[" * join([string(round(hydro_data.speed[i, j, 1] * 100.0, digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
-        w_s_json = "[" * join(["[" * join([string(round(hydro_data.w[i, j, 1] * 1000.0, digits = 3)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+        temp_s_json = "[" * join(["[" * join([string(round(hydro_data.temperature[i, j, k_surface], digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+        sal_s_json = "[" * join(["[" * join([string(round(hydro_data.salinity[i, j, k_surface], digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+        spd_s_json = "[" * join(["[" * join([string(round(hydro_data.speed[i, j, k_surface] * 100.0, digits = 2)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
+        w_s_json = "[" * join(["[" * join([string(round(hydro_data.w[i, j, k_surface] * 1000.0, digits = 3)) for j in 1:ny_h], ",") * "]" for i in 1:nx_h], ",") * "]"
 
         hydro_json = """{
             "lons": [$(join([string(round(x, digits=4)) for x in h_lons], ","))],

@@ -15,7 +15,7 @@ using GeoData
         hydrodynamics::Any;
         variable::Symbol = :speed,
         depth::Union{Nothing, Real} = nothing,
-        depth_level::Union{Nothing, Int} = 1,
+        depth_level::Union{Nothing, Int} = nothing,
         time_indices::Union{Nothing, AbstractVector{Int}} = nothing,
         time_seconds_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
         n_frames::Union{Nothing, Int} = nothing,
@@ -64,7 +64,7 @@ t_m = t_0 + m \\cdot \\Delta t_{\\text{frame}}, \\quad
   `:elevation` / `:eta` / `:ssh` (sea surface height η),
   `:w` (vertical velocity).
 - `depth`: Continuous target depth in meters (e.g. -2.5 for surface, -50.0 for CIL).
-- `depth_level`: Vertical discrete grid index (default: 1).
+- `depth_level`: Vertical discrete grid index (default: the surface layer).
 - `time_indices`: Optional vector of integer snapshot indices to animate.
 - `time_seconds_range`: Optional time window `(t_start, t_end)` in seconds.
 - `n_frames`: Optional maximum number of frames to render.
@@ -86,7 +86,7 @@ function animate_hydrodynamic_field(
     hydrodynamics::Any;
     variable::Symbol = :speed,
     depth::Union{Nothing, Real} = nothing,
-    depth_level::Union{Nothing, Int} = 1,
+    depth_level::Union{Nothing, Int} = nothing,
     time_indices::Union{Nothing, AbstractVector{Int}} = nothing,
     time_seconds_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
     n_frames::Union{Nothing, Int} = nothing,
@@ -310,7 +310,7 @@ end
     animate_hydrodynamic_dashboard(
         hydrodynamics::Any;
         depth::Union{Nothing, Real} = nothing,
-        depth_level::Union{Nothing, Int} = 1,
+        depth_level::Union{Nothing, Int} = nothing,
         time_indices::Union{Nothing, AbstractVector{Int}} = nothing,
         time_seconds_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
         n_frames::Union{Nothing, Int} = nothing,
@@ -335,7 +335,7 @@ Render a synchronized 4-panel hydrodynamic simulation dashboard animation:
 # Inputs
 - `hydrodynamics`: Model instance, JLD2 file, Zarr storage, or NamedTuple.
 - `depth`: Target depth in meters (default: -2.5 m).
-- `depth_level`: Vertical discrete index (default: 1).
+- `depth_level`: Vertical discrete index (default: the surface layer).
 - `time_indices`: Optional explicit vector of snapshot indices.
 - `time_seconds_range`: Optional time window `(t_start, t_end)` in seconds.
 - `n_frames`: Maximum number of animation frames.
@@ -354,7 +354,7 @@ Render a synchronized 4-panel hydrodynamic simulation dashboard animation:
 function animate_hydrodynamic_dashboard(
     hydrodynamics::Any;
     depth::Union{Nothing, Real} = nothing,
-    depth_level::Union{Nothing, Int} = 1,
+    depth_level::Union{Nothing, Int} = nothing,
     time_indices::Union{Nothing, AbstractVector{Int}} = nothing,
     time_seconds_range::Union{Nothing, Tuple{<:Real, <:Real}} = nothing,
     n_frames::Union{Nothing, Int} = nothing,

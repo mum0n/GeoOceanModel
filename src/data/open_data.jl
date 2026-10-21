@@ -488,7 +488,7 @@ function fetch_open_woa_climatology(;
     include_o2::Bool = true,
     verbose::Bool = true
 )
-    return fetch_woa23(;
+    return GeoDataSources.fetch_woa23(;
         lon_range = lon_range,
         lat_range = lat_range,
         month = month,

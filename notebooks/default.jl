@@ -28,7 +28,7 @@ end
 # ╠═╡
 # Activating the package directory from inside the notebook means Pluto's own environment never
 # needs this package, and `using GeoOceanModel` sees the working tree.
-Pkg.activate(@__DIR__)
+Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
 # ╔═╡ d5f4081b-0a63-4db5-9c2e-7d6f5b4e0f59
 # ╠═╡
@@ -313,24 +313,57 @@ over.
 """
 
 # ╔═╡ d0000001-0001-0001-0001-000000000006
-@bind reuse_saved_simulation PlutoUI.CheckBox(default = true)
+# ╠═╡
+md"""
+## Running the simulation
+
+This notebook **reads** a completed run; it does not integrate the model. The code that does
+the integration is shown here for the record, and is run from the command line:
+
+```bash
+julia --project=. GeoOceanModelRun.jl --config=$(opts.config_file) --all --overwrite
+```
+
+or, equivalently, from inside a Julia session with this package loaded:
+
+```julia
+import GeoOceanModel: run_segment_data, run_segment_grid, run_segment_model, run_segment_simulation
+opts  = GeoOceanModel.configuration_to_options("$(opts.config_file)")
+data  = run_segment_data(; opts = opts)
+grid  = run_segment_grid(; opts = opts)
+built = run_segment_model(; opts = opts, immersed_grid = grid.immersed_grid)
+res   = run_segment_simulation(; opts = opts, model = built.model)
+```
+
+`--overwrite` clears a previous store first; without it a re-run resumes from the checkpoint.
+The next cell loads whatever the store holds. If there is no store, it stops and says which
+command produces one — the decision to run a multi-hour integration belongs to you, not to a
+notebook cell.
+"""
 
 # ╔═╡ 1b1542d7-2c69-4e0c-9e48-9d8f7a6c2f70
 # ╠═╡
-import GeoOceanModel: run_segment_simulation, output_zarr_path
+import GeoOceanModel: output_zarr_path
+
+# The simulation is NOT run here. The code that runs it is shown above, for the record;
+# this cell only reads what a previous run left in the store. If the store is absent,
+# this cell stops and says so, rather than starting a run that would take hours.
 
 sim_res = begin
     expected_store = output_zarr_path(opts.output_dir)
-    store_exists = ispath(joinpath(expected_store, "time.json"))
-    if reuse_saved_simulation && store_exists
-        println("Reusing pre-computed hydrodynamic solution from: ", expected_store)
-        (output_path = opts.output_dir, model = built.model)
-    else
-        println("Running hydrodynamic model integration...")
-        res = run_segment_simulation(; opts = opts, model = built.model)
-        println("Simulation completed. Flow solution saved to: ", res.output_path)
-        res
+    store_exists = isdir(expected_store) && !isempty(readdir(expected_store))
+
+    if !store_exists
+        error(
+            "No hydrodynamic store at $(expected_store).\n" *
+            "This notebook reads a completed run; it does not run the model.\n" *
+            "To produce one, run either\n" *
+            "    julia --project=. GeoOceanModelRun.jl --config=$(opts.config_file) --all --overwrite\n" *
+            "from the package root, or uncomment the `run_segment_simulation` line in the cell above.")
     end
+
+    println("Reading hydrodynamic solution from: ", expected_store)
+    (output_path = opts.output_dir, model = built.model)
 end
 
 # ╔═╡ 2c2653e8-3d7a-4e1d-9a59-0e9f8b7d3a81
@@ -355,10 +388,10 @@ Three checks that mean "this is the real run and not the synthetic fallback":
 # ╔═╡ 3d3764f9-4e8b-4e2e-9b6a-1f0a9c8e4b92
 # ╠═╡
 import GeoOceanModel: extract_hydrodynamic_dataset, output_zarr_path
-using Zarr, JSON3
+using GeoData
 
 store_dir = output_zarr_path(sim_res.output_path)
-_times = Float64.(JSON3.read(read(joinpath(store_dir, "time.json"), String), Vector{Float64}))
+_times = Float64.(collect(GeoData.geoload(store_dir; backend = :zarr).coords[:time].data))
 
 println("store     : ", store_dir)
 println("intervals : ", length(_times), " (expected ", opts.sim_duration / opts.output_schedule_seconds + 1, ")")

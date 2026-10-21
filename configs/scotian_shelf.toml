@@ -29,16 +29,18 @@ center_lon = -63.0                # Shelf central longitude (°E)
 center_lat = 44.0                 # Shelf central latitude (°N)
 along_shelf_extent_km = 850.0     # Domain extent along continental margin (km)
 cross_shelf_extent_km = 220.0     # Domain extent perpendicular to shelf slope (km)
-nx = 220                          # Along-shelf grid cell count (down from 240)
-ny = 65                           # Cross-shelf grid cell count (down from 200; 60% cell reduction)
-nz = 13                           # Vertical layer count
+nx = 400                          # Along-shelf grid cell count (Δx ≈ 2.1 km)
+ny = 120                          # Cross-shelf grid cell count (Δx ≈ 1.8 km)
+nz = 16                           # Vertical layer count
 vertical_stretching_mode = "oceananigans" # Coordinate stretching mode
 nz_above = 0                      # Layers allocated to upper shelf stratum
-vertical_break_depth = 250.0      # Shelf-slope break depth (m, positive downward)
+vertical_break_depth = 350.0      # Shelf-slope break depth (m, positive downward)
 vertical_grid_file = ""           # Optional CSV specifying vertical faces
-# Explicit vertical layer face depths starting at 0.0 down to shelf floor (350 m)
-# Surface layer of 20m allows stable larger dt under wind stirring without violating vertical CFL
-depths = [0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 180.0, 200.0, 250.0, 300.0, 350.0]
+# Explicit vertical layer face depths from 0 m down to the shelf floor (350 m).
+# Surface-refined: the top 100 m is resolved in 5-20 m steps, which is the band the
+# zoeal stages occupy and where the CIL sits. Below 100 m the layers coarsen, since
+# the deeper water moves slowly and carries less of the larval signal.
+depths = [0.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 125.0, 150.0, 175.0, 200.0, 225.0, 250.0, 275.0, 300.0, 350.0, 400.0]
 
 [bathymetry]
 # Real shelf topography and geometry controls
@@ -107,10 +109,21 @@ projection_year = 2022        # Target simulation year
 
 [hydrodynamics]
 # Numerical solver controls and adaptive stepping
-sim_duration_hours = 13140.0       # 1.5yr simulation duration for tidal test
-sim_dt_seconds = 12.0          # Baseline time step in seconds
+#
+# The time step is bounded by the barotropic gravity wave, not by advection: with 45 split
+# substeps and CFL 0.1, a 2 km cell admits Δt ≈ 45 × 0.1 × 2000/58 ≈ 155 s. `max_dt` is
+# held at 120 s to stay under that, and the adaptive controller ramps up to it from
+# `sim_dt`.
+#
+# Duration is set for a run that completes end to end. The shelf at this resolution
+# resolves mesoscale structure and the spring/neap cycle; a multi-year integration at
+# 2 km is a multi-week compute job and is better launched as a checkpointed run than
+# held in a single session.
+# sim_duration_hours = 168.0      # 7-day integration: two spring/neap cycles
+sim_duration_hours = 13140.0      # 1.5 yr production run
+sim_dt_seconds = 30.0          # Baseline time step in seconds
 min_dt_seconds = 1.0          # Minimum adaptive time step floor (seconds)
-max_dt_seconds = 360.0          # Maximum adaptive time step ceiling (seconds)
+max_dt_seconds = 120.0         # Maximum adaptive time step ceiling (barotropic-CFL safe at 2 km)
 adaptive_cfl = true           # Modulate dt according to advective and wave CFL
 target_cfl = 0.2             # Target advective CFL limit (increased from 0.08 for stability)
 target_wave_cfl = 0.2        # Target barotropic gravity wave CFL limit (increased from 0.08 for stability)
@@ -118,7 +131,7 @@ surface_heat_flux = 50.0      # Baseline sensible heat flux (W/m^2)
 sst_damping_coefficient = 40.0 # Haney SST relaxation (W m-2 K-1)
 max_current_speed = 2.0       # Current velocity ceiling in m/s (reduced from 3.0 for stability)
 max_flow_snapshots = 400      # Snapshot memory retention limit
-spinup_hours = 24.0           # Spinup time before saving outputs (24 hours)
+spinup_hours = 12.0           # Spinup before saving outputs (12 hours)
 allow_analytical_fallback = false # Fail loudly if real inputs unavailable
 hydro_model_file = ""         # Hydrodynamic model checkpoint
 reuse_hydro = false           # Reuse existing flow fields if present
@@ -126,16 +139,20 @@ reuse_hydro = false           # Reuse existing flow fields if present
 
 [storage]
 # Output persistence and Lakehouse state archiving
+#
+# `output_dir` is the single place this run writes. Everything else is derived from it:
+#   <output_dir>/hydrodynamics.zarr  the 4-D field store (T, u, v, w, time)
+#   <output_dir>/checkpoints/         restart archives
+#   <output_dir>/inputs/              the ingested-data cache for this run
+# There is no separate path setting: a second path for the same store is a second
+# source of truth, and the two disagreeing is a silent data-loss bug.
 output_dir = "../lakehouse/GeoOceanModel/scotian_shelf" # Target Lakehouse directory
-output_schedule_seconds = 21600.0 # Field snapshot output frequency (6 hours for slowly-evolving background flow; tides reconstructed analytically or via TPXO9)
-max_save_depth = 400.0        # Subsample epipelagic/mesopelagic layers (0-400m) for larval drift, saving ~50% vertical array volume
-enable_zarr = true            # Persist 4D simulation tensor to Zarr
-zarr_path = "outputs/ocean_hydrodynamics.zarr" # Destination Zarr path
-storage_backend = "zarr"      # Backend ("zarr" or "geoparquet")
+output_schedule_seconds = 1800.0 # Field snapshot every 30 min: 337 intervals over 7 days, enough for the tidal cycle to animate
+progress_schedule_seconds = 900.0 # Progress report every 15 min of simulated time (time-based, so the cadence does not drift as Δt ramps)
+max_save_depth = 400.0        # Keep every level (the shelf is 350 m deep) for larval drift
 enable_checkpoint = true      # Enable state checkpointer
-checkpoint_dir = "../lakehouse/GeoOceanModel/scotian_shelf/checkpoints" # Checkpoint folder
 checkpoint_prefix = "scotian_shelf_checkpoint" # Checkpoint prefix
-checkpoint_schedule_seconds = 3600.0 # Checkpoint interval (1 hour)
+checkpoint_schedule_seconds = 1800.0 # Checkpoint interval (30 min: a restart loses at most half an hour)
 checkpoint_cleanup = true     # Automatically prune older checkpoints
 run_id = ""                   # Unique identifier
 

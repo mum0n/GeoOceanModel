@@ -8,21 +8,36 @@ structs, and back. `get_val` lives here because it is how a dict may be missing
 keys during conversion.
 """
 
+"""
+    _PROJECT_ROOT
+
+The root of this package -- the directory holding `src/`, `configs/` and `Project.toml`.
+
+Configured output paths are resolved against it, so a run started from any working
+directory writes to the same place.
+"""
+const _PROJECT_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
+
 
 """
-    configuration_to_options(config_dict::AbstractDict; overrides...) -> HydrodynamicOptions
+    configuration_to_options(config_dict::AbstractDict; config_name = "", overrides...) -> HydrodynamicOptions
 
 Convert a configuration dictionary into a validated `HydrodynamicOptions` instance,
 allowing optional keyword parameter overrides.
 
 # Inputs
 - `config_dict::AbstractDict`: Parsed configuration dictionary.
+- `config_name::AbstractString`: The configuration's own name, used to name its directory
+  in the lakehouse when the configuration names no output directory of its own. Empty
+  means "the caller did not say", and the name `default` is used.
 - `overrides...`: Additional keyword arguments to override dictionary entries.
 
 # Outputs
 - `HydrodynamicOptions`: Constructed runtime options instance.
 """
-function configuration_to_options(config_dict::AbstractDict; overrides...)
+function configuration_to_options(config_dict::AbstractDict;
+                                  config_name::AbstractString = "",
+                                  overrides...)
     # Helper to safely extract nested values with defaults
     function get_val(section::String, key::String, default_val)
         if haskey(config_dict, section) && haskey(config_dict[section], key)
@@ -170,10 +185,19 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     anim_overlay = Bool(get_val("visualization", "anim_overlay_particles", false))
      anim_out_path = String(get_val("visualization", "anim_output_path", ""))
 
-     output_path = String(get_val("storage", "output_path",
-                          get_val("storage", "output_dir", joinpath("outputs", "default"))))
-     zarr_path   = String(get_val("storage", "zarr_path", joinpath("outputs", "particle_tracking.zarr")))
-     storage_backend = String(get_val("storage", "storage_backend", "zarr"))
+     # The run's output directory: `output_path` is the name the configuration uses,
+     # `output_dir` is accepted as an alias.
+     _storage_output = String(get_val("storage", "output_path",
+                              get_val("storage", "output_dir", "")))
+     # Where a run writes when the configuration names no directory of its own: the
+     # lakehouse, under this configuration's own name. NOT a package-relative
+     # `outputs/default`, which put the run in the package root -- outside the lakehouse,
+     # where nothing collects it and no later run finds it. `lakehouse_dir` is the shared
+     # resolver, so the environment override, the local preference and the user
+     # configuration apply here as they do everywhere else.
+     _config_stem = isempty(strip(config_name)) ? "default" : strip(String(config_name))
+     _lakehouse_output = GeoData.lakehouse_dir("GeoOceanModel", _config_stem)
+     output_path = isempty(_storage_output) ? _lakehouse_output : _storage_output
      
      enable_checkpoint = Bool(get_val("storage", "enable_checkpoint", true))
      checkpoint_prefix = String(get_val("storage", "checkpoint_prefix", "checkpoint_ParticleTracking"))
@@ -190,7 +214,13 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
      # per scenario rather than once per machine -- and that is the intended trade, because it
      # makes each scenario a self-contained, shareable directory under
      # `lakehouse/GeoOceanModel/<name>/`.
-     output_dir = output_path
+     #
+     # The path is resolved against THIS PACKAGE'S ROOT, not the current working directory:
+     # a run started from anywhere then lands in the same place. The resolver also accepts
+     # the lakehouse either inside the project (`lakehouse/...`) or beside it
+     # (`../lakehouse/...`), so a config written for one layout still resolves in the other.
+     output_dir = isempty(_storage_output) ? _lakehouse_output :
+                  GeoData.project_lakehouse_path(output_path, _PROJECT_ROOT)
      input_dir  = joinpath(output_dir, "inputs")
      seed       = Int(get_val("runtype", "seed", get_val("paths", "seed", 42)))
 
@@ -209,6 +239,11 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
     # Field-output cadence, distinct from the checkpoint cadence. Read from [storage] rather
     # than hardcoded downstream, so the two can legitimately differ.
     out_sched = Float64(get_val("storage", "output_schedule_seconds", 21600.0))
+    # Progress-reporting cadence, in simulated seconds. Time-based rather than
+    # iteration-based: the adaptive time step ramps by more than two orders of
+    # magnitude over a run, so a fixed iteration count would report every couple of
+    # minutes at first and every few hours once the step has grown.
+    prog_sched = Float64(get_val("storage", "progress_schedule_seconds", 1800.0))
     max_save_d = Float64(get_val("storage", "max_save_depth", Inf))
      cp_dir    = String(get_val("storage", "checkpoint_dir",
                                 get_val("runtype", "checkpoint_dir",
@@ -379,10 +414,8 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         use_gpu = use_gpu,
         fallback_to_cpu = fallback_cpu,
          interactive_map = interactive,
-        zarr_path = zarr_path,
-        output_path = output_path,
-        storage_backend = storage_backend,
-        output_dir = output_dir,
+            output_path = output_path,
+            output_dir = output_dir,
         input_dir = input_dir,
         seed = seed,
         hydro_model_file = hydro_file,
@@ -393,6 +426,7 @@ function configuration_to_options(config_dict::AbstractDict; overrides...)
         checkpoint_prefix = cp_pfx_raw,
         checkpoint_schedule = cp_sched,
         output_schedule_seconds = out_sched,
+    progress_schedule_seconds = prog_sched,
         max_save_depth = max_save_d,
         checkpoint_dir = cp_dir,
         checkpoint_cleanup = cp_clean,
@@ -535,7 +569,11 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
             "hydro_model_file" => opts.hydro_model_file,
             "hydro_only" => opts.hydro_only,
             "track_only" => opts.track_only,
-            "reuse_hydro" => opts.reuse_hydro
+            "reuse_hydro" => opts.reuse_hydro,
+            # `spinup_hours` is read from the configuration and must survive the
+            # round-trip: a run writes this dictionary to `resolved_config.toml`, and a
+            # resume that reads it back would otherwise silently revert to the default.
+            "spinup_hours" => opts.spinup_hours
         ),
         "biology" => Dict{String, Any}(
             "n_particles" => opts.n_particles,
@@ -565,15 +603,16 @@ function options_to_configuration(opts::HydrodynamicOptions)::Dict{String, Any}
         ),
         "storage" => Dict{String, Any}(
             "output_dir" => opts.output_dir,
-            "enable_zarr" => opts.enable_zarr,
-            "zarr_path" => opts.zarr_path,
             "run_id" => opts.run_id,
             "enable_checkpoint" => opts.enable_checkpoint,
             "checkpoint_prefix" => opts.checkpoint_prefix,
             "checkpoint_schedule_seconds" => opts.checkpoint_schedule,
             "output_schedule_seconds" => opts.output_schedule_seconds,
+            "progress_schedule_seconds" => opts.progress_schedule_seconds,
             "checkpoint_dir" => opts.checkpoint_dir,
-            "checkpoint_cleanup" => opts.checkpoint_cleanup
+            "checkpoint_cleanup" => opts.checkpoint_cleanup,
+            # Read from `[storage]`, so it must be written back there.
+            "max_save_depth" => opts.max_save_depth
         ),
         "tessellation" => Dict{String, Any}(
             "enable_voronoi" => opts.enable_voronoi,
@@ -678,8 +717,8 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
          :coriolis_latitude        => 44.5,
          :divergence_limit         => 20.0,
          :output_path              => opts.output_path,
-         :storage_backend          => opts.storage_backend,
-         :output_schedule_seconds  => opts.output_schedule_seconds,
+              :output_schedule_seconds  => opts.output_schedule_seconds,
+    :progress_schedule_seconds => opts.progress_schedule_seconds,
          :enable_checkpoint        => opts.enable_checkpoint,
          :checkpoint_prefix        => opts.checkpoint_prefix,
          :checkpoint_schedule      => opts.checkpoint_schedule,
@@ -724,7 +763,8 @@ function to_hydrodynamic_config(opts::HydrodynamicOptions; kwargs...)::Hydrodyna
         Float64(d[:target_wave_cfl]), Float64(d[:max_dt_seconds]),
         Float64(d[:min_dt_seconds]), Float64(d[:coriolis_latitude]),
          Float64(d[:divergence_limit]), String(d[:output_path]),
-         String(d[:storage_backend]), Float64(d[:output_schedule_seconds]),
+         Float64(d[:output_schedule_seconds]),
+          Float64(d[:progress_schedule_seconds]),
          Bool(d[:enable_checkpoint]), String(d[:checkpoint_prefix]),
          String(d[:checkpoint_schedule]), String(d[:checkpoint_dir]),
          Bool(d[:checkpoint_cleanup]), Bool(d[:auto_restart]),

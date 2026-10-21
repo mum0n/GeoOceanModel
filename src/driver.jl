@@ -556,9 +556,24 @@ function run_segment_model(;
             # (~1.5 KB), which fits comfortably. The tidal field varies on scales of degrees and
             # the domain is ~18 deg across, so 3 deg spacing still resolves the 0.007 m/s southern
             # boundary from the 0.45 m/s Fundy -- the contrast that caused the original blowup.
+            #
+            # The spacing is derived from the DOMAIN, not fixed: a 6x4 grid over an 18 deg span
+            # is 3 deg spacing, but the same grid over a 60 deg span would be 10 deg -- too coarse
+            # to resolve a tidal wave. Target ~3 deg spacing, then clamp to the 6x4..12x8 envelope
+            # the GPU parameter memory allows. A run therefore resolves tides the same way
+            # whatever domain it was given.
+            _lon_span = abs(opts.domain_lon[2] - opts.domain_lon[1])
+            _lat_span = abs(opts.domain_lat[2] - opts.domain_lat[1])
+            _tidal_nx = clamp(ceil(Int, _lon_span / 3.0), 6, 12)
+            _tidal_ny = clamp(ceil(Int, _lat_span / 3.0), 4, 8)
+            if (_tidal_nx, _tidal_ny) != (6, 4)
+                println("  Tidal coefficient grid: $(_tidal_nx)×$(_tidal_ny) " *
+                        "(~$(round(_lon_span / _tidal_nx, digits=1))° × " *
+                        "$(round(_lat_span / _tidal_ny, digits=1))° spacing)")
+            end
             coeff = TidalCoefficientGrid(h, (opts.domain_lon[1], opts.domain_lon[2]),
                                          (opts.domain_lat[1], opts.domain_lat[2]);
-                                         nx = 6, ny = 4)
+                                         nx = _tidal_nx, ny = _tidal_ny)
             f = tidal_velocity_coefficients(coeff)
             edge = boundary_tidal_forcing(h; edges = (:east, :south, :west), sample_stride = 4)
             amps = vcat(edge[:east].uamp[1, :], edge[:south].uamp[1, :], edge[:west].uamp[1, :])
@@ -1156,7 +1171,7 @@ function run_segment_simulation(;
         enable_output = false,
         output_schedule = (opts.output_schedule_seconds > 0.0) ?
             opts.output_schedule_seconds : 21600.0,
-        progress_schedule = 100,
+        progress_schedule = opts.progress_schedule_seconds,
         enable_checkpoint = opts.enable_checkpoint,
         checkpoint_dir = cp_dir_target,
         checkpoint_prefix = opts.checkpoint_prefix,

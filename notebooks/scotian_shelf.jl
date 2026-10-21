@@ -35,7 +35,7 @@ end
 
 # stores the activate call, so re-opening it reproduces the same environment.
 
-Pkg.activate(@__DIR__)
+Pkg.activate(normpath(joinpath(@__DIR__, "..")))
 
 # ╔═╡ 5e2f7d09-4a16-4b83-9c1d-8b3e6f0a1d27
 
@@ -619,7 +619,19 @@ bg = grid_res.base_grid
 
 println("base grid: Nx ", bg.Nx, "  Ny ", bg.Ny, "  Nz ", bg.Nz)
 
-println("lon span : ", bg.λᶠᵃᵃ[1], "°E to ", bg.λᶠᵃᵃ[end], "°E")
+# The grid's coordinate fields are halo-padded OffsetArrays over CuArrays in a GPU run.
+# `Array` on such an array fails -- its plain axes do not match the offsets -- and indexing
+# one is scalar indexing, which the GPU refuses. Unwrapping the parent, moving it to the
+# host, and taking the values works for both a span and a count: neither needs the index
+# mapping, only the numbers.
+_host_values(a) = Array(parent(a))
+
+# A standard geographic grid carries 1-D longitude at its x-faces; a rotated orthogonal
+# shell grid carries geographic longitude as a 2-D cell field instead, so the span has to
+# come from the cell centres' extrema.
+_lon_host = _host_values(hasproperty(bg, :λᶠᵃᵃ) ? bg.λᶠᵃᵃ : bg.λᶜᶜᵃ)
+_lon_span = (Float64(minimum(_lon_host)), Float64(maximum(_lon_host)))
+println("lon span : ", _lon_span[1], "°E to ", _lon_span[2], "°E")
 
 println("haloes   : Hx ", grid_res.immersed_grid.Hx, "  Hy ", grid_res.immersed_grid.Hy)
 
@@ -631,11 +643,17 @@ println("immersed : ", hasproperty(grid_res.immersed_grid, :immersed_boundary))
 
 # `count` with a predicate nor broadcasting over it is allowed there.
 
-wet = count(x -> x < 0, bathy.elevation)
+# `_host_values` (defined above) unwraps the OffsetArray and moves the values to the host. A
 
-println("wet seabed: ", wet, " / ", length(bathy.elevation), " cells (",
+# count does not care about the index mapping, only the values.
 
-        round(100 * wet / length(bathy.elevation), digits = 1), "%)")
+_elev_host = _host_values(bathy.elevation)
+
+wet = count(x -> x < 0, _elev_host)
+
+println("wet seabed: ", wet, " / ", length(_elev_host), " cells (",
+
+        round(100 * wet / length(_elev_host), digits = 1), "%)")
 
 # ╔═╡ f560437f-0cb7-4e89-9e45-8a3b1c6d9e2a
 
@@ -820,24 +838,57 @@ Toggle whether to load pre-computed simulation outputs if present, or force re-r
 """
 
 # ╔═╡ b0000001-0001-0001-0001-000000000006
-@bind reuse_saved_simulation PlutoUI.CheckBox(default = true)
+# ╠═╡
+md"""
+## Running the simulation
+
+This notebook **reads** a completed run; it does not integrate the model. The code that does
+the integration is shown here for the record, and is run from the command line:
+
+```bash
+julia --project=. GeoOceanModelRun.jl --config=$(opts.config_file) --all --overwrite
+```
+
+or, equivalently, from inside a Julia session with this package loaded:
+
+```julia
+import GeoOceanModel: run_segment_data, run_segment_grid, run_segment_model, run_segment_simulation
+opts  = GeoOceanModel.configuration_to_options("$(opts.config_file)")
+data  = run_segment_data(; opts = opts)
+grid  = run_segment_grid(; opts = opts)
+built = run_segment_model(; opts = opts, immersed_grid = grid.immersed_grid)
+res   = run_segment_simulation(; opts = opts, model = built.model)
+```
+
+`--overwrite` clears a previous store first; without it a re-run resumes from the checkpoint.
+The next cell loads whatever the store holds. If there is no store, it stops and says which
+command produces one — the decision to run a multi-hour integration belongs to you, not to a
+notebook cell.
+"""
 
 # ╔═╡ 28937602-3f1b-4c23-9d34-bc60419d2e7a
 
-import GeoOceanModel: run_segment_simulation, output_zarr_path
+import GeoOceanModel: output_zarr_path
+
+# The simulation is NOT run here. The code that runs it is shown above, for the record;
+# this cell only reads what a previous run left in the store. If the store is absent,
+# this cell stops and says so, rather than starting a run that would take hours.
 
 sim_res = begin
     expected_store = output_zarr_path(opts.output_dir)
-    store_exists = ispath(joinpath(expected_store, "time.json"))
-    if reuse_saved_simulation && store_exists
-        println("Reusing pre-computed hydrodynamic solution from: ", expected_store)
-        (output_path = opts.output_dir, model = built.model)
-    else
-        println("Running hydrodynamic model integration...")
-        res = run_segment_simulation(; opts = opts, model = built.model)
-        println("Simulation completed. Flow solution saved to: ", res.output_path)
-        res
+    store_exists = isdir(expected_store) && !isempty(readdir(expected_store))
+
+    if !store_exists
+        error(
+            "No hydrodynamic store at $(expected_store).\n" *
+            "This notebook reads a completed run; it does not run the model.\n" *
+            "To produce one, run either\n" *
+            "    julia --project=. GeoOceanModelRun.jl --config=$(opts.config_file) --all --overwrite\n" *
+            "from the package root, or uncomment the `run_segment_simulation` line in the cell above.")
     end
+
+    println("Reading hydrodynamic solution from: ", expected_store)
+    (output_path = opts.output_dir, model = built.model)
 end
 
 # ╔═╡ 39348713-402c-4d34-9e45-cd71520e3f8b
@@ -876,11 +927,13 @@ Three checks that mean "this is the real run and not the synthetic fallback":
 
 import GeoOceanModel: extract_hydrodynamic_dataset, output_zarr_path
 
-using Zarr, JSON3
+using GeoData
 
 store_dir = output_zarr_path(sim_res.output_path)
 
-_times = Float64.(JSON3.read(read(joinpath(store_dir, "time.json"), String), Vector{Float64}))
+# The store's time axis is a Zarr array, not a side-car JSON file: the GeoData Zarr backend
+# keeps the coordinate in the group alongside the field variables.
+_times = Float64.(collect(GeoData.geoload(store_dir; backend = :zarr).coords[:time].data))
 
 println("store     : ", store_dir)
 

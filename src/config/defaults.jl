@@ -240,11 +240,10 @@ function get_default_configuration()::Dict{String, Any}
         ),
          "storage" => Dict{String, Any}(
              "output_path" => joinpath("outputs", "particle_tracking.jld2"),
-             "storage_backend" => "zarr",
-             "enable_checkpoint" => true,
+                      "enable_checkpoint" => true,
              "checkpoint_prefix" => "checkpoint_ParticleTracking",
              "checkpoint_schedule_seconds" => 21600.0,
-             "checkpoint_dir" => "outputs/checkpoints",
+             "checkpoint_dir" => "",
              "checkpoint_cleanup" => true
          ),
         "tessellation" => Dict{String, Any}(

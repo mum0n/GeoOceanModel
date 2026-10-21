@@ -20,7 +20,14 @@ import CairoMakie: record
     ) -> Int
 
 Resolve discrete vertical grid level index from either continuous depth in meters
-(positive or negative) or discrete index. Defaults to surface (index 1).
+(positive or negative) or discrete index.
+
+The store's depth axis is the model's own cell-centre order, which runs **deepest
+first**: level 1 is the deepest layer and the last level is the surface. So an
+explicit `depth_level` is an index into that axis, and the default -- no depth and no
+level -- is the *shallowest* level, the one nearest the free surface, not index 1.
+Resolving the default to index 1 drew the abyss in every figure that asked for the
+surface, and called it a surface figure.
 """
 function resolve_depth_index(
     depths::AbstractVector{<:Real},
@@ -35,7 +42,8 @@ function resolve_depth_index(
     elseif !isnothing(depth_level)
         return clamp(depth_level, 1, nz)
     else
-        return 1
+        # The surface: the level nearest z = 0, whichever end of the axis it is on.
+        return argmin([abs(Float64(d)) for d in depths])
     end
 end
 
@@ -248,6 +256,25 @@ function compute_hydrodynamic_diagnostics(
 end
 
 """
+    resolve_store_path(path::AbstractString) -> Union{String, Nothing}
+
+The GeoData store at `path`, whether `path` names the run's output directory or the
+store inside it. `nothing` when neither is a store.
+
+`output_zarr_path` appends the store's name, so it answers the directory form only. A
+caller that named the store itself -- which is the store's own path, printed by every
+run that produced it -- therefore found nothing there, fell through every branch, and
+landed on the synthetic synthesis: a figure of invented flow where a real run's fields
+were on disk.
+"""
+function resolve_store_path(path::AbstractString)
+    (endswith(path, ".zarr") && isdir(path)) && return String(path)
+    candidate = output_zarr_path(path)
+    isdir(candidate) && return String(candidate)
+    return nothing
+end
+
+"""
     read_immersed_bathymetry(location::AbstractString) -> Union{Matrix{Float64}, Nothing}
 
 Read the authoritative seabed (metres, negative in the ocean) for a realized run.
@@ -277,8 +304,10 @@ function read_immersed_bathymetry(location::AbstractString)
     # Old archives: a JLD2 file, read from its serialized grid.
     isfile(location) && endswith(location, ".jld2") && return _read_immersed_bathymetry_jld2(location)
 
-    # The store: `hydrodynamics.zarr` inside the run's output directory.
-    store = output_zarr_path(location)
+    # The store: `hydrodynamics.zarr` inside the run's output directory, or the store
+    # itself when the caller named it directly.
+    store = resolve_store_path(location)
+    isnothing(store) && return nothing
     zone = joinpath(store, ".zattrs")
     isfile(zone) || return nothing
 
@@ -501,13 +530,13 @@ function extract_hydrodynamic_dataset(
     time_index::Union{Nothing, Int} = nothing,
     domain_lon::Tuple{<:Real, <:Real} = (-71.0, -53.0),
     domain_lat::Tuple{<:Real, <:Real} = (40.0, 48.5),
-    grid_size::Tuple{Int, Int} = (35, 30),
+    grid_size::Union{Nothing, Tuple{Int, Int}} = nothing,
     target_depths::AbstractVector{<:Real} = [-2.5, -25.0, -50.0, -100.0],
     run_id::Union{Nothing, AbstractString} = nothing,
     coastline::Union{Nothing, AbstractVector{<:NamedTuple}} = nothing,
     coastline_path::Union{Nothing, AbstractString} = nothing
 )
-    nx, ny = grid_size
+    nx, ny = isnothing(grid_size) ? (1, 1) : grid_size
     t_depths = collect(Float64, target_depths)
     nz = length(t_depths)
 
@@ -795,8 +824,8 @@ function extract_hydrodynamic_dataset(
     # place the ocean half now writes fields. Before this branch existed such a path fell
     # through every match and landed on the synthetic synthesis at the bottom, so a figure
     # of a real run silently drew invented flow.
-    if hydro_input isa AbstractString && isdir(output_zarr_path(hydro_input))
-        store = output_zarr_path(hydro_input)
+    if hydro_input isa AbstractString && !isnothing(resolve_store_path(hydro_input))
+        store = resolve_store_path(hydro_input)
         # A GeoData read, not a walk over the store's directories. This branch used to open
         # `.<field>/<m>` itself, take `.zattrs` for the axes and `time.json` for the times, and
         # re-derive the face averaging the writer now does -- three separate hand-rolled reads
@@ -973,8 +1002,12 @@ function extract_hydrodynamic_dataset(
             return default_val
         end
 
-        target_lons = range(domain_lon[1], domain_lon[2], length = nx)
-        target_lats = range(domain_lat[1], domain_lat[2], length = ny)
+        # The target grid is a fallback: the data's own coordinates replace it on the next
+        # two lines. A range of length 1 over differing endpoints is an error in Julia, so
+        # when the grid size is unknown the fallback is a single point rather than a
+        # stretched range -- the data supplies the shape.
+        target_lons = nx > 1 ? range(domain_lon[1], domain_lon[2], length = nx) : [domain_lon[1]]
+        target_lats = ny > 1 ? range(domain_lat[1], domain_lat[2], length = ny) : [domain_lat[1]]
 
         in_lons = get_field((:lons, :grid_lons, :lon), target_lons)
         in_lats = get_field((:lats, :grid_lats, :lat), target_lats)
@@ -1048,8 +1081,12 @@ function extract_hydrodynamic_dataset(
 
     # 5. Default Realistic Regional Hydrodynamic Synthesis with Temporal Evolution
     t_sec = something(time_seconds, 0.0)
-    target_lons = range(domain_lon[1], domain_lon[2], length = nx)
-    target_lats = range(domain_lat[1], domain_lat[2], length = ny)
+    # The target grid is a fallback: a store's own coordinates replace it further up.
+    # A range of length 1 over differing endpoints is an error in Julia, so when the
+    # grid size is unknown the fallback is a single point rather than a stretched
+    # range -- the data supplies the shape.
+    target_lons = nx > 1 ? range(domain_lon[1], domain_lon[2], length = nx) : [domain_lon[1]]
+    target_lats = ny > 1 ? range(domain_lat[1], domain_lat[2], length = ny) : [domain_lat[1]]
 
     u_mat = zeros(Float64, nx, ny, nz)
     v_mat = zeros(Float64, nx, ny, nz)

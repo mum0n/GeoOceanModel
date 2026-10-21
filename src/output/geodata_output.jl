@@ -83,6 +83,11 @@ mutable struct GeodataOutputCallback
     # Optional maximum water depth (m) to archive. Depths deeper than this (e.g. > 400 m)
     # are subsampled out to reduce vertical array volume by up to 50% for epipelagic larval drift.
     max_save_depth::Float64
+    # The regridding plan for a rotated grid, held between intervals. The grid does not
+    # move during a run, so the plan -- which target cell takes its value from which
+    # source cell, and the bearing of the grid's axes at each cell -- is the same for
+    # every interval, and is worked out once.
+    regrid_plan::Any
 end
 
 """
@@ -111,7 +116,7 @@ function GeodataOutputCallback(output_dir::AbstractString, interval::Real,
     end
     return GeodataOutputCallback(store, output_dir, collect(String.(fields)), Ref(start),
                                  nothing, nothing, Float64(interval), Float64(spinup_seconds),
-                                 Float64(max_save_depth))
+                                 Float64(max_save_depth), nothing)
 end
 
 """
@@ -215,6 +220,176 @@ function _to_centres(arr::AbstractArray{T, 3}, grid_shape::Tuple{Int, Int, Int})
 end
 
 """
+    _rotated_regrid_plan(base, lons2d, lats2d, rot_bounds) -> NamedTuple
+
+The plan for regridding a rotated-grid run onto a regular geographic (longitude,
+latitude) grid: the target axes, the source cell each target cell takes its value
+from, and the bearing of the grid's own axes at every target cell.
+
+Why the writer does this, and not the reader. On a rotated grid the cells are not at the
+intersections of two straight lines of longitude and latitude, so a store that records
+one-dimensional axes cannot say where a cell is. Averaging each row and each column --
+what this did before -- puts a cell at a place no cell occupies, and a reader given only
+those axes has no way to know. The velocity has the same defect in a second way: on a
+rotated grid `u` and `v` are components along the grid's own axes (along-shelf and
+cross-shelf), not east and north, so an arrow drawn from them points fifty degrees off.
+A store is a record of where things are; it belongs in geography.
+
+`rot_bounds` is the curvilinear box `((rot_lon_min, rot_lon_max), (rot_lat_min,
+rot_lat_max))` the grid spans -- the same box `extract_rotated_grid_bounds` reports.
+"""
+function _rotated_regrid_plan(base, lons2d::Matrix{Float64}, lats2d::Matrix{Float64},
+                               rot_bounds::Tuple{Tuple{Float64, Float64}, Tuple{Float64, Float64}})
+    np = Tuple(Float64.(base.conformal_mapping.north_pole))
+    dλ = deg2rad(np[1])
+    dφ = π / 2.0 - deg2rad(np[2])
+    cos_dλ, sin_dλ = cos(dλ), sin(dλ)
+    cos_dφ, sin_dφ = cos(dφ), sin(dφ)
+    (rot_lon_min, rot_lon_max), (rot_lat_min, rot_lat_max) = rot_bounds
+
+    nx, ny = size(lons2d)
+    lon_t = collect(range(Float64(minimum(lons2d)), Float64(maximum(lons2d)); length = nx))
+    lat_t = collect(range(Float64(minimum(lats2d)), Float64(maximum(lats2d)); length = ny))
+
+    δ = 1.0e-4                      # degrees, for the Jacobian's finite differences
+    R = 6_371_000.0                 # metres, for the metric factors
+    fi = fill(NaN, nx, ny)
+    fj = fill(NaN, nx, ny)
+    bearing = fill(NaN, nx, ny)
+    for j in 1:ny, i in 1:nx
+        lon = lon_t[i]
+        lat = lat_t[j]
+        λp, φp = rotate_to_curvilinear(lon, lat, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
+        fi[i, j] = (λp - rot_lon_min) / (rot_lon_max - rot_lon_min) * (nx - 1) + 1.0
+        fj[i, j] = (φp - rot_lat_min) / (rot_lat_max - rot_lat_min) * (ny - 1) + 1.0
+
+        # The bearing of the grid's own x axis: the direction of increasing lambda',
+        # which is perpendicular to the gradient of phi'. The partial derivatives come
+        # from the mapping itself, expressed in the local (east, north) frame -- a degree
+        # of longitude is R cos(phi) long, a degree of latitude R.
+        λm, φm = rotate_to_curvilinear(lon - δ, lat, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
+        λp2, φp2 = rotate_to_curvilinear(lon + δ, lat, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
+        dλp_dλ = (λp2 - λm) / 2δ
+        dφp_dλ = (φp2 - φm) / 2δ
+        λm2, φm2 = rotate_to_curvilinear(lon, lat - δ, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
+        λp3, φp3 = rotate_to_curvilinear(lon, lat + δ, cos_dλ, sin_dλ, cos_dφ, sin_dφ)
+        dλp_dφ = (λp3 - λm2) / 2δ
+        dφp_dφ = (φp3 - φm2) / 2δ
+        m_per_deg_lon = R * cosd(lat)
+        g_e = dφp_dλ / m_per_deg_lon      # gradient of phi', east component
+        g_n = dφp_dφ / R                  # gradient of phi', north component
+        l_e = dλp_dλ / m_per_deg_lon      # gradient of lambda', east component
+        l_n = dλp_dφ / R                  # gradient of lambda', north component
+        v_e, v_n = g_n, -g_e               # perpendicular to grad(phi')
+        n = hypot(v_e, v_n)
+        if n > 0
+            v_e /= n
+            v_n /= n
+            if l_e * v_e + l_n * v_n < 0    # point it along increasing lambda'
+                v_e = -v_e
+                v_n = -v_n
+            end
+            bearing[i, j] = atan(v_e, v_n)   # bearing, clockwise from north
+        end
+    end
+
+    # The bilinear stencil, fixed once: which four source cells each target cell mixes,
+    # and by how much. A target outside the curvilinear domain has no source, and stays
+    # NaN -- which is the honest answer, and the same one the model's own land mask gives.
+    i0 = Array{Int}(undef, nx, ny)
+    j0 = Array{Int}(undef, nx, ny)
+    ti = fill(NaN, nx, ny)
+    tj = fill(NaN, nx, ny)
+    for j in 1:ny, i in 1:nx
+        a, b = fi[i, j], fj[i, j]
+        if isfinite(a) && isfinite(b) && 1.0 <= a <= nx && 1.0 <= b <= ny
+            ia = clamp(floor(Int, a), 1, nx)
+            jb = clamp(floor(Int, b), 1, ny)
+            i0[i, j] = ia
+            j0[i, j] = jb
+            ti[i, j] = a - ia
+            tj[i, j] = b - jb
+        else
+            i0[i, j] = 0
+            j0[i, j] = 0
+        end
+    end
+
+    return (lon = lon_t, lat = lat_t, i0 = i0, j0 = j0, ti = ti, tj = tj,
+            bearing = bearing)
+end
+
+"""
+    _apply_regrid(plan, fields::Dict{String, Any}) -> Dict{String, Any}
+
+The fields of a rotated-grid run, on the regular geographic grid `plan` describes, with
+the horizontal velocity turned from the grid's own axes into east and north.
+
+The rotation: on the grid, `u` is along the x axis and `v` along the y axis, and the x
+axis has the bearing ψ (clockwise from north) at each cell. So
+
+    u_east  = u·sin ψ - v·cos ψ
+    u_north = u·cos ψ + v·sin ψ
+
+which is the inverse of the mapping the run itself uses to apply wind stress to a
+rotated grid.
+"""
+function _apply_regrid(plan, fields::Dict{String, Any})
+    out = Dict{String, Any}()
+    for (name, arr) in fields
+        A = Array{Float32}(arr)
+        nx, ny = length(plan.lon), length(plan.lat)
+        B = fill(Float32(NaN), (nx, ny, size(A, 3)))
+        w00 = (1.0 .- plan.ti) .* (1.0 .- plan.tj)
+        w10 = plan.ti .* (1.0 .- plan.tj)
+        w01 = (1.0 .- plan.ti) .* plan.tj
+        w11 = plan.ti .* plan.tj
+        inside = (plan.i0 .> 0) .& (plan.j0 .> 0)
+        # The gather is clamped to the first cell: a target outside the curvilinear
+        # domain has no source, and its value is masked to NaN below.
+        i0c = max.(plan.i0, 1)
+        j0c = max.(plan.j0, 1)
+        for k in 1:size(A, 3)
+            # CartesianIndex, so the gather is elementwise: two index matrices used
+            # directly would take their cross product, not the cell each target wants.
+            a00 = A[CartesianIndex.(i0c, j0c, k)]
+            a10 = A[CartesianIndex.(min.(i0c .+ 1, nx), j0c, k)]
+            a01 = A[CartesianIndex.(i0c, min.(j0c .+ 1, ny), k)]
+            a11 = A[CartesianIndex.(min.(i0c .+ 1, nx), min.(j0c .+ 1, ny), k)]
+            B[:, :, k] = Float32.(w00 .* a00 .+ w10 .* a10 .+ w01 .* a01 .+ w11 .* a11)
+        end
+        B[.!inside, :, :] .= Float32(NaN)
+        out[name] = B
+    end
+
+    if haskey(out, "u") && haskey(out, "v")
+        # The bearing is in RADIANS (it comes from `atan`), so the ordinary sine and
+        # cosine, not the degree variants.
+        ψ = plan.bearing
+        s = sin.(ψ)
+        c = cos.(ψ)
+        U = out["u"]
+        V = out["v"]
+        Us = similar(U)
+        Vs = similar(V)
+        for k in 1:size(U, 3)
+            # The grid's x axis has the bearing ψ (clockwise from north), so it is the
+            # unit vector (sin ψ, cos ψ) in (east, north); the y axis is ninety degrees
+            # from it the other way, (-cos ψ, sin ψ). A velocity on the grid is then
+            #     east  = u·sin ψ - v·cos ψ
+            #     north = u·cos ψ + v·sin ψ
+            # which is the inverse of the mapping the run itself uses to apply wind
+            # stress to a rotated grid.
+            Us[:, :, k] = U[:, :, k] .* s .- V[:, :, k] .* c
+            Vs[:, :, k] = U[:, :, k] .* c .+ V[:, :, k] .* s
+        end
+        out["u"] = Us
+        out["v"] = Vs
+    end
+    return out
+end
+
+"""
     _grid_shape_for_centres(raw_ax) -> (nx, ny, nz)
 
 Return the interior grid shape from the coordinate axes extracted by `_field_arrays`.
@@ -250,12 +425,11 @@ function _field_arrays(model)
         return (x = Float64.(c.lons), y = Float64.(c.lats), z = Float64.(c.depths))
     elseif base isa Oceananigans.Grids.OrthogonalSphericalShellGrid
         c = extract_grid_coordinates(base)
-        # c.lons/c.lats are 2D matrices (Nx×Ny) for rotated curvilinear grids.
-        # Collapse to 1D coordinate axes by averaging along each dimension,
-        # so the store has 1D coordinate axes matching the field dimensions.
-        lons_1d = [mean(c.lons[i, :]) for i in 1:size(c.lons, 1)]
-        lats_1d = [mean(c.lats[:, j]) for j in 1:size(c.lats, 2)]
-        return (x = Float64.(lons_1d), y = Float64.(lats_1d), z = Float64.(c.depths))
+        # c.lons/c.lats are 2D matrices (Nx×Ny) for rotated curvilinear grids. They are
+        # kept as they are: the cells are not on a longitude-latitude lattice, and the
+        # writer regrids them onto one before they are written. Averaging each row and
+        # each column -- what this did before -- put a cell at a place no cell occupies.
+        return (x = Float64.(c.lons), y = Float64.(c.lats), z = Float64.(c.depths))
     end
     # Metric/rectilinear grid (the unit tests): Cartesian horizontal centres in metres, halo
     # stripped, with the vertical centre from `znode` as above. `_host_copy` rather than a
@@ -304,6 +478,23 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
         centred = Float32.(_to_centres(Array{Float32}(interior(f)),
                                        _grid_shape_for_centres(raw_ax)))
         fields[name] = length(z_indices) < length(raw_ax.z) ? centred[:, :, z_indices] : centred
+    end
+
+    # A rotated grid's cells are not on a longitude-latitude lattice. They are put on one
+    # here, before they are written, so that the store says where its cells are and its
+    # velocities are east and north. A store is a record of where things are; a reader
+    # given a smeared one-dimensional axis has no way to undo that.
+    if ndims(raw_ax.x) == 2
+        g = model.grid
+        base_g = hasproperty(g, :underlying_grid) ? g.underlying_grid : g
+        if isnothing(cb.regrid_plan)
+            np = Tuple(Float64.(base_g.conformal_mapping.north_pole))
+            cb.regrid_plan = _rotated_regrid_plan(base_g, raw_ax.x, raw_ax.y,
+                                                   extract_rotated_grid_bounds(base_g, np))
+        end
+        plan = cb.regrid_plan
+        fields = _apply_regrid(plan, fields)
+        ax = (x = plan.lon, y = plan.lat, z = raw_ax.z[z_indices])
     end
 
     ds = cb.store_ds

@@ -14,7 +14,7 @@ import CairoMakie: record
     plot_hydrodynamic_advection(
         hydrodynamics::Any;
         depth::Union{Nothing, Real} = nothing,
-        depth_level::Union{Nothing, Int} = 1,
+        depth_level::Union{Nothing, Int} = nothing,
         time_seconds::Union{Nothing, Real} = nothing,
         time_index::Union{Nothing, Int} = 1,
         bathymetry_data::Union{Nothing, NamedTuple} = nothing,
@@ -40,7 +40,7 @@ Flow orientation angle:
 # Inputs
 - `hydrodynamics`: Model instance, JLD2 path, Zarr storage, or NamedTuple.
 - `depth`: Target continuous depth in meters (e.g. `-25.0` or `25.0`).
-- `depth_level`: Vertical discrete index (default: 1).
+- `depth_level`: Vertical discrete index (default: the surface layer).
 - `time_seconds`: Timestamp in seconds.
 - `time_index`: Snapshot index.
 - `bathymetry_data`: Optional background elevation dataset.
@@ -55,7 +55,7 @@ Flow orientation angle:
 function plot_hydrodynamic_advection(
     hydrodynamics::Any;
     depth::Union{Nothing, Real} = nothing,
-    depth_level::Union{Nothing, Int} = 1,
+    depth_level::Union{Nothing, Int} = nothing,
     time_seconds::Union{Nothing, Real} = nothing,
     time_index::Union{Nothing, Int} = 1,
     bathymetry_data::Union{Nothing, NamedTuple} = nothing,
@@ -149,7 +149,7 @@ end
     plot_hydrodynamic_tracers(
         hydrodynamics::Any;
         depth::Union{Nothing, Real} = nothing,
-        depth_level::Union{Nothing, Int} = 1,
+        depth_level::Union{Nothing, Int} = nothing,
         time_seconds::Union{Nothing, Real} = nothing,
         time_index::Union{Nothing, Int} = 1,
         title::AbstractString = "Hydrodynamic Model Seawater Tracers",
@@ -167,7 +167,7 @@ at a specific depth and time.
 # Inputs
 - `hydrodynamics`: Model, JLD2 file, Zarr storage, or NamedTuple.
 - `depth`: Target depth in meters (e.g. `-50.0`).
-- `depth_level`: Vertical index (default: 1).
+- `depth_level`: Vertical index (default: the surface layer).
 - `time_seconds`: Timestamp in seconds.
 - `time_index`: Snapshot index.
 - `title`: Figure title.
@@ -179,7 +179,7 @@ at a specific depth and time.
 function plot_hydrodynamic_tracers(
     hydrodynamics::Any;
     depth::Union{Nothing, Real} = nothing,
-    depth_level::Union{Nothing, Int} = 1,
+    depth_level::Union{Nothing, Int} = nothing,
     time_seconds::Union{Nothing, Real} = nothing,
     time_index::Union{Nothing, Int} = 1,
     title::AbstractString = "Hydrodynamic Model Seawater Tracers",
@@ -237,7 +237,7 @@ end
     plot_hydrodynamic_stratification(
         hydrodynamics::Any;
         depth::Union{Nothing, Real} = nothing,
-        depth_level::Union{Nothing, Int} = 1,
+        depth_level::Union{Nothing, Int} = nothing,
         time_seconds::Union{Nothing, Real} = nothing,
         time_index::Union{Nothing, Int} = 1,
         stations::Union{Nothing, AbstractVector} = nothing,
@@ -277,7 +277,7 @@ Vertical salinity gradient (halocline strength):
 function plot_hydrodynamic_stratification(
     hydrodynamics::Any;
     depth::Union{Nothing, Real} = nothing,
-    depth_level::Union{Nothing, Int} = 1,
+    depth_level::Union{Nothing, Int} = nothing,
     time_seconds::Union{Nothing, Real} = nothing,
     time_index::Union{Nothing, Int} = 1,
     stations::Union{Nothing, AbstractVector} = nothing,
@@ -381,7 +381,7 @@ end
     plot_hydrodynamic_diffusion(
         hydrodynamics::Any;
         depth::Union{Nothing, Real} = nothing,
-        depth_level::Union{Nothing, Int} = 1,
+        depth_level::Union{Nothing, Int} = nothing,
         time_seconds::Union{Nothing, Real} = nothing,
         time_index::Union{Nothing, Int} = 1,
         title::AbstractString = "Hydrodynamic Turbulent Eddy Diffusivity & Viscosity",
@@ -415,7 +415,7 @@ Ri = \\\\\\\\\\\\\\frac{N^2}{\\left(\\\\\\\\\\\\\\frac{\\\\\\\\\\\\\\partial u}{
 function plot_hydrodynamic_diffusion(
     hydrodynamics::Any;
     depth::Union{Nothing, Real} = nothing,
-    depth_level::Union{Nothing, Int} = 1,
+    depth_level::Union{Nothing, Int} = nothing,
     time_seconds::Union{Nothing, Real} = nothing,
     time_index::Union{Nothing, Int} = 1,
     title::AbstractString = "Hydrodynamic Turbulent Eddy Diffusivity & Viscosity",
@@ -836,7 +836,7 @@ end
         hydrodynamics::Any,
         variable::Symbol;
         depth::Union{Nothing, Real} = nothing,
-        depth_level::Union{Nothing, Int} = 1,
+        depth_level::Union{Nothing, Int} = nothing,
         time_seconds::Union{Nothing, Real} = nothing,
         time_index::Union{Nothing, Int} = 1,
         title::Union{Nothing, AbstractString} = nothing,
@@ -875,7 +875,7 @@ function plot_hydrodynamic_field(
     hydrodynamics::Any,
     variable::Symbol;
     depth::Union{Nothing, Real} = nothing,
-    depth_level::Union{Nothing, Int} = 1,
+    depth_level::Union{Nothing, Int} = nothing,
     time_seconds::Union{Nothing, Real} = nothing,
     time_index::Union{Nothing, Int} = 1,
     title::Union{Nothing, AbstractString} = nothing,

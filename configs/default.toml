@@ -62,26 +62,25 @@ v_inflow = 0.05               # Prescribed background meridional inflow velocity
 [tides]
 # Astronomical tidal body and boundary forcing
 #
-# IMPORTANT: enable_tides MUST remain false in GeoOceanModel.
+# TPXO9 boundary forcing (placement = :boundary): tide enters through the open
+# boundary sponge zone only, allowing the barotropic tidal wave to propagate
+# inward dynamically. This avoids the resonance that the uniform analytic
+# body forcing caused (8-13 m/s divergence within 6 hours).
 #
-# GeoLarvalTracking (the larval half) superimposes analytic M2/S2 tidal velocity
-# onto the stored hydrodynamic flow field at particle-advection time
-# (GeoLarvalTracking/src/biology/larval_behavior.jl:superpose_tidal_velocity).
-# Enabling tides here would add tidal body forcing to the ocean model AND let
-# GeoLarvalTracking add analytic tidal velocity on top — double-counting tide.
+# For this Scotian Shelf run, tide is enabled in the ocean model at the boundary
+# only (placement = "boundary"). GeoLarvalTracking will add its own analytic
+# tidal velocity at particle time. If you want consistency between the two,
+# disable tide in GeoLarvalTracking or set enable_tides = false here.
 #
-# The analytic tidal recipe (spatially uniform amplitude at every depth) also
-# diverged on the Scotian Shelf (8-13 m/s within six simulated hours) when run
-# as a body forcing across the interior. Tides enter the ocean model through
-# GeoLarvalTracking's particle tracking, not through this TOML.
-#
-enable_tides = false          # DO NOT CHANGE: must remain false
-tides_source = "analytic"     # unused while enable_tides = false
-tidal_constituents = []       # unused while enable_tides = false
-tidal_u_amp = 0.25            # unused while enable_tides = false
-tidal_v_amp = 0.12            # unused while enable_tides = false
-s2_u_amp = 0.11               # unused while enable_tides = false
-s2_v_amp = 0.05               # unused while enable_tides = false
+enable_tides = true             # Enable TPXO9 tidal boundary forcing
+tides_source = "tpxo9"          # TPXO9 global tidal atlas (not "analytic")
+tidal_placement = "boundary"    # Edge-only relaxation: tide propagates inward dynamically
+tidal_relaxation_timescale = 3600.0 # 1-hour tidal relaxation timescale at open edges
+tidal_constituents = ["M2", "S2"] # Semidiurnal constituents
+tidal_u_amp = 0.0               # Unused with tpxo9 source (amplitudes come from atlas)
+tidal_v_amp = 0.0               # Unused with tpxo9 source
+s2_u_amp = 0.0                  # Unused with tpxo9 source
+s2_v_amp = 0.0                  # Unused with tpxo9 source
 
 [climate]
 # Long-term climate scenario projections
@@ -108,13 +107,16 @@ reuse_hydro = false           # Reuse existing flow fields if found on disk
 
 [storage]
 # Output lakehouse persistence and state serialization
+#
+# `output_dir` is the single place this run writes. Everything else is derived from it:
+#   <output_dir>/hydrodynamics.zarr  the 4-D field store (T, u, v, w, time)
+#   <output_dir>/checkpoints/         restart archives
+#   <output_dir>/inputs/              the ingested-data cache for this run
+# There is no separate path setting: a second path for the same store is a second
+# source of truth, and the two disagreeing is a silent data-loss bug.
 output_dir = "../lakehouse/GeoOceanModel/default" # Target Lakehouse output directory
 output_schedule_seconds = 21600.0 # Field-output interval (seconds, 6 hours)
-enable_zarr = true            # Persist 4D ocean state to chunked Zarr store
-zarr_path = "outputs/ocean_hydrodynamics.zarr" # Relative or absolute Zarr path
-storage_backend = "zarr"      # Persistence format ("zarr" or "geoparquet")
 enable_checkpoint = true      # Save Oceananigans simulation checkpointer state
-checkpoint_dir = "../lakehouse/GeoOceanModel/default/checkpoints" # Checkpoint folder
 checkpoint_prefix = "default_checkpoint" # Filename prefix for checkpoint files
 checkpoint_schedule_seconds = 21600.0 # State checkpoint frequency in seconds
 checkpoint_cleanup = true     # Automatically purge older intermediate checkpoints
