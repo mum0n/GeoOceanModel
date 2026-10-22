@@ -131,11 +131,11 @@ cd_drag = 2.5e-3
 # resolves mesoscale structure and the spring/neap cycle; a multi-year integration at
 # 2 km is a multi-week compute job and is better launched as a checkpointed run than
 # held in a single session.
-sim_duration_hours = 168.0      # 7-day integration: two spring/neap cycles
-# sim_duration_hours = 13140.0      # 1.5 yr production run
+# sim_duration_hours = 168.0      # 7-day integration: two spring/neap cycles
+sim_duration_hours = 13140.0      # 1.5 yr production run
 sim_dt_seconds = 30.0          # Baseline time step in seconds
 min_dt_seconds = 10.0          # Minimum adaptive time step floor (seconds)
-max_dt_seconds = 240.0         # Maximum adaptive time step ceiling (barotropic-CFL safe at 2 km)
+max_dt_seconds = 360.0         # Maximum adaptive time step ceiling (barotropic-CFL safe at 2 km)
 adaptive_cfl = true           # Modulate dt according to advective and wave CFL
 target_cfl = 0.2             # Target advective CFL limit (increased from 0.08 for stability)
 target_wave_cfl = 0.2        # Target barotropic gravity wave CFL limit (increased from 0.08 for stability)
@@ -143,8 +143,8 @@ surface_heat_flux = 50.0      # Baseline sensible heat flux (W/m^2)
 sst_damping_coefficient = 40.0 # Haney SST relaxation (W m-2 K-1)
 max_current_speed = 2.0       # Current velocity ceiling in m/s (reduced from 3.0 for stability)
 max_flow_snapshots = 400      # Snapshot memory retention limit
-spinup_hours = 24.0           # 1 month Spinup before saving outputs (12 hours)
-# spinup_hours = 720.0           # 1 month Spinup before saving outputs (12 hours)
+spinup_hours = 168.0           # 7 day spin-up before the first output is written
+# spinup_hours = 720.0           # 30 day spin-up, for a run that has to reach equilibrium
 allow_analytical_fallback = false # Fail loudly if real inputs unavailable
 hydro_model_file = ""         # Hydrodynamic model checkpoint
 reuse_hydro = false           # Reuse existing flow fields if present
@@ -165,7 +165,18 @@ progress_schedule_seconds = 900.0 # Progress report every 15 min of simulated ti
 max_save_depth = 400.0        # Keep every level (the shelf is 350 m deep) for larval drift
 enable_checkpoint = true      # Enable state checkpointer
 checkpoint_prefix = "scotian_shelf_checkpoint" # Checkpoint prefix
-checkpoint_schedule_seconds = 1800.0 # Checkpoint interval (30 min: a restart loses at most half an hour)
+# Checkpoint interval, in SIMULATED seconds.
+#
+# This is a full serialisation of the model state -- every prognostic field copied to
+# the host and written -- and it happens INSIDE the timestep, so the interval is paid for
+# in wall-clock time on every step. At 1800 s, with the time step at its 240 s ceiling,
+# that is one checkpoint every seven and a half model iterations, and the run spent more
+# time writing checkpoints than integrating: eleven seconds per iteration against a
+# quarter of a second for the physics.
+#
+# Six hours of simulated time is every ninety iterations, and a restart then loses at
+# most six hours of simulation -- a few minutes of wall clock at this grid.
+checkpoint_schedule_seconds = 86400.0 # Checkpoint every 24 h of simulated time
 checkpoint_cleanup = true     # Automatically prune older checkpoints
 run_id = ""                   # Unique identifier
 

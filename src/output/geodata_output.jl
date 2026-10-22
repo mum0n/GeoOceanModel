@@ -103,7 +103,15 @@ function GeodataOutputCallback(output_dir::AbstractString, interval::Real,
     if !resume && ispath(store)
         rm(store; recursive = true, force = true)   # a fresh run overwrites its own output
     end
-    mkpath(store)
+    # The store directory is NOT created here. It is created by the save at the first
+    # output, when the grid axes and the field shapes are known.
+    #
+    # Creating it here made "the run has not saved anything yet" and "the run is not
+    # saving" look identical from the outside: an empty `hydrodynamics.zarr` beside a
+    # running process reads as a failure, and it is what a run that has not yet reached
+    # its first output interval -- or one still inside its spin-up -- looks like. The
+    # absence of the directory is the honest signal, and `store_interval_count` already
+    # treats a missing store as zero intervals.
 
     start = 1
     if resume
@@ -132,23 +140,33 @@ end
 """
     _build_store_dataset(store, ax, names, nt, model) -> GeoDataset
 
-The run's output store, created as a GeoData `GeoDataset` and written once so each interval is
-a slice of an already-open array.
+The run's output store, created with its final shape and filled a slice at a time.
 
-Axes, not offsets: `ax` is the interior cell centres in `(lon, lat, depth)` from the model's
-own grid, so the dataset records where its cells are rather than leaving a reader to infer
-positions from indices. `nt` sizes the time axis to the run.
+The variables are `(lon, lat, depth, time)` arrays, and the time axis is sized to the
+run so the array never has to grow.
 
-The variables are the named fields, each `(lon, lat, depth, time)`, created empty and filled
-by the callback. `ds` is returned open, and writing `v.data[:, :, :, m] = field` goes
-straight to the Zarr array behind it, so nothing is held in memory.
+The store is created as a TEMPLATE: the arrays have their final shape and chunking, and
+no data is written until the first interval arrives. That is the whole point. Creating
+the store by saving a dataset of zeros would hold the entire store in host memory at
+once -- at 432 x 250 x 20 x 337 that is 2.9 GB per field, 14.6 GB for five -- and write
+all of it to disk, before the run had produced a single value. The run then spent hours
+in that write and died in it, with the store still empty and every field still zero.
+
+The axes, not offsets: `ax` is the interior cell centres in `(lon, lat, depth)` from the
+model's own grid, so the dataset records where its cells are rather than leaving a reader
+to infer positions from indices.
+
+The store's metadata goes into the group's attributes at creation, because the
+attributes are what the save writes. Setting them on the dataset afterwards changed an
+in-memory dictionary and nothing on disk: the store was written without its seabed, and
+a reader that went looking for it found nothing.
 """
 function _build_store_dataset(store::AbstractString, ax, names::Vector{String}, nt::Int,
                               model)
     crs = GeoData.CoordinateSystem(crs = "EPSG:4326")
     nx, ny, nz = length(ax.x), length(ax.y), length(ax.z)
 
-    axe(name, coords, units, std, dim_type) = Dimension(
+    axe(name, coords, units, std, dim_type) = GeoData.Dimension(
         name = name, size = length(coords), coords = coords,
         units = units, standard_name = std, dim_type = dim_type)
 
@@ -157,34 +175,26 @@ function _build_store_dataset(store::AbstractString, ax, names::Vector{String}, 
     dz = axe(:depth, ax.z, "m", "depth", GeoData.DIM_PARAMETRIC)
     tim = axe(:time, Float64.(1:nt), "s", "time", GeoData.DIM_TEMPORAL)
 
-    vars = Dict{String, GeoArray}()
-    # Align Zarr chunk sizes (nx, ny, nz, min(nt, 24)) to minimize metadata overhead and allow fast streaming chunks
+    dims = Dict{Symbol, GeoData.Dimension}(:lon => dl, :lat => dt, :depth => dz, :time => tim)
+
+    # Align Zarr chunk sizes (nx, ny, nz, min(nt, 24)) to minimize metadata overhead and
+    # allow fast streaming chunks.
     chunk_t = min(nt, 24)
     target_chunks = (nx, ny, nz, chunk_t)
-    for name in names
-        d = dims = (dl, dt, dz, tim)
-        # Store 4D simulation fields as Float32 to reduce disk volume by 50% without scientific precision loss
-        vars[name] = GeoArray(zeros(Float32, nx, ny, nz, nt), d, crs,
-                              Dict{String, Any}("chunks" => target_chunks))
-    end
-    coords = Dict{Symbol, GeoArray}(
-        :lon => GeoArray(ax.x, (dl,), crs, Dict{String, Any}()),
-        :lat => GeoArray(ax.y, (dt,), crs, Dict{String, Any}()),
-        :depth => GeoArray(ax.z, (dz,), crs, Dict{String, Any}()),
-        :time => GeoArray(tim.coords, (tim,), crs, Dict{String, Any}()))
 
-    # The run's metadata goes into the dataset's attributes BEFORE the save, because the
-    # save is what writes the store's `.zattrs`. Setting an attribute on the dataset
-    # afterwards changed an in-memory dictionary and nothing on disk: the store was
-    # written without its seabed, and a reader that went looking for it found nothing.
-    ds = GeoDataset(vars, coords, Dict(:lon => dl, :lat => dt, :depth => dz, :time => tim), crs,
-                    run_metadata(model), GeoData.ZarrBackend(), String(store))
-    GeoData.geosave(String(store), ds; backend = :zarr, overwrite = true)
-    # Reopened for write, because the callback writes into this dataset's arrays: `geoload`
-    # defaults to read-only, and of the Zarr modes only `"w"` hands out a writeable array
-    # here. It does not truncate -- a second `"w"` open appends, which is checked explicitly,
-    # because a writer that silently cleared its earlier intervals would produce a run whose
-    # first slice is missing.
+    variables = [(name, (nx, ny, nz, nt), ["lon", "lat", "depth", "time"], target_chunks)
+                 for name in names]
+
+    GeoData.create_zarr_template(String(store);
+                                 dims = dims,
+                                 attrs = run_metadata(model),
+                                 variables = variables)
+
+    # Reopened for write, because the callback writes into this dataset's arrays:
+    # `geoload` defaults to read-only, and of the Zarr modes only `"w"` hands out a
+    # writeable array here. It does not truncate -- a second `"w"` open appends, which is
+    # checked explicitly, because a writer that silently cleared its earlier intervals
+    # would produce a run whose first slice is missing.
     return GeoData.geoload(String(store); backend = :zarr, mode = "w")
 end
 

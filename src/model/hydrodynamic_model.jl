@@ -188,7 +188,6 @@ function build_hydrodynamic_model(
     mask_bay_of_fundy::Bool = false,
     active_boundaries = (:east, :west),
     tidal_placement::Symbol = :boundary,
-    bottom_drag::Real = 1e-4,
     cd_drag::Real = 2.5e-3,
 )
     active_tracers = (enable_o2 && !(:O2 in tracers)) ? (tracers..., :O2) : tracers
@@ -248,10 +247,10 @@ function build_hydrodynamic_model(
            FluxBoundaryCondition(surface_wind_stress_y)
     T_bc = T_flux_bc
 
-    # Bottom drag: quadratic seabed friction via Oceananigans BulkDrag boundary condition.
-    # Applied to both u and v on the bottom face, providing the momentum sink that was
-    # previously missing (bottom_drag/cd_drag were function parameters but never forwarded
-    # to HydrostaticFreeSurfaceModel which does not accept them as kwargs).
+    # Bottom drag: quadratic seabed friction via the Oceananigans `BulkDrag` boundary
+    # condition, applied to both u and v on the bottom face. It is the model's only
+    # momentum sink, and the same coefficient is what the Courant estimator protects, so
+    # the two are read from one value.
     bottom_drag_bc = BulkDrag(coefficient = Float64(cd_drag))
 
     bcs = Dict{Symbol, Any}(
