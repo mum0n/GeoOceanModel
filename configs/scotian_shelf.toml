@@ -115,12 +115,17 @@ s2_v_amp = 0.0                  # Unused with tpxo9 source
 #
 # `target_cfl` is NOT the advective Courant number, and treating it as one is why it
 # looks mis-set. The reported "CFL" is max(advective, 0.5 * drag), and the drag term
-# -- (r + cd*|u|) * dt with cd = 2.5e-3 -- dominates the advective terms at EVERY
-# speed, because 0.5*cd*dx = 2.7 and 0.5*cd*dy = 5.2. The controller is therefore
-# really setting dt = 0.4 / (1e-4 + 2.5e-3 * |u|_max), and the advective Courant
-# number sits near 0.03, an order of magnitude below the target. Lowering
-# `target_cfl` would cost wall-clock time and buy no accuracy: the step size is
-# protecting the bottom drag, not the advection.
+# -- cd*|u| * dt with cd = 2.5e-3 -- dominates the advective terms at EVERY speed,
+# because 0.5*cd*dx = 2.7 and 0.5*cd*dy = 5.2. The controller is therefore really
+# setting dt = 0.4 / (2.5e-3 * |u|_max), and the advective Courant number sits near
+# 0.03, an order of magnitude below the target. Lowering `target_cfl` would cost
+# wall-clock time and buy no accuracy: the step size is protecting the bottom drag,
+# not the advection.
+#
+# The quadratic seabed friction coefficient. It is applied to the model as a `BulkDrag`
+# bottom boundary condition on the sea floor, and it is the drag the step controller
+# protects, so the two are read from this one number.
+cd_drag = 2.5e-3
 #
 # Duration is set for a run that completes end to end. The shelf at this resolution
 # resolves mesoscale structure and the spring/neap cycle; a multi-year integration at

@@ -96,6 +96,9 @@ adaptive_cfl = true           # Enable adaptive time stepping based on CFL
 target_cfl = 0.2              # Target Courant-Friedrichs-Lewy condition limit
 target_wave_cfl = 0.20        # Target wave CFL limit for barotropic gravity waves
 surface_heat_flux = 50.0      # Prescribed surface heat flux (W/m^2)
+# The quadratic seabed friction coefficient. Applied to the model as a `BulkDrag` bottom
+# boundary condition, and the drag the adaptive step controller protects.
+cd_drag = 2.5e-3
 max_current_speed = 3.0       # Current speed ceiling in m/s (negative disables clamp)
 max_flow_snapshots = 400      # Snapshot memory retention limit (0 = all)
 spinup_hours = 0.0            # Spinup duration before saving outputs (hours)

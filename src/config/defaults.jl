@@ -194,6 +194,10 @@ function get_default_configuration()::Dict{String, Any}
             "divergence_velocity_limit" => 20.0,
             "coriolis_latitude" => 44.5,
             "surface_heat_flux" => 50.0,
+            # The quadratic seabed friction coefficient. It is applied to the model as a
+            # `BulkDrag` bottom boundary condition and is the drag the Courant estimator
+            # protects, so the two are read from this one value.
+            "cd_drag" => 2.5e-3,
             "max_flow_snapshots" => 0,
             "allow_analytical_fallback" => false,
             "turbulence_closure" => "nemotke",

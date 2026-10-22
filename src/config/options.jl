@@ -296,6 +296,10 @@ struct HydrodynamicOptions
     tidal_relaxation_timescale :: Float64  # relaxation toward the prescribed tide (s)
     u_inflow                 :: Float64  # reference zonal inflow velocity (m/s)
     v_inflow                 :: Float64  # reference meridional inflow velocity (m/s)
+    # The quadratic seabed friction coefficient (dimensionless). It is applied to the model
+    # as a `BulkDrag` bottom boundary condition and is also what the Courant estimator
+    # protects, so the two cannot be allowed to disagree about it.
+    cd_drag                  :: Float64
     # Time integration ceiling
     max_dt                   :: Float64  # maximum allowable time step (s)
     # Stochastic biology parameters
@@ -417,6 +421,7 @@ function HydrodynamicOptions(;
     tidal_relaxation_timescale :: Real = 3600.0,
     u_inflow                 :: Real = -0.15,
     v_inflow                 :: Real = 0.05,
+    cd_drag                  :: Real = 2.5e-3,
     max_dt                   :: Real = 600.0,
     settlement_stochastic    :: Bool = true,
     cv_molt                  :: Real = 0.25,
@@ -548,6 +553,7 @@ function HydrodynamicOptions(;
         Float64(tidal_relaxation_timescale),
         Float64(u_inflow),
         Float64(v_inflow),
+        Float64(cd_drag),
         Float64(max_dt),
         settlement_stochastic,
         Float64(cv_molt),
