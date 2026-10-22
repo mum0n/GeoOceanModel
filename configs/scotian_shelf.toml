@@ -176,7 +176,7 @@ checkpoint_prefix = "scotian_shelf_checkpoint" # Checkpoint prefix
 #
 # Six hours of simulated time is every ninety iterations, and a restart then loses at
 # most six hours of simulation -- a few minutes of wall clock at this grid.
-checkpoint_schedule_seconds = 86400.0 # Checkpoint every 24 h of simulated time
+checkpoint_schedule_seconds = 864000.0 # Checkpoint every 864000sec=10days of simulated time
 checkpoint_cleanup = true     # Automatically prune older checkpoints
 run_id = ""                   # Unique identifier
 
