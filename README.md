@@ -93,21 +93,49 @@ When the boundary source carries currents, the momentum sponge now relaxes towar
 the model as `boundary_velocities`. `u_inflow`/`v_inflow` remain the fallback for a
 source with no currents (WOA23 has none) and are used only when there are none.
 
-Two implementation details are not optional:
+Two implementation details are not optional, and both were established by measurement
+rather than by reading the API:
 
-- The target must be a **callable**, not a field. A `Relaxation` whose target is a `Field`
-  computes an *exactly zero* tendency for a face-located velocity field in this
-  Oceananigans build, whatever the field contains. The same `Relaxation` with a field
-  target works for a centre-located tracer, which is why the tracer sponge uses one and
-  the momentum sponge cannot. A boundary relaxation that silently does nothing is worse
-  than one that is absent, so a field is rejected with an error rather than accepted.
-- The tidal velocity is added to the boundary velocity **inside one relaxation**, because
-  the boundary carries the sum. Two separate relaxations would settle on the *average* of
-  the two targets, halving the tidal amplitude at the boundary.
+- **The momentum target must be a field, not a callable.** A `Relaxation` whose target is
+  a `Field` lowers into a GPU kernel and gives the same answer on CPU and GPU. A
+  `Relaxation` whose target is a *callable* lowers only if the callable is `isbits` — and
+  a spatially varying velocity is not `isbits` however it is built, so a closure over an
+  interpolation object is rejected by CUDA with `KernelError: passing non-bitstype
+  argument`. The boundary velocity is therefore materialised onto the velocity's own
+  faces (`XFaceField` for `u`, `YFaceField` for `v`), which have the same data layout as
+  the fields being relaxed.
+- **The tidal velocity is added to the background velocity as an *additive* term, not as
+  a second relaxation.** The boundary carries the sum, and two separate relaxations
+  settle on their *average* — which would halve the tidal amplitude at the boundary. The
+  decomposition used is exact:
+  `rate·(u_bnd + u_tide − u) = rate·(u_bnd − u) + rate·u_tide`, where the first term is
+  the relaxation toward the materialised field and the second is a `ContinuousForcing`.
 
 #### GPU Device Kernel Lowering
 
 Passing closures that capture heap-allocated objects or variables of abstract type prevents CUDA LLVM IR generation. [`CartesianSpongeMask`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl) is declared as a concrete, immutable `isbits` struct. With `Adapt.adapt_structure(to, s) = s`, the functor lowers into device registers and executes inline without GPU scalar indexing or memory allocation.
+
+What a relaxation target may be, on the GPU, and why:
+
+| Target | Result |
+|---|---|
+| a `Field` | lowers; the materializer adapts it to the device array and the tendency kernel indexes it. The field must have the same data layout — size *and* offsets — as the field being relaxed. |
+| a callable that is `isbits` | lowers; the callable is passed by value. This is how the tidal relaxation works: the tidal coefficients are a small `NamedTuple` of numbers. |
+| a callable that is not `isbits` | does not lower: `KernelError: passing non-bitstype argument`. A closure over an `Interpolations` object is the usual culprit. |
+
+Two further things about `ContinuousForcing`, both of which cost an afternoon:
+
+- If `parameters` is given, the function must take the parameters as its **last**
+  argument: `func(x, y, z, t, parameters)`. A four-argument function is called with five
+  arguments and the kernel does not lower.
+- `ContinuousForcing` adds `func(...)` to the tendency and **ignores** `parameters.rate`
+  and `parameters.mask`. The function must apply the rate and the mask itself.
+
+And a diagnostic note: when a forcing fails to lower, the error is reported from an
+*unrelated* kernel — usually `gpu_compute_hydrostatic_free_surface_Gu!` — because the
+model is a single object and the CUDA compiler fails on whichever kernel it reaches
+first. An error in the free-surface kernel therefore says nothing about the free
+surface.
 
 #### Barotropic Wave Stability & Substepping
 
@@ -115,11 +143,17 @@ In shallow shelf and slope waters, barotropic external gravity waves propagate a
 
 $$c = \sqrt{g H}$$
 
-At the shelf break floor depth $H = 350\,\text{m}$, $c \approx 58.6\,\text{m/s}$. Across a cross-shelf grid spacing $\Delta y \approx 3,380\,\text{m}$, the barotropic Courant number satisfies:
+At the deepest water in the domain ($H = 400\,\text{m}$), $c \approx 62.6\,\text{m/s}$. Across a
+$2\,\text{km}$ grid spacing, the barotropic Courant number of the split-explicit solver is
 
-$$\text{CFL}_{\text{wave}} = \frac{c \, \Delta t}{\Delta y} \approx 0.0173 \, \Delta t$$
+$$\text{CFL}_{\text{wave}} = \frac{c \, (\Delta t / N_{\text{sub}})}{\Delta x} \approx 0.000695 \, \Delta t$$
 
-Oceananigans employs a split-explicit free-surface solver ([`SplitExplicitFreeSurface`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl)) where the 2D barotropic equations are integrated over $N_{\text{sub}}$ substeps per baroclinic time step $\Delta t$. When $\Delta t \ge 20.0\,\text{s}$ with $\text{cfl} = 0.7$, $N_{\text{sub}}$ drops to 1, disabling the barotropic substepping filter over steep topographic slopes. Restricting $\Delta t_{\max} \le 12.0\text{--}15.0\,\text{s}$ maintains active substepping averaging and keeps $\text{CFL}_{\text{wave}} \le 0.21\text{--}0.26$, preventing forward-backward acoustic-gravitational resonance.
+Oceananigans employs a split-explicit free-surface solver ([`SplitExplicitFreeSurface`](file:///c:/home/jae/projects/GeoOceanModel/src/model/hydrodynamic_model.jl)) where the 2D barotropic equations are integrated over $N_{\text{sub}} = 45$ substeps per baroclinic time step $\Delta t$. The substep count is fixed rather than derived from a CFL, so the Courant number above is what the time step has to keep small. The adaptive step controller enforces this: when
+$\text{CFL}_{\text{wave}} > 0.5$ it caps $\Delta t$ at $0.5 \cdot 45 \cdot \Delta x / c$, which at
+$2\,\text{km}$ and $400\,\text{m}$ is $467\,\text{s}$. The practical ceiling is therefore the
+configured `max_dt_seconds`, and $240\,\text{s}$ gives a wave Courant number of $0.167$ —
+comfortably inside the limit, and the reason `max_dt_seconds` can be raised from the
+$120\,\text{s}$ that a coarser grid needed.
 
 ## Vertical Discretization & Standardized Depth Conventions
 

@@ -110,9 +110,10 @@ function display_help(io::IO = stdout)
       --overwrite        Overwrite the MODEL RESULTS: the output store and the
                          checkpoints. The downloaded store -- the ingested bathymetry,
                          coastline, winds and vertical grid -- is KEPT, so the run does
-                         not fetch them again. Asks before it deletes.
+                         not fetch them again. This is the answer to the deletion
+                         question: the flag says yes, and it does not ask again.
       --blank_state      Wipe ALL of this run's state, the downloaded store included: the
-                         next run fetches everything again. Asks before it deletes.
+                         next run fetches everything again.
       --help, -h         This message.
 
     Two configurations:
@@ -219,7 +220,8 @@ function load_options(flag::AbstractString; overwrite::Bool = false)
 end
 
 """
-    clear_run_state(opts::HydrodynamicOptions; blank_state::Bool, input = stdin) -> Bool
+    clear_run_state(opts::HydrodynamicOptions; blank_state::Bool, input = stdin,
+                    confirmed::Bool = true) -> Bool
 
 Clear what a previous run of this configuration left behind, after warning about it and
 being told to go ahead. Returns `false` when the operator declined, in which case the
@@ -237,18 +239,25 @@ things because of it:
 The shared GeoData store under the lakehouse is never touched: it holds datasets several
 runs depend on, and this run's own directory is the only thing a purge may reach into.
 
+`confirmed` is the answer to the question the purge asks. It is true here because the
+caller reached this function through `--overwrite` or `--blank_state`: the flag IS the
+answer, and a purge that cannot ask because the run is not attached to a terminal would
+otherwise refuse to do what it was explicitly told to do. The warning is still printed,
+so the operator sees what went.
+
 `input` is the stream the answer is read from: `stdin` in a run, and a buffer when the
 run is being driven from a script.
 """
 function clear_run_state(opts::HydrodynamicOptions; blank_state::Bool = false,
-                        input::IO = stdin)
+                        input::IO = stdin, confirmed::Bool = true)
     out_dir = opts.output_dir
     results = [output_zarr_path(out_dir)]
     result_globs = [joinpath(out_dir, "checkpoints", "*.jld2"),
                     joinpath(out_dir, "*.attempt")]
     inputs = [opts.input_dir]
     return GeoData.purge_run_state(out_dir; results, result_globs, inputs,
-                                   blank_state = blank_state, input = input)
+                                   blank_state = blank_state, input = input,
+                                   confirmed = confirmed)
 end
 
 """

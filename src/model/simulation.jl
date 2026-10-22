@@ -199,7 +199,6 @@ end
     compute_advective_cfl(
         model,
         Δt::Real;
-        bottom_drag::Real = 1e-4,
         cd_drag::Real = 2.5e-3
     ) -> Float64
 
@@ -216,14 +215,31 @@ in interior cells and the explicit bottom friction / drag Courant limit.
 \\right)
 ```
 ```math
-\\text{CFL}_{\\text{drag}} = (r_{\\text{drag}} + C_d |\\boldsymbol{u}_h|) \\Delta t
+\\text{CFL}_{\\text{drag}} = C_d |\\boldsymbol{u}_h| \\Delta t
 ```
 The composite stability index returned is:
 ```math
 \\text{CFL} = \\max(\\text{CFL}_{\\text{adv}}, 0.5 \\, \\text{CFL}_{\\text{drag}})
 ```
-ensuring that adaptive time-step controllers (e.g. `TimeStepWizard`) automatically
-throttle \$\\Delta t\$ during intense spring-neap tidal acceleration episodes.
+
+# What the composite number is, in practice
+The two terms are not comparable in size. The drag term is
+\$0.5 \\, C_d |u| \\Delta t / (|v| \\Delta t / \\Delta y) = 0.5 \\, C_d \\Delta y\$, which is
+5.2 at a 4.2 km cell and 2.7 at a 2.2 km one: the drag term is the larger of the two at
+EVERY speed, and the advective Courant number sits an order of magnitude below the
+target while the reported figure tracks the target exactly. So the controller is really
+setting
+
+\$\\Delta t = 0.4 / (C_d |u|_{\\max})\$
+
+and the name "advective CFL" is a misnomer for what the number does. The consequence for
+the configuration is that `target_cfl` is not the knob for advective accuracy -- the
+advective Courant number is already far below it -- and the step size is protected
+against the explicit bottom drag.
+
+`cd_drag` must be the coefficient the model actually applies. The model has only a
+quadratic `BulkDrag`, so there is no linear drag term here: a linear coefficient in this
+expression would protect friction the model does not have.
 
 # References
 - Canuto, C., et al. (2007). *Spectral Methods*. Springer-Verlag.
@@ -231,7 +247,6 @@ throttle \$\\Delta t\$ during intense spring-neap tidal acceleration episodes.
 function compute_advective_cfl(
     model,
     Δt::Real;
-    bottom_drag::Real = 1e-4,
     cd_drag::Real = 2.5e-3
 )
     u_max = maximum(abs, interior(model.velocities.u))
@@ -296,9 +311,14 @@ function compute_advective_cfl(
 
     cfl_adv = max(cfl_x, cfl_y, cfl_z)
 
-    # Frictional / quadratic drag Courant number
+    # Frictional / quadratic drag Courant number.
+    #
+    # This mirrors the model's `BulkDrag` bottom boundary condition, whose drag rate is
+    # `cd_drag * |u_h|`. The model has no linear bottom drag, so there is no linear term
+    # here either: a coefficient for friction the model does not have is a protection
+    # that is not protecting anything.
     speed_h = sqrt(u_max^2 + v_max^2)
-    cfl_drag = (bottom_drag + cd_drag * speed_h) * Δt
+    cfl_drag = cd_drag * speed_h * Δt
 
     return Float64(max(cfl_adv, 0.5 * cfl_drag))
 end
@@ -1202,6 +1222,7 @@ end
         target_cfl::Real = 0.2,
         max_Δt::Real = 12.0,
         min_Δt::Real = 10.0,
+        cd_drag::Real = 2.5e-3,
         progress_schedule::Union{Real, Int} = 20,
         enable_output::Bool = true,
         output_dir::AbstractString = "outputs",
@@ -1239,6 +1260,9 @@ multistage schemes subject to the CFL condition:
 - `max_Δt::Real`: Maximum allowed time step in seconds (default `12.0` to ensure
   high-order WENO stability across immersed step bathymetry).
 - `min_Δt::Real`: Minimum allowed time step in seconds (default `0.1`). If the wizard attempts to scale below this floor to preserve CFL, it implies spatial divergence.
+- `cd_drag::Real`: The quadratic seabed friction coefficient the model applies as a
+  `BulkDrag` bottom boundary condition (default `2.5e-3`). It is passed to the Courant
+  estimator so that the step controller protects the drag the model actually has.
 - `progress_schedule::Union{Real, Int}`: Logging frequency (iterations or seconds).
 - `enable_output::Bool`: Whether to attach a JLD2 timeseries output writer.
 - `output_dir::AbstractString`: Directory where outputs will be saved.
@@ -1277,6 +1301,7 @@ function setup_hydrodynamic_simulation(
     target_cfl::Real = 0.2,
     max_Δt::Real = 12.0,
     min_Δt::Real = 0.1,
+    cd_drag::Real = 2.5e-3,
     progress_schedule::Union{Real, Int} = 20,
     enable_output::Bool = true,
     output_path::AbstractString = joinpath("outputs", "nova_scotia_hydrodynamics.jld2"),
@@ -1356,7 +1381,7 @@ function setup_hydrodynamic_simulation(
     progress_fn(s) = begin
         u_max = maximum(abs, interior(s.model.velocities.u))
         v_max = maximum(abs, interior(s.model.velocities.v))
-        cfl_val = compute_advective_cfl(s.model, s.Δt)
+        cfl_val = compute_advective_cfl(s.model, s.Δt; cd_drag = cd_drag)
         # Report the vertical velocity, the three directional Courant numbers and the
         # free-surface range alongside the advective CFL. `compute_advective_cfl` returns only
         # the MAXIMUM of the three, so on this grid it was impossible to tell from the log
@@ -1455,7 +1480,7 @@ function setup_hydrodynamic_simulation(
     # fifth iteration cannot catch up once it starts falling behind.
     if adaptive_time_step
         adapt_fn = function (s)
-            cfl = compute_advective_cfl(s.model, s.Δt)
+            cfl = compute_advective_cfl(s.model, s.Δt; cd_drag = cd_drag)
             if isfinite(cfl) && cfl > 0
                 # Scale so the next step lands on the target, then bound the change to a
                 # factor of two in either direction: unbounded scaling lets a single noisy

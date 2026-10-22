@@ -560,8 +560,10 @@ function run_segment_model(;
                 lat_range = opts.domain_lat,
             )
             # The forcing is reduced to a small `isbits` coefficient grid BEFORE it reaches the
-            # model. A closure that searches the atlas arrays at call time is not GPU-safe and
-            # fails to compile in gpu_compute_hydrostatic_free_surface_Gu!.
+            # model. A closure that searches the atlas arrays at call time captures heap-allocated
+            # arrays, is not `isbits`, and the CUDA compiler rejects it with
+            # "KernelError: passing non-bitstype argument" -- reported from whichever kernel it
+            # reaches first, which is usually not the one at fault.
             # Grid size is bounded by GPU kernel *parameter* memory: the coefficient tuple is
             # passed by value into every invocation, so 16x12x2x4 doubles (12 KB) is rejected
             # with "Kernel invocation uses too much parameter memory". 6x4 gives 192 doubles
@@ -819,6 +821,11 @@ end
         tidal_relaxation_timescale = opts.tidal_relaxation_timescale,
         u_inflow = u_inflow_rot,
         v_inflow = v_inflow_rot,
+        # The quadratic seabed friction coefficient, from the configuration. It was
+        # previously not passed at all, so the model used its own default and the
+        # configuration was silently ignored -- which happened not to matter only because
+        # the default and the configured value were the same number.
+        cd_drag = opts.cd_drag,
         boundary_tracers = boundary_tracer_data,
         boundary_velocities = boundary_velocity_data,
         closure = closure_choice in (:nemotke, :catke) ? :catke : nothing,
@@ -1193,6 +1200,9 @@ function run_segment_simulation(;
         target_cfl = opts.target_cfl,
         max_Δt = max_Δt,
         min_Δt = opts.min_dt_seconds,
+        # The same coefficient the model applies as a `BulkDrag` bottom boundary
+        # condition, so the step controller protects the drag that is actually there.
+        cd_drag = opts.cd_drag,
         enable_output = false,
         output_schedule = (opts.output_schedule_seconds > 0.0) ?
             opts.output_schedule_seconds : 21600.0,

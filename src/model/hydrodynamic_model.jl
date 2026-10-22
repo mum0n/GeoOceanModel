@@ -9,7 +9,7 @@ using Oceananigans
 using Oceananigans.Units
 # `ContinuousForcing` and `Relaxation` live in `Oceananigans.Forcings`, which
 # Oceananigans `using`s internally but does not re-export at top level, so they are
-# imported by name. `ZeroForcing` is defined locally below.
+# imported by name.
 using Oceananigans.BoundaryConditions: ContinuousBoundaryFunction
 using Oceananigans: BulkDrag
 using Oceananigans.Forcings: ContinuousForcing, MultipleForcings, Relaxation
@@ -100,12 +100,16 @@ stepping, checkpointing and JLD2 output machinery and therefore only needs the m
   42–47.5 °N domain the β term is not negligible, so the spherical form is more appropriate.
 - `closure` defaults to `VerticalScalarDiffusivity` with the caller's `ν`/`κ`, matching the
   previous behaviour. Pass `closure = :catke` for the library's prognostic NEMO-TKE closure.
-- `free_surface = SplitExplicitFreeSurface(grid; cfl)`. The previous builder used
+- `free_surface = SplitExplicitFreeSurface(grid; substeps = 45)`. The previous builder used
   `ImplicitFreeSurface`; the split-explicit barotropic solver is cheaper and is what the
-  library considers the standard choice.
-- `bottom_drag_coefficient` is left at the library default (`0.003`) because `Default` is not
-  part of Oceananigans' public API in this build. Bottom drag is therefore applied at the
-  library default value rather than through an explicit `cd_drag` parameter.
+  library considers the standard choice. The substep count is fixed rather than derived
+  from a CFL, so the barotropic Courant number depends on the time step: the adaptive
+  step controller caps `Δt` so that `c·(Δt/45)/Δx ≤ 0.5`, with `c = sqrt(g·H)`.
+- The quadratic seabed friction is applied as a `BulkDrag` bottom boundary condition with
+  the caller's `cd_drag`. `HydrostaticFreeSurfaceModel` has no `bottom_drag` or
+  `cd_drag` keyword in this build, and `Default` is not part of Oceananigans' public API,
+  so the coefficient is carried by the boundary condition rather than by the model
+  constructor.
 - `tidal_placement = :boundary` (default): under hydrostatic primitive equations, vertical velocity
   is diagnostic:
   ```math
@@ -261,12 +265,7 @@ function build_hydrodynamic_model(
     base_g = grid isa ImmersedBoundaryGrid ? grid.underlying_grid : grid
     (lon_min_grid, lon_max_grid), (lat_min_grid, lat_max_grid) = grid_geographic_bounds(base_g)
 
-    # Interior forcing: tides plus the lateral sponge, matching the manual builder's CPU path.
-    # Construct proper bitstype forcing structs that Oceananigans can call in GPU kernels.
-
-    # Interior forcing: tides plus the lateral sponge, matching the manual builder's CPU path.
-    # Construct proper bitstype forcing structs that Oceananigans can call in GPU kernels.
-    # Extract values from NamedTuples properly.
+    # The tidal velocity, as a callable the sponge can relax toward.
     u_tide_val = isnothing(tidal_forcing) ? nothing : tidal_forcing.u
     v_tide_val = isnothing(tidal_forcing) ? nothing : tidal_forcing.v
 
@@ -283,32 +282,41 @@ function build_hydrodynamic_model(
     # Sponge relaxation, expressed as an Oceananigans `Relaxation`.
     #
     # `Relaxation(; rate, mask, target)` contributes
-    #     rate * mask(X) * (target(X, t) - field)
+    #     rate * mask(X) * (target(X) - field)
     # which, with `rate = 1/tau_relax` and `mask = gamma`, is exactly the sponge tendency
-    # `-gamma * (psi - ref) / tau_relax`. This replaces an earlier
-    # `ContinuousForcing(...; field_dependencies = (:u, :v))`, which had to be spelled that way
-    # because the closure needed the instantaneous velocity.
+    # `-gamma * (psi - ref) / tau_relax`.
     #
-    # That declaration is what broke the GPU: a `ContinuousForcing` carrying *any*
-    # `field_dependencies` produced invalid LLVM IR in
-    # `gpu_compute_hydrostatic_free_surface_Gu!` (Oceananigans 0.111 + CUDA.jl 6), for velocity
-    # and tracer dependencies alike. `Relaxation` needs no dependency declaration at all -- it
-    # reads the field it relaxes through `r.relaxed`, which the materializer rebinds to the model
-    # field and `Adapt`s per device -- so it lowers cleanly.
+    # What a `Relaxation` target may be, on the GPU, is the whole of the difficulty, and it
+    # is worth stating plainly because the two obvious answers are each wrong in one
+    # direction:
+    #
+    #   * A target that is a `Field` lowers. The materializer turns it into the field's
+    #     device array and the tendency kernel indexes it. The field must have the same
+    #     data layout -- size AND offsets -- as the field being relaxed, which is what
+    #     `XFaceField(grid)` and `CenterField(grid)` give for `u` and `v` and for the
+    #     tracers respectively.
+    #
+    #   * A target that is a CALLABLE lowers only if the callable is `isbits`. A closure
+    #     over the tidal coefficients is, because they are a small NamedTuple of numbers
+    #     and can be passed by value. A closure over an interpolation object is not, and
+    #     CUDA rejects it with "passing non-bitstype argument". A spatially varying
+    #     boundary velocity is not `isbits` however it is built, so it has to arrive as
+    #     a field.
+    #
+    # Note also that a failure to lower is reported from an UNRELATED kernel -- the
+    # free-surface one is a common culprit, because the model is a single object and the
+    # CUDA compiler fails on whichever kernel it reaches first. An error in
+    # `gpu_compute_hydrostatic_free_surface_Gu!` therefore says nothing about the free
+    # surface; it says that something in the model does not lower.
     #
     # The tidal body forcing is kept as a separate additive term via `MultipleForcings`, so the
     # total is numerically identical to the previous construction:
     #     tide(x, y, z, t) + rate * gamma * (ref - u)
     if sponge_active
-        sponge_relaxation = LateralBoundaryRelaxation(
-            (lon_min_grid, lon_max_grid), (lat_min_grid, lat_max_grid);
-            sponge_width_deg = sponge_width,
-            tau_relax = sponge_tau,
-            u_inflow = u_inflow,
-            v_inflow = v_inflow,
-            u_decay = u_decay,
-            v_decay = v_decay
-        )
+        # The reference profiles the momentum sponge relaxes toward when the boundary
+        # source carries no currents. The sponge's geometry is the mask and its rate is
+        # the `Relaxation`; this is only the velocity profile.
+        (u_ref, v_ref) = reference_inflow_profiles(u_inflow, v_inflow, u_decay, v_decay)
 
         relax_rate = 1.0 / Float64(sponge_tau)
         # Quadratic sponge weight, zero in the interior and 1 on the designated open boundaries.
@@ -334,23 +342,23 @@ function build_hydrodynamic_model(
         #
         # The target is a FIELD, and that is not incidental. A `Relaxation` whose target is
         # a `Field` lowers into a GPU kernel; one whose target is a callable does not,
-        # unless the callable is `isbits` -- and a spatially varying velocity is not
-        # `isbits` whatever it is built from. The tidal coefficients are a small NamedTuple
-        # of numbers and so can be passed by value, which is why the tidal relaxation has
-        # always been able to be a callable and a momentum one could not be.
+        # unless the callable is `isbits` -- and the observed current is not known to be
+        # expressible as an `isbits` object at all. The tidal coefficients ARE: they are a
+        # small NamedTuple of numbers, which is why the tidal relaxation can be a callable
+        # and the momentum one cannot be.
         u_target = _materialise_boundary_velocity(
             grid,
             if !isnothing(boundary_velocities) && haskey(boundary_velocities, :u)
                 boundary_velocities.u
             else
-                sponge_relaxation.u_ref
+                u_ref
             end, :x)
         v_target = _materialise_boundary_velocity(
             grid,
             if !isnothing(boundary_velocities) && haskey(boundary_velocities, :v)
                 boundary_velocities.v
             else
-                sponge_relaxation.v_ref
+                v_ref
             end, :y)
 
         # Disentangle the upstream inflow momentum forcing from the lateral radiation sponge.
@@ -490,27 +498,26 @@ function build_hydrodynamic_model(
     #      outside are not represented.
     #   3. It covers T and S only. A model carrying oxygen (`enable_o2`) relaxes the other
     #      tracers not at all.
-    #   4. Boundary targets are materialized onto `CenterField(grid)` objects so they
-    #      execute natively on both CPU and GPU without run-time interpolation overhead
-    #      or non-isbits closure restrictions. That is possible for a tracer, whose
-    #      `Relaxation` reads a field target correctly; the MOMENTUM sponge cannot use a
-    #      field target, because Oceananigans' field-target `Relaxation` computes an
-    #      exactly zero tendency for a face-located velocity field, so the momentum
-    #      target is a callable instead.
+    #   4. The boundary targets are materialised onto `CenterField(grid)` objects, which is
+    #      what makes them usable as a `Relaxation` target on the GPU. A target that is a
+    #      closure over an interpolation object is not `isbits` and CUDA rejects it; a
+    #      target that is a field is adapted to the device array and indexed by the
+    #      tendency kernel, and it must have the same data layout as the field being
+    #      relaxed. The momentum sponge does the same thing on the velocity's own faces.
     #
     # Closing any of these needs a source that supplies the missing quantity -- a reanalysis
     # with currents (GLORYS) for (1), a dated series rather than a climatology for (2). It
     # does not need more code here; the code is not the missing part.
     if !isnothing(boundary_tracers) && sponge_active
         # The tracer sponge relaxes the boundary band toward observed temperature and
-        # salinity (WOA23 or GLORYS12V1). Rather than passing a host-bound closure capturing
-        # an interpolation object (which is not isbits and cannot be lowered into a GPU kernel),
-        # the target is materialized onto a `CenterField(grid)`.
+        # salinity (WOA23 or GLORYS12V1).
         #
-        # In Oceananigans, a `Field` target in `Relaxation` is directly adapted to a device
-        # array (`CuDeviceArray` on GPU, `Array` on CPU) and indexed as `target[i, j, k]`.
-        # This executes natively on both CPU and GPU architectures without run-time
-        # interpolation overhead in the tendency kernel.
+        # The target is materialised onto a `CenterField(grid)`. A closure over the
+        # interpolation object is not `isbits` and does not lower into a GPU kernel; a
+        # field is adapted to the device array (`CuDeviceArray` on GPU, `Array` on CPU) and
+        # indexed as `target[i, j, k]` by the tendency kernel, with no run-time
+        # interpolation in the kernel at all. `CenterField(grid)` has the same data layout
+        # -- size and offsets -- as the tracers it relaxes.
         for (nm, itp) in pairs(boundary_tracers)
             target_field = CenterField(grid)
             set!(target_field, (x, y, z) -> Float64(itp(x, y, z)))
@@ -564,9 +571,9 @@ function build_hydrodynamic_model(
         # `model.buoyancy.formulation.equation_of_state`, exactly what this construction yields.
         :buoyancy => SeawaterBuoyancy(equation_of_state = TEOS10EquationOfState(; reference_density = Float64(reference_density))),
         # `bottom_drag` / `cd_drag` are not valid `HydrostaticFreeSurfaceModel` kwargs in this
-        # pinned Oceananigans build; they are left at the library default. Bottom drag is
-        # applied through the sponge relaxation path (`LateralBoundaryRelaxation`) instead.
-        # The read side (`model_equation_of_state` in `simulation.jl`) expects
+        # pinned Oceananigans build, so the quadratic seabed friction is applied as a
+        # `BulkDrag` bottom boundary condition instead (see `bottom_drag_bc` above). The
+        # read side (`model_equation_of_state` in `simulation.jl`) expects
         # `model.buoyancy.formulation.equation_of_state`, exactly what this construction yields.
         :boundary_conditions => merge(user_bcs, boundary_conditions),
         :forcing => merged_forcing
@@ -1311,45 +1318,21 @@ T_{\\text{freeze}}(S) = -0.0575 S + 0.00171 S^{1.5} - 0.000215 S^2
 end
 
 """
-    LateralBoundaryRelaxation{TF}
-
-Bitstype lateral boundary sponge relaxation forcing following Price & Aumont (2011)
-and Arctic Ocean shelf modeling implementations. Rather than imposing artificial localized
-surface wind stress to drive regional shelf circulation, lateral boundary relaxation nudges
-prognostic velocities \$(u, v)\$ and active tracers \$(T, S, O_2)\$ towards upstream and open ocean
-hydrographic boundary conditions within peripheral sponge zones.
-
-# Mathematical & Governing Formulation
-```math
-F_{\\text{relax}}(x, y, z, t, \\psi) = -\\frac{\\gamma(x, y)}{\\tau_{\\text{relax}}} \\left(\\psi - \\psi_{\\text{ref}}(x, y, z, t)\\right)
-```
-where the sponge relaxation weight \$\\gamma(x, y) \\in [0, 1]\$ increases smoothly (quadratically)
-from 0.0 at the interior edge of the sponge layer to 1.0 at the outer domain boundary.
-
-# References
-- Price, J. F., & Aumont, O. (2011). Lateral boundary conditions and regional shelf circulation.
-  *Journal of Physical Oceanography*, 41(5), 903-921.
-"""
-struct LateralBoundaryRelaxation{TU, TV}
-    lon_domain       :: Tuple{Float64, Float64}
-    lat_domain       :: Tuple{Float64, Float64}
-    sponge_width_deg :: Float64
-    tau_relax        :: Float64
-    u_inflow         :: Float64
-    v_inflow         :: Float64
-    u_ref            :: TU
-    v_ref            :: TV
-end
-
-"""
     ExponentialInflow{T}
 
 Bitstype reference profile for open-boundary inflow, \$\\psi_{ref}(z) = A \\exp(z / d)\$.
 
-A concrete struct is used rather than a closure so that the sponge forcing built from it
-stays `isbits`. A closure capturing `A` and `d` is *not* `isbits`, which makes the enclosing
-`ContinuousForcing` unlowerable into a GPU kernel and triggers
-`KernelError: passing non-bitstype argument`.
+This is the FALLBACK target, used when the boundary source carries no currents: a
+uniform velocity of `u_inflow` over the whole open face, decaying downward with an
+e-folding depth of `u_decay`. It is an approximation standing in for a real current, and
+for the Scotian Shelf the current it stands in for -- the Nova Scotia Current -- is a
+southwestward, slope-following jet in the 200-400 m layer, which a surface-intensified
+zonal profile is not. A source that carries velocities (GLORYS12V1 does) replaces it.
+
+A concrete struct is used rather than a closure because a closure capturing `A` and `d`
+is not `isbits`, and a callable relaxation target is passed by value into a GPU kernel.
+A closure over a non-`isbits` object is rejected by CUDA with "passing non-bitstype
+argument".
 """
 struct ExponentialInflow{T <: AbstractFloat}
     amplitude::T
@@ -1360,100 +1343,25 @@ end
 Adapt.adapt_structure(to, f::ExponentialInflow) = f
 
 """
-    LateralBoundaryRelaxation(lon_domain, lat_domain; kwargs...)
+    reference_inflow_profiles(u_inflow, v_inflow, u_decay, v_decay) -> (u_ref, v_ref)
 
-Construct a regional lateral boundary relaxation sponge zone following Price & Aumont (2011).
+The two reference profiles the momentum sponge relaxes toward when the boundary source
+carries no currents: a uniform velocity of `u_inflow` (and `v_inflow`) over the whole
+open face, decaying downward with an e-folding depth of `u_decay` (and `v_decay`).
 
-# Arguments
-- `lon_domain::Tuple{Real, Real}`: Zonal domain boundaries (lon_min, lon_max) in °E.
-- `lat_domain::Tuple{Real, Real}`: Meridional domain boundaries (lat_min, lat_max) in °N.
-
-# Keyword Arguments
-- `sponge_width_deg::Real=0.5`: Width of peripheral buffer sponge layer in degrees.
-- `tau_relax::Real=86400.0`: Relaxation timescale \$\\tau\$ in seconds (default 1 day).
-- `u_inflow::Real=-0.15`: Reference zonal upstream inflow velocity in m/s.
-- `v_inflow::Real=0.05`: Reference meridional upstream inflow velocity in m/s.
-- `u_decay::Real=100.0`: e-folding depth of the zonal reference profile in metres.
-- `v_decay::Real=100.0`: e-folding depth of the meridional reference profile in metres.
-
-# Notes
-`u_ref`/`v_ref` default to [`ExponentialInflow`](@ref) values rather than closures so the
-result is `isbits` and can be compiled for GPU.
+Following Price & Aumont (2011), *J. Phys. Oceanogr.*, 41(5), 903-921: rather than
+imposing artificial localised surface wind stress to drive regional shelf circulation, a
+lateral boundary relaxation nudges prognostic velocities and tracers towards upstream and
+open-ocean hydrographic boundary conditions within peripheral sponge zones. The sponge
+weight γ rises quadratically from 0 at the interior edge of the sponge to 1 at the
+domain wall; that weight is [`CartesianSpongeMask`](@ref), and the relaxation rate is the
+`Relaxation` built from it.
 """
-function LateralBoundaryRelaxation(
-    lon_domain::Tuple{Real, Real},
-    lat_domain::Tuple{Real, Real};
-    sponge_width_deg::Real = 0.5,
-    tau_relax::Real = 86400.0,
-    u_inflow::Real = -0.15,
-    v_inflow::Real = 0.05,
-    u_decay::Real = 100.0,
-    v_decay::Real = 100.0
-)
-    return LateralBoundaryRelaxation(
-        (Float64(lon_domain[1]), Float64(lon_domain[2])),
-        (Float64(lat_domain[1]), Float64(lat_domain[2])),
-        Float64(sponge_width_deg),
-        Float64(tau_relax),
-        Float64(u_inflow),
-        Float64(v_inflow),
-        ExponentialInflow(Float64(u_inflow), Float64(u_decay)),
-        ExponentialInflow(Float64(v_inflow), Float64(v_decay))
-    )
+function reference_inflow_profiles(u_inflow::Real, v_inflow::Real,
+                                   u_decay::Real, v_decay::Real)
+    return (ExponentialInflow(Float64(u_inflow), Float64(u_decay)),
+            ExponentialInflow(Float64(v_inflow), Float64(v_decay)))
 end
-
-@inline function _sponge_relaxation(r::LateralBoundaryRelaxation, ref, x, y, z, t, psi::Real)
-    gamma = compute_sponge_gamma(
-        x, y,
-        r.lon_domain[1], r.lon_domain[2],
-        r.lat_domain[1], r.lat_domain[2],
-        r.sponge_width_deg
-    )
-    if gamma <= 0.0
-        return 0.0
-    end
-    return -gamma * (Float64(psi) - Float64(ref(x, y, z, t))) / r.tau_relax
-end
-
-"""
-    sponge_relaxation_u(r, x, y, z, t, psi) -> Float64
-
-Zonal (\$u\$) sponge relaxation tendency, with no runtime selector argument.
-
-This is the entry point the GPU forcing path uses. It deliberately takes only
-`isbitstype` arguments: a `Symbol` cannot be passed through a CUDA kernel ABI, so a
-`Symbol`-dispatched method makes the enclosing `ContinuousForcing` unlowerable and the
-free-surface kernel fails to compile with `InvalidIRError`. Keeping the two components as
-separate methods keeps the kernel body free of non-bits values.
-"""
-@inline function sponge_relaxation_u(r::LateralBoundaryRelaxation, x, y, z, t, psi::Real)
-    return _sponge_relaxation(r, r.u_ref, x, y, z, t, psi)
-end
-
-"""
-    sponge_relaxation_v(r, x, y, z, t, psi) -> Float64
-
-Meridional (\$v\$) sponge relaxation tendency; see [`sponge_relaxation_u`](@ref) for why this
-is separate rather than `Symbol`-dispatched.
-"""
-@inline function sponge_relaxation_v(r::LateralBoundaryRelaxation, x, y, z, t, psi::Real)
-    return _sponge_relaxation(r, r.v_ref, x, y, z, t, psi)
-end
-
-# Runtime-selected forms, retained for host-side and test callers. These are deliberately
-# not used to build GPU forcing: the `Symbol` argument is what makes them unlowerable.
-@inline function (r::LateralBoundaryRelaxation)(x, y, z, t, var::Symbol, psi::Real)
-    return if var === :u
-        sponge_relaxation_u(r, x, y, z, t, psi)
-    elseif var === :v
-        sponge_relaxation_v(r, x, y, z, t, psi)
-    else
-        0.0
-    end
-end
-
-@inline (r::LateralBoundaryRelaxation)(x, y, z, t, psi) = sponge_relaxation_u(r, x, y, z, t, psi)
-@inline (r::LateralBoundaryRelaxation)(x, y, z, t) = 0.0
 
 """
     compute_sponge_gamma(
@@ -1526,21 +1434,6 @@ end
         x, y, lon_min, lon_max, lat_min, lat_max, sponge_width,
         true, true, true, true
     )
-end
-
-"""
-    compute_sponge_velocity_target(u_inflow_mean, v_inflow_mean, u_decay, v_decay, z) -> Tuple{Float64, Float64}
-
-Compute the target velocity for sponge relaxation with exponential depth decay.
-"""
-@inline function compute_sponge_velocity_target(
-    u_inflow_mean::Real, v_inflow_mean::Real,
-    u_decay::Real, v_decay::Real,
-    z::Real
-)::Tuple{Float64, Float64}
-    u_target = Float64(u_inflow_mean) * exp(Float64(z) / Float64(u_decay))
-    v_target = Float64(v_inflow_mean) * exp(Float64(z) / Float64(v_decay))
-    return (u_target, v_target)
 end
 
 """
