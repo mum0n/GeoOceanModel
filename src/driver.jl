@@ -792,6 +792,37 @@ end
         error("u_inflow and v_inflow must be numbers")
     end
 
+    # Optional observation nudging from TOML [observations] (paths only; "" disables).
+    obs_forcing = NamedTuple()
+    try
+        cfg_path = isdefined(opts, :config_file) ? opts.config_file : ""
+        if isfile(cfg_path)
+            cfg_dict = TOML.parsefile(cfg_path)
+            obs_cfg = get(cfg_dict, "observations", Dict{String, Any}())
+            method = string(get(obs_cfg, "assimilation_method", "none"))
+            if method != "none"
+                tau = Float64(get(obs_cfg, "nudging_tau_seconds", 3600.0))
+                vmin = Float64(get(obs_cfg, "qc_vmin", -5.0))
+                vmax = Float64(get(obs_cfg, "qc_vmax", 40.0))
+                bobs = load_observation_csv(string(get(obs_cfg, "bottom_temperature_file", "")))
+                pobs = load_observation_csv(string(get(obs_cfg, "profile_file", "")))
+                obs = (
+                    lon = vcat(bobs.lon, pobs.lon),
+                    lat = vcat(bobs.lat, pobs.lat),
+                    time = vcat(bobs.time, pobs.time),
+                    depth = vcat(bobs.depth, pobs.depth),
+                    value = vcat(bobs.value, pobs.value),
+                )
+                of = build_observation_nudging(obs; tau = tau, vmin = vmin, vmax = vmax)
+                if !isnothing(of)
+                    obs_forcing = (T = of,)
+                end
+            end
+        end
+    catch err
+        @warn "Observation nudging disabled: $(sprint(showerror, err))"
+    end
+
     # SplitExplicitFreeSurface with explicit substepping (substeps = 45).
     # Provides an averaging filter for fast barotropic gravity waves over steep
     # bathymetry, suppressing 2-delta numerical resonance near open boundaries.
@@ -835,6 +866,7 @@ end
         free_surface = free_surf,
         momentum_advection = WENO(),
         tracer_advection = WENO(),
+        forcing = obs_forcing,
         lon_range = opts.domain_lon,
         lat_range = opts.domain_lat,
         mask_bay_of_fundy = opts.mask_bay_of_fundy,
@@ -1129,10 +1161,12 @@ function run_segment_simulation(;
     elseif file_info.exists && !file_info.is_complete && file_info.last_time <= 0
         discard_run!("Existing store $(basename(store_path)) is incomplete with no recorded progress.")
     elseif file_info.exists && failed_before && opts.auto_restart
-        discard_run!(
-            "A previous attempt to continue this run from t = " *
-            "$(round(file_info.last_time / 3600.0, digits=2)) h did not get any further " *
-            "(the store's stored time is unchanged).")
+        println("WARNING: a previous attempt to continue this run from t = " *
+                "$(round(file_info.last_time / 3600.0, digits=2)) h made no further " *
+                "progress (the store's stored time is unchanged). The interruption " *
+                "may be transient, so the existing $(file_info.n_timesteps) snapshot(s) " *
+                "are kept and the resume is retried rather than discarded.")
+        resume = true
     elseif file_info.exists && !file_info.is_complete && opts.auto_restart
         println("Found interrupted simulation on the store at: $(store_path)")
         println("  (progress: $(round(file_info.last_time / 3600.0, digits=2)) of " *

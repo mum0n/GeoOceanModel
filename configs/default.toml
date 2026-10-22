@@ -140,3 +140,14 @@ anim_output_path = ""         # Custom destination path for animation video
 use_gpu = true                # Enable NVIDIA CUDA GPU acceleration
 fallback_to_cpu = false       # Reject silent degradation to CPU if GPU requested
 seed = 42                     # Master RNG seed
+
+[observations]
+# Optional observation files used to guide hydrodynamics. Empty path disables.
+bottom_temperature_file = "data/observations/bottom_temperatures.csv"
+profile_file = "data/observations/profiles.csv"
+assimilation_method = "optimal_interpolation"  # "nudging", "optimal_interpolation", "none"
+nudging_tau_seconds = 3600.0
+qc_vmin = -5.0
+qc_vmax = 40.0
+B = 1.0
+R = 1.0

@@ -71,8 +71,15 @@ include("data/geodata/geodata_integration.jl")
 # bodies reach for is already defined; it adds the run driver the CLI dispatches to.
 include("driver.jl")
 include("assimilation.jl")
+include("data_assimilation.jl")
 
 export stitch_shelf_domains,
-    CartesianSpongeMask
+    CartesianSpongeMask,
+    qc_observations,
+    obs_indices,
+    nudging_tendency,
+    optimal_interpolation,
+    load_observation_csv,
+    build_observation_nudging
 
 end # module

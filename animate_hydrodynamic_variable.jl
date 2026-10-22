@@ -30,7 +30,8 @@ const DEFAULT_STORE = "C:/Users/Nathalie/projects/lakehouse/GeoOceanModel/scotia
 const SUPPORTED_VARIABLES = (:temperature, :salinity, :u, :v, :w, :speed, :flow)
 
 const FPS = 2                    # frames per second
-const N_FRAMES = nothing         # nothing = use all available time steps
+const N_FRAMES = nothing         # nothing = use all available time steps (after time-interval selection)
+const TIME_INTERVAL_DAYS = 1.0   # default days between animation frames
 # The figure's size, in pixels. The flow arrows are drawn in pixels and converted back
 # to data units, so the geometry needs it.
 const FIG_SIZE = (1200, 600)
@@ -55,14 +56,15 @@ const VARIABLE_SPEC = Dict(
 
 function usage()
     println("""
-    Usage: julia --project=. animate_hydrodynamic_variable.jl [variable] [depth] [store]
+    Usage: julia --project=. animate_hydrodynamic_variable.jl [variable] [depth] [store] [days_per_frame]
 
-      variable : $(join(SUPPORTED_VARIABLES, " | "))   (default: temperature)
-      depth    : metres below the surface (50, -50), or "surface"   (default: surface)
-      store    : path to the GeoData store   (default: $(DEFAULT_STORE))
+      variable      : $(join(SUPPORTED_VARIABLES, " | "))   (default: temperature)
+      depth         : metres below the surface (50, -50), "surface", or "bottom"   (default: surface)
+      store         : path to the GeoData store   (default: $(DEFAULT_STORE))
+      days_per_frame: days between animation frames   (default: $TIME_INTERVAL_DAYS)
 
-      "flow" draws the horizontal current as arrows over the speed: the store holds
-      (u, v) as separate fields, and only the pair is a vector.
+      Flags: --bottom, --interval-days=N, --variable=..., --store=..., --depth=...
+      "flow" draws the horizontal current as arrows over the speed.
     """)
 end
 
@@ -94,6 +96,94 @@ function parse_depth(text::AbstractString)
 end
 
 """
+    bottom_level(depths, bathy, i, j) -> Union{Int, Nothing}
+
+The index of the deepest wet vertical level at horizontal cell (i, j), using the
+seabed height when available. The store's depth axis runs deepest first, so this
+is the first level whose depth is at or above the seabed.
+"""
+function bottom_level(depths, bathy, i::Int, j::Int)
+    bval = if bathy isa AbstractMatrix && size(bathy, 1) >= i && size(bathy, 2) >= j
+        bathy[i, j]
+    else
+        nothing
+    end
+    for (kk, z) in enumerate(depths)
+        if !isfinite(z)
+            continue
+        end
+        if bval === nothing || !isfinite(bval) || z >= bval
+            return kk
+        end
+    end
+    return nothing
+end
+
+"""
+    bottom_matrix(ds, arr3d::AbstractArray{<:Real,3}) -> Matrix{Float64}
+
+Extract the bottom-most value of a 3D field, cell by cell, rather than at one
+uniform depth level.
+
+When the store carries bathymetry, the deepest wet level is the first level whose
+depth is at or above the seabed. When bathymetry is absent (as in some GeoData
+stores), the deepest level holding a finite (non-NaN) value is used instead --
+levels below the seabed hold no real water and must not be mistaken for the bottom.
+"""
+function bottom_matrix(ds, arr3d::AbstractArray{<:Real,3})
+    depths = ds.depths
+    bathy = hasproperty(ds, :bathymetry) ? ds.bathymetry : nothing
+    nx, ny = size(arr3d, 1), size(arr3d, 2)
+    nz = size(arr3d, 3)
+    out = fill(NaN, nx, ny)
+    for i in 1:nx, j in 1:ny
+        kb = if bathy isa AbstractMatrix && size(bathy, 1) >= i && size(bathy, 2) >= j
+            bval = bathy[i, j]
+            _bottom_level_by_bathy(depths, bval)
+        else
+            # No bathymetry: find the deepest level holding a finite (wet) value.
+            _bottom_level_by_field(arr3d, i, j, nz)
+        end
+        isnothing(kb) && continue
+        out[i, j] = Float64(arr3d[i, j, kb])
+    end
+    return out
+end
+
+"""
+    _bottom_level_by_bathy(depths, bval) -> Union{Int, Nothing}
+
+Deepest wet level from seabed height `bval`. The depth axis runs deepest first,
+so this is the first level whose depth is at or above the seabed (z >= bval).
+"""
+function _bottom_level_by_bathy(depths::AbstractVector{<:Real}, bval::Real)
+    for (kk, z) in enumerate(depths)
+        if isfinite(z) && z >= bval
+            return kk
+        end
+    end
+    return nothing
+end
+
+"""
+    _bottom_level_by_field(arr3d, i, j, nz) -> Union{Int, Nothing}
+
+Deepest level holding a finite value at cell (i, j), scanning deepest first.
+Used when bathymetry is unavailable; levels below the seabed hold no real water.
+"""
+function _bottom_level_by_field(arr3d::AbstractArray{<:Real,3}, i::Int, j::Int, nz::Int)
+    for k in 1:nz
+        v = Float64(arr3d[i, j, k])
+        if isfinite(v)
+            return k
+        end
+    end
+    return nothing
+end
+    return out
+end
+
+"""
     _load_coastline(store) -> Vector{NamedTuple}
 
 The coastline rings to draw over the field: the run's own fetched coastline when the run
@@ -121,16 +211,95 @@ function main()
         return nothing
     end
 
-    variable = isempty(ARGS) ? :temperature : parse_variable(ARGS[1])
-    depth = length(ARGS) < 2 ? nothing : parse_depth(ARGS[2])
-    store = length(ARGS) < 3 ? DEFAULT_STORE : ARGS[3]
+    positional = String[]
+    time_interval_days = TIME_INTERVAL_DAYS
+    bottom = false
+    variable_override = nothing
+    store_override = nothing
+    depth_override_text = nothing
+    i = 1
+    while i <= length(ARGS)
+        tok = String(ARGS[i])
+        if startswith(tok, "--") || contains(tok, "=")
+            if contains(tok, "=")
+                parts = split(tok, "=", limit = 2)
+                key = replace(String(parts[1]), r"^[-]+" => "")
+                val = String(parts[2])
+                advance = 1
+            else
+                key = replace(tok, r"^[-]+" => "")
+                if i < length(ARGS) && !startswith(String(ARGS[i + 1]), "-") && !contains(String(ARGS[i + 1]), "=")
+                    val = String(ARGS[i + 1])
+                    advance = 2
+                else
+                    val = "true"
+                    advance = 1
+                end
+            end
+            lk = lowercase(replace(key, "_" => "-"))
+            if lk in ("interval", "time-interval", "interval-days", "days-per-frame", "frame-interval", "time-step", "timestep")
+                time_interval_days = parse(Float64, val)
+            elseif lk in ("bottom", "bottom-level", "benthic", "seabed")
+                bottom = lowercase(strip(val)) in ("true", "1", "yes", "") ? true : parse(Bool, val)
+            elseif lk == "depth"
+                if lowercase(strip(val)) in ("bottom", "bottom-level", "seabed", "benthic")
+                    bottom = true
+                else
+                    depth_override_text = val
+                end
+            elseif lk == "variable"
+                variable_override = parse_variable(val)
+            elseif lk == "store"
+                store_override = val
+            elseif lk in ("interval-days",)
+                time_interval_days = parse(Float64, val)
+            end
+            i += advance
+        else
+            push!(positional, tok)
+            i += 1
+        end
+    end
+
+    variable = if !isnothing(variable_override)
+        variable_override
+    elseif isempty(positional)
+        :temperature
+    else
+        parse_variable(positional[1])
+    end
+
+    depth_text = if !isnothing(depth_override_text)
+        depth_override_text
+    elseif length(positional) < 2
+        "surface"
+    else
+        positional[2]
+    end
+    if lowercase(strip(depth_text)) in ("bottom", "bottom-level", "seabed", "benthic")
+        bottom = true
+        depth = nothing
+    else
+        depth = parse_depth(depth_text)
+    end
+
+    store = if !isnothing(store_override)
+        store_override
+    elseif length(positional) < 3
+        DEFAULT_STORE
+    else
+        positional[3]
+    end
+    if length(positional) >= 4
+        time_interval_days = parse(Float64, positional[4])
+    end
     isdir(store) || error("No store at $(store).")
 
     # The output is named for what it holds, so a run of one variable at one depth does
     # not overwrite the run of another.
     output_dir = joinpath(dirname(store), "outputs")
     mkpath(output_dir)
-    depth_tag = isnothing(depth) ? "surface" : replace(string(abs(depth)), "." => "p")
+    depth_tag = bottom ? "bottom" : (isnothing(depth) ? "surface" : replace(string(abs(depth)), "." => "p"))
     output_path = joinpath(output_dir, "$(variable)_$(depth_tag)_animation.mp4")
 
     field, factor, var_label = VARIABLE_SPEC[variable]
@@ -140,7 +309,8 @@ function main()
     println("="^60)
     println("Store:      $store")
     println("Variable:   $variable")
-    println("Depth:      ", isnothing(depth) ? "the surface layer" : "$(depth) m")
+    println("Depth:      ", bottom ? "ocean bottom" : (isnothing(depth) ? "the surface layer" : "$(depth) m"))
+    println("Time step:  $time_interval_days day(s) per frame")
     println("FPS:        $FPS")
     println("Output:     $output_path")
     println("="^60)
@@ -152,10 +322,14 @@ function main()
     # with hundreds of intervals pays hundreds of full reads to learn what the store
     # already states.
     n_times = 0
+    times_all = Float64[]
     try
         probe = GeoData.geoload(store; backend = :zarr)
         if haskey(probe.dims, :time)
             n_times = probe.dims[:time].size
+        end
+        if hasproperty(probe, :coords) && haskey(probe.coords, :time)
+            times_all = collect(Float64, probe.coords[:time].data)
         end
     catch err
         println("Could not read the store's time axis: $(sprint(showerror, err))")
@@ -175,19 +349,39 @@ function main()
     # The level the reader resolved: the surface layer unless a depth was named. Taken
     # from the reader rather than computed here, so the figure and the data cannot
     # disagree about which layer this is.
-    k = ds_first.depth_index
-    depth_m = ds_first.depth_m
+    k = if bottom
+        argmin(ds_first.depths)
+    else
+        ds_first.depth_index
+    end
+    depth_m = ds_first.depths[k]
 
     println("Grid: $(length(lons)) × $(length(lats)) × $(length(depths))")
     println("Depth: level $k of $(length(depths)) = $(round(depth_m, digits=1)) m " *
             "(the store's depth axis runs deepest first)")
 
     # Determine frame indices
-    if N_FRAMES === nothing
-        frame_indices = 1:n_times
+    selected = if isempty(times_all) || length(times_all) != n_times
+        collect(1:n_times)
     else
-        n_frames = min(N_FRAMES, n_times)
-        frame_indices = round.(Int, range(1, n_times, length = n_frames))
+        interval_sec = time_interval_days * 86400.0
+        out = Int[1]
+        last_t = times_all[1]
+        for i in 2:n_times
+            if isfinite(times_all[i]) && times_all[i] >= last_t + interval_sec - 1e-6
+                push!(out, i)
+                last_t = times_all[i]
+            elseif times_all[i] < last_t
+                last_t = times_all[i]
+            end
+        end
+        length(out) < 2 ? collect(1:n_times) : out
+    end
+    if N_FRAMES === nothing
+        frame_indices = selected
+    else
+        n_frames = min(N_FRAMES, length(selected))
+        frame_indices = selected[round.(Int, range(1, length(selected), length = n_frames))]
     end
     total_frames = length(frame_indices)
     println("Frames to render: $total_frames")
@@ -203,6 +397,14 @@ function main()
 
     # The field at the resolved level, in display units.
     function field_of(ds)
+        if bottom
+            if field === :speed || field === :flow
+                u = bottom_matrix(ds, Float64.(ds.u)) .* factor
+                v = bottom_matrix(ds, Float64.(ds.v)) .* factor
+                return sqrt.(u .^ 2 .+ v .^ 2)
+            end
+            return bottom_matrix(ds, Float64.(ds[Symbol(field)])) .* factor
+        end
         if field === :speed || field === :flow
             u = Float64.(ds.u[:, :, k]) * factor
             v = Float64.(ds.v[:, :, k]) * factor
@@ -309,8 +511,14 @@ function main()
         # The scale: the fastest arrow spans ARROW_PIXELS, and every other arrow is
         # proportional to it. Stated on the figure, because an arrow of unstated length
         # is a decoration.
-        u0, v0 = Float64.(get_slice(first(frame_indices)).u[:, :, k]) * 100.0,
-        Float64.(get_slice(first(frame_indices)).v[:, :, k]) * 100.0
+        ds0 = get_slice(first(frame_indices))
+        if bottom
+            u0 = bottom_matrix(ds0, Float64.(ds0.u)) .* factor
+            v0 = bottom_matrix(ds0, Float64.(ds0.v)) .* factor
+        else
+            u0 = Float64.(ds0.u[:, :, k]) * factor
+            v0 = Float64.(ds0.v[:, :, k]) * factor
+        end
         sp0 = sqrt.(u0 .^ 2 .+ v0 .^ 2)
         sp_max = maximum(filter(isfinite, sp0))
         # The same field in pixels: the reference for every arrow's length.
@@ -341,8 +549,13 @@ function main()
         hm_data[] = field_of(ds)
 
         if field === :flow
+        if bottom
+            uu = bottom_matrix(ds, Float64.(ds.u)) .* 100.0
+            vv = bottom_matrix(ds, Float64.(ds.v)) .* 100.0
+        else
             uu = Float64.(ds.u[:, :, k]) * 100.0
             vv = Float64.(ds.v[:, :, k]) * 100.0
+        end
             dirs = Vec2f[]
             for (n, _) in enumerate(arrow_pts)
                 i_idx = (n - 1) ÷ length(lat_idx) + 1
@@ -364,7 +577,8 @@ function main()
             arrow_dirs[] = dirs
         end
 
-        title_lbl.text[] = "$var_label at $(round(depth_m, digits=1)) m depth — " *
+        depth_desc = bottom ? "ocean bottom" : "$(round(depth_m, digits=1)) m depth"
+        title_lbl.text[] = "$var_label at $depth_desc — " *
                            "Time: $(round(t_hr, digits=1)) h  (Step $i / $n_times)" *
                            (isempty(arrow_scale_note) ? "" : "\n$arrow_scale_note")
 
