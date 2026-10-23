@@ -341,9 +341,34 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
         # and every consumer -- the larval half and the figures -- then hand-rolls its own
         # Zarr walk. That is exactly what they were doing.
         nt = _interval_count(sim, cb)
-        ds = _build_store_dataset(output_zarr_path(cb.output_dir), ax, cb.field_names, nt,
-                                  sim.model)
-        cb.store_ds = ds
+        st = output_zarr_path(cb.output_dir)
+        old_time = nothing
+        old_fields = nothing
+        old_nt = 0
+        if ispath(st)
+            old_ds = GeoData.geoload(st; backend = :zarr)
+            old_nt = size(old_ds.variables[cb.field_names[1]].data, 4)
+            if old_nt >= nt
+                ds = GeoData.geoload(st; backend = :zarr, mode = "w")
+                cb.store_ds = ds
+            else
+                old_time = copy(old_ds.coords[:time].data)
+                old_fields = Dict(name => copy(old_ds.variables[name].data) for name in cb.field_names)
+                ds = _build_store_dataset(st, ax, cb.field_names, nt, sim.model)
+                cb.store_ds = ds
+                cb.written[] = old_nt + 1
+            end
+        else
+            ds = _build_store_dataset(st, ax, cb.field_names, nt, sim.model)
+            cb.store_ds = ds
+        end
+        if !isnothing(old_fields)
+            for i in 1:old_nt
+                for name in cb.field_names
+                    ds.variables[name].data[:, :, :, i] .= old_fields[name][:, :, :, i]
+                end
+            end
+        end
     end
     if isnothing(cb.time_array)
         # The store's own time array, opened once. See the note where it is written: this is
@@ -355,6 +380,11 @@ function (cb::GeodataOutputCallback)(sim::Oceananigans.Simulation)
         # copy, so a run's time axis stays the placeholder it was created with.
         g = Zarr.zopen(output_zarr_path(cb.output_dir), "w")
         cb.time_array = g.arrays["time"]
+        if !isnothing(old_time)
+            for i in 1:old_nt
+                cb.time_array[i] = old_time[i]
+            end
+        end
     end
 
     # `time` lives on the model's clock, not on the Simulation: `Simulation` has no `clock`
