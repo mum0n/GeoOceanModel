@@ -113,6 +113,7 @@ function configuration_to_options(config_dict::AbstractDict;
     else
         Bool(get_val("hydrodynamics", "bulk_heat_flux", true))
     end
+    tidal_placement = Symbol(lowercase(strip(String(get_val("tides", "tidal_placement", "boundary")))))
     sst_damping = if haskey(config_dict, "atmosphere") &&
                      haskey(config_dict["atmosphere"], "sst_damping_coefficient")
         Float64(get_val("atmosphere", "sst_damping_coefficient", 0.0))
@@ -238,7 +239,7 @@ function configuration_to_options(config_dict::AbstractDict;
      cp_dir    = String(get_val("storage", "checkpoint_dir",
                                 get_val("runtype", "checkpoint_dir",
                                         get_val("paths", "checkpoint_dir", ""))))
-    cp_clean  = Bool(get_val("storage", "checkpoint_cleanup", true))
+    cp_clean  = Bool(get_val("storage", "checkpoint_cleanup", false))
     auto_res  = Bool(get_val("hydrodynamics", "auto_restart", true))
     v_mode_str = String(get_val("grid", "vertical_stretching_mode", "oceananigans"))
     # Two-segment shelf grid parameters. `vertical_stretching_mode = "two_segment"` splits `nz`
@@ -395,6 +396,7 @@ function configuration_to_options(config_dict::AbstractDict;
         target_cfl = tgt_cfl,
         surface_heat_flux = heat_flux,
         bulk_heat_flux = Bool(bulk_heat_flux),
+        tidal_placement = tidal_placement,
         sst_damping_coefficient = sst_damping,
         sst_target = sst_target_val,
         spinup_hours = spinup_hours_val,

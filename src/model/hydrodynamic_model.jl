@@ -40,6 +40,19 @@ struct CartesianSpongeMask <: Function
 end
 Adapt.adapt_structure(to, s::CartesianSpongeMask) = s
 
+struct TidalMask <: Function
+    mask_bay::Bool
+end
+Adapt.adapt_structure(to, m::TidalMask) = m
+@inline (m::TidalMask)(x, y, z) = m.mask_bay ? (is_in_bay_of_fundy(x, y) ? 0.0 : 1.0) : 1.0
+
+struct MaxMask{A, B} <: Function
+    a::A
+    b::B
+end
+Adapt.adapt_structure(to, m::MaxMask) = MaxMask(Adapt.adapt(to, m.a), Adapt.adapt(to, m.b))
+@inline (m::MaxMask)(x, y, z) = max(m.a(x, y, z), m.b(x, y, z))
+
 @inline function (s::CartesianSpongeMask)(x, y, z)
     gamma_e = if !s.active_east || x <= (s.lon_max - s.sponge_width)
         0.0
@@ -274,9 +287,7 @@ function build_hydrodynamic_model(
     # The tide is applied across the domain. When mask_bay_of_fundy is active, the hypertidal
     # shallows in the Bay of Fundy are masked to zero relaxation weight to prevent forcing
     # unphysical velocity shears near the immersed land boundary.
-    tidal_mask = mask_bay_of_fundy ?
-        ((x, y, z) -> (is_in_bay_of_fundy(x, y) ? 0.0 : 1.0)) :
-        ((x, y, z) -> 1.0)
+    tidal_mask = mask_bay_of_fundy ? TidalMask(true) : TidalMask(false)
 
     # Sponge relaxation, expressed as an Oceananigans `Relaxation`.
     #
@@ -402,7 +413,7 @@ function build_hydrodynamic_model(
             tidal_mask
         else
             # :both or fallback
-            (x, y, z) -> max(sponge_mask(x, y, z), tidal_mask(x, y, z))
+            MaxMask(sponge_mask, tidal_mask)
         end
 
         if !isnothing(u_tide_val)
@@ -438,7 +449,7 @@ function build_hydrodynamic_model(
                         parameters = (rate = relax_rate, mask = sponge_mask))
                 )
             else
-                u_tide_target = (x, y, z, t) -> Float64(u_tide_val(x, y, z, t))
+                u_tide_target = u_tide_val
                 u_forcing = MultipleForcings(
                     u_forcing,
                     Relaxation(rate = tidal_relax_rate, mask = tidal_eff_mask, target = u_tide_target)
@@ -454,7 +465,7 @@ function build_hydrodynamic_model(
                         parameters = (rate = relax_rate, mask = sponge_mask))
                 )
             else
-                v_tide_target = (x, y, z, t) -> Float64(v_tide_val(x, y, z, t))
+                v_tide_target = v_tide_val
                 v_forcing = MultipleForcings(
                     v_forcing,
                     Relaxation(rate = tidal_relax_rate, mask = tidal_eff_mask, target = v_tide_target)

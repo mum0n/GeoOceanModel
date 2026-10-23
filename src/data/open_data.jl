@@ -263,7 +263,11 @@ end
     return sw_net - lw_net - sens - lat
 end
 
-@inline (s::TimeSeriesBulkHeatFlux{N})(x, y, z, t, T_surf) where {N} = s(x, y, t, T_surf)
+struct ConstantHeatFlux <: Function
+    value::Float64
+end
+Adapt.adapt_structure(to, c::ConstantHeatFlux) = ConstantHeatFlux(c.value)
+@inline (c::ConstantHeatFlux)(x, y, t, T_surf) = c.value
 
 """
     HaneyRelaxedHeatFlux{F}
@@ -336,26 +340,46 @@ function build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
             tstep = nt > 1 ? (tvec[end] - tvec[1]) / (nt - 1) : 3600.0
             horizon = nt > 1 ? tvec[end] - tvec[1] : 3600.0
 
-            # Wind stress files carry dynamic stress in Pa (kg m^-1 s^-2).
-            # Oceananigans FluxBoundaryCondition expects kinematic stress (m^2 s^-2),
-            # so divide by reference water density before assigning.
-            # Filter NaN/Inf values to prevent them from propagating into the model
-            # and causing numerical divergence at later time steps.
             rho_water = 1025.0
             tx_tuple = ntuple(k -> begin
-                v = Float64(tx[1, 1, k]) / rho_water
-                isfinite(v) ? v : 0.0
+                v = filter(!isnan, tx[:, :, k])
+                val = isempty(v) ? 0.0 : Statistics.mean(v) / rho_water
+                isfinite(val) ? val : 0.0
             end, nt)
             ty_tuple = ntuple(k -> begin
-                v = Float64(ty[1, 1, k]) / rho_water
-                isfinite(v) ? v : 0.0
+                v = filter(!isnan, ty[:, :, k])
+                val = isempty(v) ? 0.0 : Statistics.mean(v) / rho_water
+                isfinite(val) ? val : 0.0
             end, nt)
-            ta_tuple = ntuple(k -> Float64(ta[1, 1, k]), nt)
-            ps_tuple = ntuple(k -> Float64(ps[1, 1, k]), nt)
-            rh_tuple = ntuple(k -> Float64(rh[1, 1, k]), nt)
-            cc_tuple = ntuple(k -> Float64(cc[1, 1, k]), nt)
-            sw_tuple = ntuple(k -> Float64(sw[1, 1, k]), nt)
-            tau_tuple = ntuple(k -> hypot(Float64(tx[1, 1, k]), Float64(ty[1, 1, k])), nt)
+            ta_tuple = ntuple(k -> begin
+                v = filter(!isnan, ta[:, :, k])
+                isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            end, nt)
+            ps_tuple = ntuple(k -> begin
+                v = filter(!isnan, ps[:, :, k])
+                isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            end, nt)
+            rh_tuple = ntuple(k -> begin
+                v = filter(!isnan, rh[:, :, k])
+                isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            end, nt)
+            cc_tuple = ntuple(k -> begin
+                v = filter(!isnan, cc[:, :, k])
+                isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            end, nt)
+            sw_tuple = ntuple(k -> begin
+                v = filter(!isnan, sw[:, :, k])
+                isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            end, nt)
+            tau_tuple = ntuple(k -> begin
+                txv = filter(!isnan, tx[:, :, k])
+                tyv = filter(!isnan, ty[:, :, k])
+                if isempty(txv) || isempty(tyv)
+                    0.0
+                else
+                    hypot(Statistics.mean(txv), Statistics.mean(tyv))
+                end
+            end, nt)
 
             stress_x = TimeSeriesSurfaceStress{nt}(tx_tuple, horizon, tstep)
             stress_y = TimeSeriesSurfaceStress{nt}(ty_tuple, horizon, tstep)
@@ -376,26 +400,71 @@ function build_bulk_surface_flux(wind_file::AbstractString; albedo::Real = 0.06)
         end
         tx_arr = Array(ds["tau_x"])
         ty_arr = Array(ds["tau_y"])
-        nt = size(tx_arr, 3)
+        nt = size(tx_arr, ndims(tx_arr))
         tstep = 3600.0
         horizon = nt * tstep
 
-        # Spatial average for each time slice
         rho_water = 1025.0
         tx_tuple = ntuple(k -> begin
-            v = filter(!isnan, tx_arr[:, :, k])
+            sl = selectdim(tx_arr, ndims(tx_arr), k)
+            v = filter(!isnan, vec(sl))
             val = isempty(v) ? 0.0 : Float64(Statistics.mean(v)) / rho_water
             isfinite(val) ? val : 0.0
         end, nt)
         ty_tuple = ntuple(k -> begin
-            v = filter(!isnan, ty_arr[:, :, k])
+            sl = selectdim(ty_arr, ndims(ty_arr), k)
+            v = filter(!isnan, vec(sl))
             val = isempty(v) ? 0.0 : Float64(Statistics.mean(v)) / rho_water
             isfinite(val) ? val : 0.0
         end, nt)
 
         stress_x = TimeSeriesSurfaceStress{nt}(tx_tuple, horizon, tstep)
         stress_y = TimeSeriesSurfaceStress{nt}(ty_tuple, horizon, tstep)
-        heat_flux = nothing
+
+        heat_flux = if haskey(ds, "air_temperature") && haskey(ds, "surface_pressure") &&
+                      haskey(ds, "relative_humidity") && haskey(ds, "cloud_fraction") &&
+                      haskey(ds, "sw_down")
+            ta_arr = Array(ds["air_temperature"])
+            ps_arr = Array(ds["surface_pressure"])
+            rh_arr = Array(ds["relative_humidity"])
+            cc_arr = Array(ds["cloud_fraction"])
+            sw_arr = Array(ds["sw_down"])
+            ta_tuple = ntuple(k -> begin
+                sl = selectdim(ta_arr, ndims(ta_arr), k)
+                v = filter(!isnan, vec(sl)); isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            end, nt)
+            ps_tuple = ntuple(k -> begin
+                sl = selectdim(ps_arr, ndims(ps_arr), k)
+                v = filter(!isnan, vec(sl)); isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            end, nt)
+            rh_tuple = ntuple(k -> begin
+                sl = selectdim(rh_arr, ndims(rh_arr), k)
+                v = filter(!isnan, vec(sl)); isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            end, nt)
+            cc_tuple = ntuple(k -> begin
+                sl = selectdim(cc_arr, ndims(cc_arr), k)
+                v = filter(!isnan, vec(sl)); isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            end, nt)
+            sw_tuple = ntuple(k -> begin
+                sl = selectdim(sw_arr, ndims(sw_arr), k)
+                v = filter(!isnan, vec(sl)); isempty(v) ? 0.0 : Float64(Statistics.mean(v))
+            end, nt)
+            tau_tuple = ntuple(k -> begin
+                txsl = selectdim(tx_arr, ndims(tx_arr), k)
+                tysl = selectdim(ty_arr, ndims(ty_arr), k)
+                txv = filter(!isnan, vec(txsl)); tyv = filter(!isnan, vec(tysl))
+                if isempty(txv) || isempty(tyv)
+                    0.0
+                else
+                    hypot(Statistics.mean(txv), Statistics.mean(tyv))
+                end
+            end, nt)
+            TimeSeriesBulkHeatFlux{nt}(
+                ta_tuple, ps_tuple, rh_tuple, cc_tuple, sw_tuple, tau_tuple,
+                horizon, tstep, Float64(albedo))
+        else
+            nothing
+        end
 
         return (stress_x, stress_y, heat_flux)
     end

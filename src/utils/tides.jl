@@ -976,6 +976,44 @@ struct TidalCoefficientGrid{N, NX, NY, NT}
     omega::NTuple{N, Float64}
 end
 
+struct TidalVelocityField{G} <: Function
+    grid::G
+    is_u::Bool
+end
+Adapt.adapt_structure(to, f::TidalVelocityField) = TidalVelocityField(Adapt.adapt(to, f.grid), f.is_u)
+
+@inline function (f::TidalVelocityField)(x, y, z, t)
+    g = f.grid
+    fx = (x - g.lon0) / g.dlon
+    fy = (y - g.lat0) / g.dlat
+    (fx < 0 || fy < 0 || fx > g.nx - 1 || fy > g.ny - 1) && return 0.0
+    i = clamp(floor(Int, fx) + 1, 1, g.nx - 1)
+    j = clamp(floor(Int, fy) + 1, 1, g.ny - 1)
+    tx = fx - floor(fx)
+    ty = fy - floor(fy)
+    a = (1 - tx) * (1 - ty)
+    b = tx * (1 - ty)
+    c = (1 - tx) * ty
+    d = tx * ty
+    N = length(g.omega)
+    s = 0.0
+    Re = f.is_u ? g.uRe : g.vRe
+    Im = f.is_u ? g.uIm : g.vIm
+    for k in 1:N
+        re = Re[k + N*((j-1) + g.ny*(i-1))] * a +
+             Re[k + N*((j-1) + g.ny*(i))] * b +
+             Re[k + N*((j) + g.ny*(i-1))] * c +
+             Re[k + N*((j) + g.ny*(i))] * d
+        im = Im[k + N*((j-1) + g.ny*(i-1))] * a +
+             Im[k + N*((j-1) + g.ny*(i))] * b +
+             Im[k + N*((j) + g.ny*(i-1))] * c +
+             Im[k + N*((j) + g.ny*(i))] * d
+        w = g.omega[k]
+        s += re * cos(w * t) + im * sin(w * t)
+    end
+    s
+end
+
 # `NT = N*NX*NY` is a fourth parameter rather than a computed product, because type
 # parameters cannot be multiplied inside another type parameter's position.
 TidalCoefficientGrid{N, NX, NY}(args...) where {N, NX, NY} =
@@ -1142,37 +1180,8 @@ function tidal_velocity_coefficients(g::TidalCoefficientGrid{N, NX, NY}) where {
     @inline w01(tx, ty) = (1 - tx) * ty
     @inline w11(tx, ty) = tx * ty
 
-    u_vel = @inline (x, y, z, t) -> begin
-        (i, j, tx, ty) = locate(x, y)
-        i == 0 && return 0.0
-        (a, b, c, d) = (w00(tx, ty), w10(tx, ty), w01(tx, ty), w11(tx, ty))
-        s = 0.0
-        for k in 1:N
-            re = at(g.uRe, k, i, j) * a + at(g.uRe, k, i + 1, j) * b +
-                 at(g.uRe, k, i, j + 1) * c + at(g.uRe, k, i + 1, j + 1) * d
-            im = at(g.uIm, k, i, j) * a + at(g.uIm, k, i + 1, j) * b +
-                 at(g.uIm, k, i, j + 1) * c + at(g.uIm, k, i + 1, j + 1) * d
-            w = g.omega[k]
-            s += re * cos(w * t) + im * sin(w * t)
-        end
-        s
-    end
-
-    v_vel = @inline (x, y, z, t) -> begin
-        (i, j, tx, ty) = locate(x, y)
-        i == 0 && return 0.0
-        (a, b, c, d) = (w00(tx, ty), w10(tx, ty), w01(tx, ty), w11(tx, ty))
-        s = 0.0
-        for k in 1:N
-            re = at(g.vRe, k, i, j) * a + at(g.vRe, k, i + 1, j) * b +
-                 at(g.vRe, k, i, j + 1) * c + at(g.vRe, k, i + 1, j + 1) * d
-            im = at(g.vIm, k, i, j) * a + at(g.vIm, k, i + 1, j) * b +
-                 at(g.vIm, k, i, j + 1) * c + at(g.vIm, k, i + 1, j + 1) * d
-            w = g.omega[k]
-            s += re * cos(w * t) + im * sin(w * t)
-        end
-        s
-    end
+    u_vel = TidalVelocityField(g, true)
+    v_vel = TidalVelocityField(g, false)
 
     return (u = u_vel, v = v_vel)
 end

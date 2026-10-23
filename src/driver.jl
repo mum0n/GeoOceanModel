@@ -730,7 +730,7 @@ end
             if raw_flux isa Function
                 HaneyRelaxedHeatFlux(raw_flux, λ, T_target)
             else
-                HaneyRelaxedHeatFlux((x, y, t, T_surf) -> Float64(raw_flux), λ, T_target)
+                HaneyRelaxedHeatFlux(ConstantHeatFlux(Float64(raw_flux)), λ, T_target)
             end
         else
             raw_flux
@@ -871,7 +871,7 @@ end
         lat_range = opts.domain_lat,
         mask_bay_of_fundy = opts.mask_bay_of_fundy,
         active_boundaries = opts.active_boundaries,
-        tidal_placement = :boundary
+        tidal_placement = opts.tidal_placement,
     )
 
     # Initial thermal and haline stratification.
@@ -1098,6 +1098,7 @@ function run_segment_simulation(;
         model
     end
 
+
     println("\n=================================================================")
     println(" [Segment 5/8] Hydrodynamic Simulation Time Stepping")
     println("=================================================================")
@@ -1226,6 +1227,33 @@ function run_segment_simulation(;
     total_sim_duration = opts.sim_duration + spinup_sec
 
     println("Setting up simulation (target_duration=$(opts.sim_duration)s, spinup=$(spinup_sec)s, total_stop_time=$(total_sim_duration)s, Δt₀=$(init_Δt)s, max_Δt=$(max_Δt)s, min_Δt=$(opts.min_dt_seconds)s)...")
+    # If the run is resuming but the Oceananigans checkpoint is unusable (corrupt or
+    # incompatible), do not silently restart from t = 0: recover the model clock and any
+    # tracer fields that the output store still holds, so the run continues from its last
+    # saved state instead of discarding 11 days of progress.
+    if resume
+        cp_candidate = find_latest_checkpoint(cp_dir_target; prefix = opts.checkpoint_prefix)
+        cp_ok = !isnothing(cp_candidate) && verify_checkpoint_compatibility(
+            cp_candidate, size(target_model.velocities.u.data))
+        if !cp_ok && ispath(store_path)
+            try
+                ds = GeoData.geoload(store_path; backend = :zarr)
+                t_last = Float64(last(ds.coords[:time].data))
+                if haskey(ds.variables, "T")
+                    Oceananigans.set!(target_model; T = ds.variables["T"].data[:, :, :, end])
+                end
+                if haskey(ds.variables, "S") && hasproperty(target_model.tracers, :S)
+                    Oceananigans.set!(target_model; S = ds.variables["S"].data[:, :, :, end])
+                end
+                target_model.clock.time = t_last
+                println("Recovered model state from the output store (t = $(round(t_last, digits=2)) s); " *
+                        "the checkpoint was unusable.")
+            catch err
+                @warn "Could not recover model state from the output store: $(err)"
+            end
+        end
+    end
+
     sim = setup_hydrodynamic_simulation(
         target_model,
         Δt = init_Δt,

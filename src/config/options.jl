@@ -129,6 +129,7 @@ struct HydrodynamicOptions
     target_cfl               :: Float64
     surface_heat_flux        :: Float64
     bulk_heat_flux           :: Bool
+    tidal_placement          :: Symbol
     sst_damping_coefficient  :: Float64
     sst_target               :: Float64
     spinup_hours             :: Float64
@@ -336,6 +337,7 @@ function HydrodynamicOptions(;
     target_cfl            :: Real = 0.2,
     surface_heat_flux     :: Real = 50.0,
     bulk_heat_flux        :: Bool = true,
+    tidal_placement       :: Symbol = :boundary,
     sst_damping_coefficient :: Real = 0.0,
     sst_target            :: Real = 12.0,
     spinup_hours          :: Real = 720.0,
@@ -468,6 +470,7 @@ function HydrodynamicOptions(;
         Float64(target_cfl),
         Float64(surface_heat_flux),
         bulk_heat_flux,
+        tidal_placement,
         Float64(sst_damping_coefficient),
         Float64(sst_target),
         Float64(spinup_hours),
